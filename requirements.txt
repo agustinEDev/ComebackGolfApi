@@ -161,7 +161,7 @@ pillow-heif==1.8.1
 
 # email-validator - Librería robusta para validar direcciones de email
 # Usada en los Value Objects para asegurar la validez de los emails
-email-validator==2.3.0
+email-validator==2.4.0
 
 # httpx - Cliente HTTP asíncrono para testear endpoints de FastAPI
 # Alternativa moderna a `requests` con soporte para async/await
