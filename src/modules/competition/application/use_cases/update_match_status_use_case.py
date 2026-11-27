@@ -1,0 +1,180 @@
+"""Caso de Uso: Actualizar estado de un partido."""
+
+from src.modules.competition.application.dto.round_match_dto import (
+    UpdateMatchStatusRequestDTO,
+    UpdateMatchStatusResponseDTO,
+)
+from src.modules.competition.application.exceptions import (
+    CompetitionNotFoundError,
+    MatchNotFoundError,
+    NotCompetitionCreatorError,
+    RoundNotFoundError,
+)
+from src.modules.competition.application.ports.competition_activity_publisher_interface import (
+    CompetitionActivityPublisherInterface,
+)
+from src.modules.competition.application.services.avisos_de_actividad import AvisosDeActividad
+from src.modules.competition.application.services.match_opener import MatchOpener
+from src.modules.competition.domain.entities.competition import Competition
+from src.modules.competition.domain.entities.match import Match
+from src.modules.competition.domain.entities.round import Round
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.value_objects.match_id import MatchId
+from src.modules.competition.domain.value_objects.round_status import RoundStatus
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class CompetitionNotInProgressError(Exception):
+    """La competicion no esta en progreso."""
+
+    pass
+
+
+class InvalidActionError(Exception):
+    """Accion invalida para el estado actual del partido."""
+
+    pass
+
+
+class UpdateMatchStatusUseCase:
+    """
+    Caso de uso para actualizar el estado de un partido.
+
+    Acciones:
+    - START: SCHEDULED -> IN_PROGRESS (auto-start round si esta SCHEDULED)
+    - COMPLETE: IN_PROGRESS -> COMPLETED (auto-complete round si todos terminaron)
+
+    La competicion debe estar IN_PROGRESS.
+    """
+
+    def __init__(
+        self,
+        uow: CompetitionUnitOfWorkInterface,
+        actividad: CompetitionActivityPublisherInterface | None = None,
+    ):
+        self._uow = uow
+        # Los avisos de Actividad (BE-2); sin el, no se avisa
+        self._actividad = AvisosDeActividad(actividad)
+
+    async def execute(
+        self, request: UpdateMatchStatusRequestDTO, user_id: UserId, is_admin: bool = False
+    ) -> UpdateMatchStatusResponseDTO:
+        """
+        Arranca (START) o cierra (COMPLETE) un partido, solo su creador o un admin.
+
+        Autoriza antes de bloquear la fila del partido, y decide sobre el partido
+        y la ronda releidos tras el bloqueo (BE #309).
+        """
+        async with self._uow:
+            # 1-4. Validaciones
+            match, round_entity, competition = await self._validate(request, user_id, is_admin)
+
+            # 5. Ejecutar accion
+            if request.action == "START":
+                round_status_changed = await self._handle_start(match, round_entity)
+            elif request.action == "COMPLETE":
+                round_status_changed = await self._handle_complete(request, match, round_entity)
+            else:
+                raise InvalidActionError(f"Accion invalida: {request.action}. Use START o COMPLETE")
+
+            if round_status_changed:
+                await self._uow.rounds.update(round_entity)
+            await self._uow.matches.update(match)
+
+        # Cerrado y guardado: a cada jugador, su resultado en Actividad (BE-2)
+        if request.action == "COMPLETE":
+            await self._actividad.match_finished(competition, round_entity, match)
+
+        return UpdateMatchStatusResponseDTO(
+            match_id=match.id.value,
+            new_status=match.status.value,
+            round_status=round_status_changed,
+            updated_at=match.updated_at,
+        )
+
+    async def _validate(
+        self, request: UpdateMatchStatusRequestDTO, user_id: UserId, is_admin: bool = False
+    ) -> tuple[Match, Round, Competition]:
+        """Validaciones: buscar match, ronda, competicion, verificar creador y estado."""
+        match_id = MatchId(request.match_id)
+        # Primero SIN bloqueo, para autorizar: antes cualquiera con sesion que
+        # supiera el id retenia la fila hasta que su peticion se deshacia (BE #309)
+        match = await self._uow.matches.find_by_id(match_id)
+
+        if not match:
+            raise MatchNotFoundError(f"No existe partido con ID {request.match_id}")
+
+        # La ronda y la competicion, antes del bloqueo, para autorizar. Lo que
+        # cambia de estado se decide sobre lo releido tras el bloqueo
+        round_entity = await self._uow.rounds.find_by_id(match.round_id)
+        if not round_entity:
+            raise RoundNotFoundError("La ronda asociada no existe")
+
+        competition = await self._uow.competitions.find_by_id(round_entity.competition_id)
+        if not competition:
+            raise CompetitionNotFoundError("La competicion asociada no existe")
+
+        if not is_admin and not competition.is_creator(user_id):
+            raise NotCompetitionCreatorError("Solo el creador puede actualizar partidos")
+
+        if not competition.is_in_progress():
+            raise CompetitionNotInProgressError(
+                f"La competicion debe estar IN_PROGRESS. Estado: {competition.status.value}"
+            )
+
+        # Autorizado: ahora con la fila bloqueada, y RELEIDO. START y la apertura
+        # automatica por hora de sesion (BE #305) hacen lo mismo, y si se cruzan
+        # los dos pre-crean los 18 hoyos de cada jugador y uno se estrella contra
+        # `uq_hole_score_match_hole_player` (PR #307). El estado se decide sobre
+        # lo releido: lo leido arriba puede haber cambiado entre medias
+        match = await self._uow.matches.find_by_id_for_update(match_id)
+        if not match:
+            raise MatchNotFoundError(f"No existe partido con ID {request.match_id}")
+        # Y la ronda, releida FRESCA: START y COMPLETE pueden cambiarla y se
+        # guarda. Sin bloquearla, como antes: bloquear ronda tras partido abriria
+        # un interbloqueo con quien bloquea primero la ronda (code-review)
+        round_entity = await self._uow.rounds.find_by_id_fresh(match.round_id)
+        if not round_entity:
+            raise RoundNotFoundError("La ronda asociada no existe")
+
+        return match, round_entity, competition
+
+    async def _handle_start(self, match: Match, round_entity: Round) -> str | None:
+        """Ejecuta START: match.start() + pre-create HoleScores + auto-start round.
+
+        Los tres pasos viven en `MatchOpener`, compartidos con la apertura
+        automatica por hora de sesion (BE #305): abrir un partido sin crear sus
+        hoyos hace que anotar devuelva 200 sin guardar nada.
+        """
+        try:
+            return await MatchOpener.open(match, round_entity, self._uow)
+        except ValueError as e:
+            raise InvalidActionError(str(e)) from e
+
+    async def _handle_complete(
+        self, request: UpdateMatchStatusRequestDTO, match: Match, round_entity: Round
+    ) -> str | None:
+        """Ejecuta COMPLETE: match.complete() + auto-complete round."""
+        if request.result is None:
+            raise InvalidActionError("Se requiere 'result' para completar un partido")
+        winner = request.result.get("winner") if isinstance(request.result, dict) else None
+        if winner not in ("A", "B", "HALVED"):
+            raise InvalidActionError(
+                "El resultado debe incluir 'winner' con valor 'A', 'B' o 'HALVED'"
+            )
+        try:
+            match.complete(request.result)
+        except ValueError as e:
+            raise InvalidActionError(str(e)) from e
+
+        # Persist match status before querying so find_by_round sees the update
+        await self._uow.matches.update(match)
+
+        all_matches = await self._uow.matches.find_by_round(match.round_id)
+        all_finished = all(m.is_finished() for m in all_matches)
+        if all_finished and round_entity.status == RoundStatus.IN_PROGRESS:
+            round_entity.complete()
+            return round_entity.status.value
+        return None

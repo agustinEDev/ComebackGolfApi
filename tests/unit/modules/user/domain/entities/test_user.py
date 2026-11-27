@@ -1,0 +1,922 @@
+"""
+Tests unitarios para la entidad User.
+
+Este archivo contiene tests que verifican:
+- Creación correcta de usuarios
+- Validación de campos
+- Métodos de la clase User
+- Casos de borde y errores
+"""
+
+import pytest
+
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.value_objects.email import InvalidEmailError
+from src.modules.user.domain.value_objects.token_hash import hash_del_enlace
+
+
+class TestUserCreation:
+    """Tests para la creación de usuarios"""
+
+    def test_create_user_with_valid_data(self, sample_user_data):
+        """
+        Test: Crear usuario con datos válidos
+        Given: Datos válidos de usuario
+        When: Se crea una instancia de User
+        Then: El usuario se crea correctamente con todos los campos
+        """
+        # Arrange - usando fixture de conftest.py
+        data = sample_user_data
+
+        # Act
+        user = User.create(
+            first_name=data["name"],
+            last_name=data["surname"],
+            email_str=data["email"],
+            plain_password="DefaultPassword123!",
+        )
+
+        # Assert
+        assert user.first_name == data["name"]
+        assert user.last_name == data["surname"]
+        assert str(user.email) == data["email"]
+
+    def test_create_user_with_spanish_characters(self):
+        """
+        Test: Crear usuario con caracteres españoles
+        Given: Datos con acentos y ñ
+        When: Se crea una instancia de User
+        Then: Los caracteres especiales se mantienen correctamente
+        """
+        # Arrange
+        first_name = "José María"
+        last_name = "Aznar Botín"
+        email = "jose.maria@español.com"
+
+        # Act
+        user = User.create(
+            first_name=first_name,
+            last_name=last_name,
+            email_str=email,
+            plain_password="DefaultPassword123!",
+        )
+
+        # Assert
+        assert user.first_name == "José María"
+        assert user.last_name == "Aznar Botín"
+        assert str(user.email) == "jose.maria@español.com"
+
+    def test_create_multiple_users(self, multiple_users_data):
+        """
+        Test: Crear múltiples usuarios
+        Given: Lista de datos de usuarios
+        When: Se crean múltiples instancias
+        Then: Todos los usuarios se crean correctamente
+        """
+        # Arrange & Act
+        users = []
+        for data in multiple_users_data:
+            user = User.create(
+                first_name=data["name"],
+                last_name=data["surname"],
+                email_str=data["email"],
+                plain_password="DefaultPassword123!",
+            )
+            users.append(user)
+
+        # Assert
+        assert len(users) == 3
+        assert users[0].first_name == "Carlos"
+        assert users[1].first_name == "Ana"
+        assert users[2].first_name == "Luis"
+
+
+class TestUserMethods:
+    """Tests para los métodos de la clase User"""
+
+    def test_get_full_name_normal_case(self):
+        """
+        Test: Método get_full_name con caso normal
+        Given: Usuario con nombre y apellido
+        When: Se llama a get_full_name()
+        Then: Retorna nombre completo con formato correcto
+        """
+        # Arrange
+        user = User.create(
+            first_name="Carlos",
+            last_name="Rodríguez",
+            email_str="carlos@test.com",
+            plain_password="DefaultPassword123!",
+        )
+
+        # Act
+        full_name = user.get_full_name()
+
+        # Assert
+        assert full_name == "Carlos Rodríguez"
+
+    def test_get_full_name_with_compound_names(self):
+        """
+        Test: Método get_full_name con nombres compuestos
+        Given: Usuario con nombres y apellidos compuestos
+        When: Se llama a get_full_name()
+        Then: Retorna nombre completo respetando espacios
+        """
+        # Arrange
+        user = User.create(
+            first_name="María José",
+            last_name="García López",
+            email_str="maria@test.com",
+            plain_password="DefaultPassword123!",
+        )
+
+        # Act
+        full_name = user.get_full_name()
+
+        # Assert
+        assert full_name == "María José García López"
+
+    def test_get_full_name_with_single_word_names(self):
+        """
+        Test: Método get_full_name con nombres de una palabra
+        Given: Usuario con nombre y apellido simples
+        When: Se llama a get_full_name()
+        Then: Retorna nombre completo con un espacio entre ellos
+        """
+        # Arrange
+        user = User.create(
+            first_name="Ana",
+            last_name="Martín",
+            email_str="ana@test.com",
+            plain_password="DefaultPassword123!",
+        )
+
+        # Act
+        full_name = user.get_full_name()
+
+        # Assert
+        assert full_name == "Ana Martín"
+
+
+class TestUserAccountDeactivation:
+    """Tests para deactivate()/reactivate() (panel de administración)."""
+
+    def _make_user(self):
+        return User.create(
+            first_name="Carlos",
+            last_name="Rodríguez",
+            email_str="carlos@test.com",
+            plain_password="DefaultPassword123!",
+        )
+
+    def test_new_user_is_active_by_default(self):
+        user = self._make_user()
+        assert user.is_active is True
+
+    def test_deactivate_sets_is_active_false(self):
+        user = self._make_user()
+        user.deactivate()
+        assert user.is_active is False
+
+    def test_deactivate_raises_if_already_deactivated(self):
+        user = self._make_user()
+        user.deactivate()
+        with pytest.raises(ValueError, match="already deactivated"):
+            user.deactivate()
+
+    def test_reactivate_sets_is_active_true(self):
+        user = self._make_user()
+        user.deactivate()
+        user.reactivate()
+        assert user.is_active is True
+
+    def test_reactivate_raises_if_already_active(self):
+        user = self._make_user()
+        with pytest.raises(ValueError, match="already active"):
+            user.reactivate()
+
+
+class TestUserValidation:
+    """Tests para las validaciones de la clase User"""
+
+    def test_is_valid_with_correct_email(self):
+        """
+        Test: Validación con email correcto
+        Given: Usuario con email válido y todos los campos requeridos
+        When: Se llama a is_valid()
+        Then: Retorna True
+        """
+        # Arrange
+        user = User.create(
+            first_name="Pedro",
+            last_name="Sánchez",
+            email_str="pedro.sanchez@test.com",
+            plain_password="ValidPassword123!",
+        )
+
+        # Act
+        is_valid = user.is_valid()
+
+        # Assert
+        assert is_valid is True
+
+    def test_is_valid_with_simple_email(self):
+        """
+        Test: Validación con email simple pero válido
+        Given: Usuario con email formato simple y todos los campos
+        When: Se llama a is_valid()
+        Then: Retorna True
+        """
+        # Arrange
+        user = User.create(
+            first_name="Laura",
+            last_name="González",
+            email_str="laura@test.com",
+            plain_password="ValidPassword123!",
+        )
+
+        # Act
+        is_valid = user.is_valid()
+
+        # Assert
+        assert is_valid is True
+
+    def test_is_valid_with_invalid_email_no_at(self):
+        """
+        Test: Usuario con email sin @ debe fallar al crearse
+        Given: Email sin símbolo @
+        When: Se intenta crear usuario
+        Then: La creación falla porque el Email Value Object valida
+        """
+        # Act & Assert - Ahora falla al crear el Email Value Object
+        with pytest.raises(InvalidEmailError):
+            User.create(
+                first_name="Miguel",
+                last_name="Ruiz",
+                email_str="email-sin-arroba.com",
+                plain_password="ValidPassword123!",
+            )
+
+    def test_is_valid_with_invalid_email_no_domain(self):
+        """
+        Test: Usuario con email sin dominio debe fallar al crearse
+        Given: Email sin dominio completo
+        When: Se intenta crear usuario
+        Then: La creación falla porque el Email Value Object valida
+        """
+        # Act & Assert
+        with pytest.raises(InvalidEmailError):
+            User.create(
+                first_name="Carmen",
+                last_name="López",
+                email_str="carmen@",
+                plain_password="ValidPassword123!",
+            )
+
+    def test_is_valid_with_empty_email(self):
+        """
+        Test: Usuario con email vacío debe fallar al crearse
+        Given: Email vacío
+        When: Se intenta crear usuario
+        Then: La creación falla porque el Email Value Object valida
+        """
+        # Act & Assert
+        with pytest.raises(InvalidEmailError):
+            User.create(
+                first_name="Roberto",
+                last_name="Martínez",
+                email_str="",
+                plain_password="ValidPassword123!",
+            )
+
+    def test_is_valid_with_complex_valid_email(self):
+        """
+        Test: Usuario con email complejo pero válido se crea correctamente
+        Given: Email válido con números y caracteres especiales
+        When: Se crea usuario
+        Then: Se crea exitosamente y tiene email válido
+        """
+        # Arrange & Act
+        user = User.create(
+            first_name="Antonio",
+            last_name="García",
+            email_str="antonio.garcia123+test@empresa.co.es",
+            plain_password="ValidPassword123!",
+        )
+
+        # Assert
+        assert user.has_valid_email() is True
+        assert str(user.email) == "antonio.garcia123+test@empresa.co.es"
+
+
+class TestUserEdgeCases:
+    """Tests para casos de borde y situaciones especiales"""
+
+    def test_user_with_empty_name(self):
+        """
+        Test: Usuario con nombre vacío
+        Given: Datos con nombre vacío
+        When: Se crea el usuario
+        Then: Se crea pero nombre queda vacío (comportamiento actual)
+        """
+        # Arrange & Act
+        user = User.create(
+            first_name="",
+            last_name="Pérez",
+            email_str="test@example.com",
+            plain_password="ValidPassword123!",
+        )
+
+        # Assert
+        assert user.first_name == ""
+        assert user.last_name == "Pérez"
+
+    def test_user_with_empty_surname(self):
+        """
+        Test: Usuario con apellido vacío
+        Given: Datos con apellido vacío
+        When: Se crea el usuario
+        Then: Se crea pero apellido queda vacío
+        """
+        # Arrange & Act
+        user = User.create(
+            first_name="Juan",
+            last_name="",
+            email_str="test@example.com",
+            plain_password="ValidPassword123!",
+        )
+
+        # Assert
+        assert user.first_name == "Juan"
+        assert user.last_name == ""
+
+    def test_get_full_name_with_empty_name(self):
+        """
+        Test: get_full_name con nombre vacío
+        Given: Usuario con nombre vacío
+        When: Se llama a get_full_name()
+        Then: Retorna solo el apellido (strip elimina espacios)
+        """
+        # Arrange
+        user = User.create(
+            first_name="",
+            last_name="Rodríguez",
+            email_str="test@example.com",
+            plain_password="ValidPassword123!",
+        )
+
+        # Act
+        full_name = user.get_full_name()
+
+        # Assert
+        assert full_name == "Rodríguez"
+
+    def test_get_full_name_with_empty_surname(self):
+        """
+        Test: get_full_name con apellido vacío
+        Given: Usuario con apellido vacío
+        When: Se llama a get_full_name()
+        Then: Retorna solo el nombre (strip elimina espacios)
+        """
+        # Arrange
+        user = User.create(
+            first_name="Carlos",
+            last_name="",
+            email_str="test@example.com",
+            plain_password="ValidPassword123!",
+        )
+
+        # Act
+        full_name = user.get_full_name()
+
+        # Assert
+        assert full_name == "Carlos"
+
+
+# ================================
+# TESTS DE INTEGRACIÓN LOCAL
+# ================================
+
+
+class TestUserIntegration:
+    """Tests de integración para flujos completos con User"""
+
+    def test_create_and_validate_user_flow(self):
+        """
+        Test: Flujo completo de creación y validación
+        Given: Datos válidos de usuario
+        When: Se crea y valida el usuario
+        Then: Todo el flujo funciona correctamente
+        """
+        # Arrange
+        first_name = "Fernando"
+        last_name = "Alonso"
+        email = "fernando.alonso@f1.com"
+        password = "ValidPassword123!"
+
+        # Act
+        user = User.create(
+            first_name=first_name,
+            last_name=last_name,
+            email_str=email,
+            plain_password=password,
+        )
+        full_name = user.get_full_name()
+        is_valid = user.is_valid()
+
+        # Assert
+        assert user.first_name == first_name
+        assert user.last_name == last_name
+        assert str(user.email) == email
+        assert user.verify_password(password) is True
+        assert full_name == "Fernando Alonso"
+        assert is_valid is True
+
+    def test_create_invalid_user_and_check_validation(self, invalid_user_data):
+        """
+        Test: Flujo con usuario inválido
+        Given: Datos inválidos de usuario
+        When: Se crea y valida el usuario
+        Then: La validación detecta los errores
+        """
+        # Arrange
+        data = invalid_user_data
+
+        # Act & Assert
+        with pytest.raises(InvalidEmailError):
+            User.create(
+                first_name=data["name"],
+                last_name=data["surname"],
+                email_str=data["email"],
+                plain_password="ValidPassword123!",
+            )
+
+
+class TestUserUpdateHandicap:
+    """Tests para el método update_handicap() de User."""
+
+    def test_update_handicap_with_valid_value(self):
+        """Test: Actualizar hándicap con un valor válido."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        user.update_handicap(15.5)
+
+        assert user.handicap.value == pytest.approx(15.5)
+
+    def test_update_handicap_from_existing_value(self):
+        """Test: Actualizar hándicap cuando ya tiene un valor previo."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        user.update_handicap(15.5)
+
+        user.update_handicap(20.0)
+
+        assert user.handicap.value == pytest.approx(20.0)
+
+    def test_update_handicap_to_none(self):
+        """Test: Actualizar hándicap a None (eliminar hándicap)."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        user.update_handicap(15.5)
+
+        user.update_handicap(None)
+
+        assert user.handicap is None
+
+    def test_update_handicap_with_invalid_value_raises_error(self):
+        """Test: Actualizar con valor inválido lanza ValueError."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        with pytest.raises(ValueError, match=r"debe estar entre -10\.0 y 54\.0"):
+            user.update_handicap(100.0)
+
+    def test_update_handicap_below_minimum_raises_error(self):
+        """Test: Actualizar con valor por debajo del mínimo lanza error."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        with pytest.raises(ValueError):
+            user.update_handicap(-15.0)
+
+    def test_update_handicap_updates_timestamp(self):
+        """Test: Actualizar hándicap actualiza el timestamp updated_at."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        original_updated_at = user.updated_at
+
+        import time
+
+        time.sleep(0.01)  # Pequeña espera para asegurar diferencia de timestamp
+
+        user.update_handicap(15.5)
+
+        assert user.updated_at > original_updated_at
+
+    def test_update_handicap_with_negative_value(self):
+        """Test: Actualizar con hándicap negativo válido."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        user.update_handicap(-5.0)
+
+        assert user.handicap.value == -5.0
+
+    def test_update_handicap_with_zero(self):
+        """Test: Actualizar con hándicap cero."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        user.update_handicap(0.0)
+
+        assert user.handicap.value == pytest.approx(0.0)
+
+    def test_update_handicap_minimum_valid_value(self):
+        """Test: Actualizar con valor mínimo válido (-10.0)."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        user.update_handicap(-10.0)
+
+        assert user.handicap.value == -10.0
+
+    def test_update_handicap_maximum_valid_value(self):
+        """Test: Actualizar con valor máximo válido (54.0)."""
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        user.update_handicap(54.0)
+
+        assert user.handicap.value == pytest.approx(54.0)
+
+
+class TestUserEmailVerification:
+    """Tests para la verificación de email de usuarios"""
+
+    def test_generate_verification_token_creates_token(self):
+        """
+        Test: Generar token de verificación
+        Given: Un usuario recién creado
+        When: Se llama a generate_verification_token()
+        Then: Se genera un token y se asigna al usuario
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        assert user.verification_token is None
+
+        # Act
+        token = user.generate_verification_token()
+
+        # Assert
+        assert token is not None
+        assert len(token) > 0
+        # Se guarda su SHA-256, nunca el token (fase 3)
+        assert user.verification_token == hash_del_enlace(token)
+        assert isinstance(token, str)
+
+    def test_generate_verification_token_returns_unique_tokens(self):
+        """
+        Test: Tokens generados son únicos
+        Given: Un usuario
+        When: Se genera un token múltiples veces
+        Then: Cada token es diferente
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        # Act
+        token1 = user.generate_verification_token()
+        token2 = user.generate_verification_token()
+        token3 = user.generate_verification_token()
+
+        # Assert
+        assert token1 != token2
+        assert token2 != token3
+        assert token1 != token3
+
+    def test_generate_verification_token_updates_updated_at(self):
+        """
+        Test: Generar token actualiza updated_at
+        Given: Un usuario con updated_at inicial
+        When: Se genera un token de verificación
+        Then: updated_at se actualiza
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        original_updated_at = user.updated_at
+
+        # Act
+        user.generate_verification_token()
+
+        # Assert
+        assert user.updated_at > original_updated_at
+
+    def test_verify_email_with_valid_token_success(self):
+        """
+        Test: Verificar email con token válido
+        Given: Un usuario con token de verificación generado
+        When: Se llama a verify_email() con el token correcto
+        Then: El email se marca como verificado
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        token = user.generate_verification_token()
+
+        # Act
+        result = user.verify_email(token)
+
+        # Assert
+        assert result is True
+        assert user.email_verified is True
+        assert user.verification_token is None
+
+    def test_verify_email_with_invalid_token_raises_error(self):
+        """
+        Test: Verificar email con token inválido
+        Given: Un usuario con token de verificación
+        When: Se llama a verify_email() con token incorrecto
+        Then: Se lanza ValueError
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        user.generate_verification_token()
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="Token de verificación inválido"):
+            user.verify_email("invalid_token_12345")
+
+    def test_verify_email_when_already_verified_raises_error(self):
+        """
+        Test: No se puede verificar un email ya verificado
+        Given: Un usuario con email ya verificado
+        When: Se intenta verificar nuevamente
+        Then: Se lanza ValueError
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        token = user.generate_verification_token()
+        user.verify_email(token)
+
+        # Act & Assert
+        with pytest.raises(ValueError, match="El email ya está verificado"):
+            new_token = "any_token"
+            user.verify_email(new_token)
+
+    def test_verify_email_clears_verification_token(self):
+        """
+        Test: Verificación limpia el token
+        Given: Un usuario con token de verificación
+        When: Se verifica el email exitosamente
+        Then: El token se elimina (se pone en None)
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        token = user.generate_verification_token()
+        assert user.verification_token is not None
+
+        # Act
+        user.verify_email(token)
+
+        # Assert
+        assert user.verification_token is None
+
+    def test_verify_email_updates_updated_at(self):
+        """
+        Test: Verificación actualiza updated_at
+        Given: Un usuario con updated_at inicial
+        When: Se verifica el email
+        Then: updated_at se actualiza
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        token = user.generate_verification_token()
+        original_updated_at = user.updated_at
+
+        # Act
+        user.verify_email(token)
+
+        # Assert
+        assert user.updated_at > original_updated_at
+
+    def test_is_email_verified_returns_false_initially(self):
+        """
+        Test: Email no verificado inicialmente
+        Given: Un usuario recién creado
+        When: Se verifica el estado de verificación
+        Then: Retorna False
+        """
+        # Arrange & Act
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        # Assert
+        assert user.is_email_verified() is False
+
+    def test_is_email_verified_returns_true_after_verification(self):
+        """
+        Test: Email verificado retorna True
+        Given: Un usuario con email verificado
+        When: Se verifica el estado
+        Then: Retorna True
+        """
+        # Arrange
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+        token = user.generate_verification_token()
+        user.verify_email(token)
+
+        # Act & Assert
+        assert user.is_email_verified() is True
+
+    def test_user_created_with_email_not_verified(self):
+        """
+        Test: Usuario creado con email no verificado por defecto
+        Given: Datos válidos de usuario
+        When: Se crea un usuario
+        Then: email_verified es False y verification_token es None
+        """
+        # Act
+        user = User.create("Juan", "Pérez", "juan@test.com", "T3stP@ssw0rd!")
+
+        # Assert
+        assert user.email_verified is False
+        assert user.verification_token is None
+
+
+class TestUserAlias:
+    """
+    Tests del alias público del perfil (BE #239).
+
+    El alias sustituye al nombre real en toda la aplicación. `None` en
+    `update_profile` significa "no lo han mandado" y la cadena vacía
+    "quítamelo", igual que ya hacían country_code y gender.
+    """
+
+    def _user(self, alias=None):
+        user = User.create(
+            first_name="Agustin",
+            last_name="Estevez",
+            email_str="agustin@example.com",
+            plain_password="DefaultPassword123!",
+        )
+        if alias is not None:
+            user.update_profile(alias=alias)
+        return user
+
+    def test_new_user_has_no_alias(self):
+        """
+        Test: Un usuario nace sin alias
+
+        Given: Un usuario recién creado
+        When: Se mira su alias
+        Then: Es None, y display_name es su nombre completo
+        """
+        user = self._user()
+
+        assert user.alias is None
+        assert user.display_name == "Agustin Estevez"
+
+    def test_setting_an_alias_changes_display_name(self):
+        """
+        Test: Poner un alias cambia el nombre con el que se muestra
+
+        Given: Un usuario sin alias
+        When: Se le pone "Chuchi"
+        Then: display_name pasa a ser "Chuchi" y el nombre legal no cambia
+        """
+        user = self._user()
+
+        user.update_profile(alias="Chuchi")
+
+        assert user.alias == "Chuchi"
+        assert user.display_name == "Chuchi"
+        assert user.get_full_name() == "Agustin Estevez"
+
+    def test_get_full_name_ignores_the_alias(self):
+        """
+        Test: El nombre legal nunca es el alias
+
+        Given: Un usuario con alias
+        When: Se pide get_full_name()
+        Then: Devuelve el nombre real — la búsqueda de hándicap en la RFEG y
+              los correos van por ahí, y la federación busca por nombre legal
+        """
+        user = self._user("Chuchi")
+
+        assert user.get_full_name() == "Agustin Estevez"
+
+    def test_clearing_the_alias_returns_to_the_real_name(self):
+        """
+        Test: La cadena vacía borra el alias
+
+        Given: Un usuario con alias "Chuchi"
+        When: Se actualiza el perfil con alias=""
+        Then: El alias queda a None y vuelve a mostrarse el nombre real
+        """
+        user = self._user("Chuchi")
+
+        user.update_profile(alias="")
+
+        assert user.alias is None
+        assert user.display_name == "Agustin Estevez"
+
+    def test_not_sending_the_alias_leaves_it_alone(self):
+        """
+        Test: Omitir el alias no lo toca
+
+        Given: Un usuario con alias
+        When: Se actualiza solo el nombre
+        Then: El alias sigue ahí
+        """
+        user = self._user("Chuchi")
+
+        user.update_profile(first_name="Agus")
+
+        assert user.alias == "Chuchi"
+        assert user.display_name == "Chuchi"
+
+    def test_setting_the_same_alias_changes_nothing(self):
+        """
+        Test: Repetir el alias que ya se tiene no es un cambio
+
+        Given: Un usuario con alias "Chuchi"
+        When: Se manda el mismo alias
+        Then: No cambia nada, ni la fecha de actualización
+        """
+        user = self._user("Chuchi")
+        antes = user.updated_at
+
+        user.update_profile(alias="Chuchi")
+
+        assert user.alias == "Chuchi"
+        assert user.updated_at == antes
+
+    def test_alias_alone_is_enough_to_update_the_profile(self):
+        """
+        Test: El alias cuenta como campo para "al menos uno"
+
+        Given: Un usuario
+        When: Se actualiza el perfil mandando solo el alias
+        Then: No se levanta el error de "ningún campo"
+        """
+        user = self._user()
+
+        user.update_profile(alias="Chuchi")
+
+        assert user.alias == "Chuchi"
+
+    def test_updating_with_no_field_at_all_still_fails(self):
+        """
+        Test: Sin ningún campo sigue siendo un error
+
+        Given: Un usuario
+        When: Se llama a update_profile sin nada
+        Then: ValueError, y el mensaje menciona el alias
+        """
+        user = self._user()
+
+        with pytest.raises(ValueError, match="alias"):
+            user.update_profile()
+
+
+class TestUserDisplayNameForCompetition:
+    """
+    `display_name_or_legal` (BE #254): el mismo fallback de
+    `display_name`, salvo que la inscripción en ESA competición haya elegido
+    el nombre legal. Único sitio donde vive esa segunda excepción — la
+    clasificación, la anotación y la lista de inscritos lo usan en vez de
+    repetir cada una `get_full_name() if use_real_name else display_name`.
+    """
+
+    def _user(self, alias=None):
+        user = User.create(
+            first_name="Agustin",
+            last_name="Estevez",
+            email_str="agustin@example.com",
+            plain_password="DefaultPassword123!",
+        )
+        if alias is not None:
+            user.update_profile(alias=alias)
+        return user
+
+    def test_without_the_preference_it_is_the_same_as_display_name(self):
+        """
+        Given: Un usuario con alias
+        When: Se pide su nombre para una competición sin la preferencia (False)
+        Then: Es igual que display_name — el alias
+        """
+        user = self._user("Chuchi")
+
+        assert user.display_name_or_legal(False) == "Chuchi"
+        assert user.display_name_or_legal(False) == user.display_name
+
+    def test_with_the_preference_it_is_the_legal_name_even_with_an_alias(self):
+        """
+        Given: Un usuario con alias
+        When: Se pide su nombre para una competición con la preferencia (True)
+        Then: Es el nombre legal, no el alias
+        """
+        user = self._user("Chuchi")
+
+        assert user.display_name_or_legal(True) == "Agustin Estevez"
+        assert user.display_name_or_legal(True) == user.get_full_name()
+
+    def test_without_an_alias_the_preference_changes_nothing(self):
+        """
+        Given: Un usuario sin alias
+        When: Se pide su nombre con y sin la preferencia
+        Then: Los dos caminos dan el mismo nombre legal, que es lo único que hay
+        """
+        user = self._user()
+
+        assert user.display_name_or_legal(True) == "Agustin Estevez"
+        assert user.display_name_or_legal(False) == "Agustin Estevez"

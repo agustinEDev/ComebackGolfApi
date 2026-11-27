@@ -1,0 +1,1139 @@
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationInfo, field_validator
+from pydantic.json_schema import SkipJsonSchema
+
+from src.modules.user.domain.services.cookie_de_dispositivo import LONGITUD_MAXIMA_DE_LA_COOKIE
+from src.modules.user.domain.value_objects.terms_of_service import (
+    current_terms_version,
+    require_utc,
+)
+from src.shared.application.validation import (
+    AliasValidator,
+    FieldLimits,
+    NameValidator,
+    sanitize_html,
+)
+
+# Literales reutilizados
+CONFIRMATION_MESSAGE_DESCRIPTION = "Mensaje de confirmación."
+IP_ADDRESS_DESCRIPTION = "Dirección IP del cliente (para security audit trail)."
+USER_AGENT_DESCRIPTION = "User-Agent del navegador (para security audit trail)."
+
+
+# Constants
+EMAIL_DESCRIPTION = "Correo electrónico del usuario."
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Registrar Usuario
+# ======================================================================================
+
+
+class RegisterUserRequestDTO(BaseModel):
+    """
+    DTO de entrada para el caso de uso de registro de usuario.
+    Define los datos necesarios para crear un nuevo usuario.
+    """
+
+    email: EmailStr = Field(
+        ..., max_length=FieldLimits.EMAIL_MAX_LENGTH, description=EMAIL_DESCRIPTION
+    )
+    password: str = Field(
+        ...,
+        min_length=12,  # Actualizado según nueva política OWASP
+        max_length=FieldLimits.PASSWORD_MAX_LENGTH,
+        description="Contraseña del usuario (mínimo 12 caracteres, incluir mayúsculas, minúsculas, números y símbolos).",
+    )
+    first_name: str = Field(
+        ...,
+        min_length=2,
+        max_length=FieldLimits.NAME_MAX_LENGTH,
+        description="Nombre del usuario.",
+    )
+    last_name: str = Field(
+        ...,
+        min_length=2,
+        max_length=FieldLimits.NAME_MAX_LENGTH,
+        description="Apellido del usuario.",
+    )
+    country_code: str | None = Field(
+        None,
+        min_length=2,
+        max_length=2,
+        pattern="^[A-Z]{2}$",
+        description="Código ISO del país (2 letras mayúsculas, ej: 'ES', 'FR', 'PT'). Opcional.",
+    )
+    manual_handicap: float | None = Field(
+        None,
+        ge=-10.0,
+        le=54.0,
+        description="Hándicap manual (opcional). Solo se usa si no se encuentra en RFEG.",
+    )
+    gender: str | None = Field(
+        None,
+        pattern="^(MALE|FEMALE)$",
+        description="Género del usuario (MALE/FEMALE). Opcional. Usado para resolución automática de tees.",
+    )
+    # Obligatorio y solo `true`: sin aceptar los Términos no hay alta. Se
+    # guarda la versión vigente con la fecha (ver terms_of_service)
+    accept_terms: Literal[True] = Field(
+        ...,
+        description=(
+            "Acepta los Términos de uso vigentes. Obligatorio y solo `true`: "
+            "sin él, o con `false`, el registro responde 422."
+        ),
+    )
+
+    # Contexto de seguridad: lo pone la capa de API, no el cliente (como en el
+    # login). Va al historial de aceptaciones de los Términos
+    ip_address: str | None = Field(None, max_length=45, description=IP_ADDRESS_DESCRIPTION)
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def sanitize_and_validate_name(cls, v: str) -> str:
+        """Sanitiza HTML y valida formato de nombre según NameValidator."""
+        # Sanitizar HTML primero
+        sanitized = sanitize_html(v)
+        if sanitized is None:
+            raise ValueError("El nombre no puede estar vacío")
+
+        # Validar formato de nombre (sin números ni caracteres especiales)
+        return NameValidator.validate(sanitized)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Aceptar los Términos
+# ======================================================================================
+
+
+class PurgeTermsAcceptancesRequestDTO(BaseModel):
+    """Entrada de la purga del historial de aceptaciones: el «ahora» de referencia."""
+
+    now: datetime = Field(..., description="Instante de referencia, en UTC.")
+
+    @field_validator("now")
+    @classmethod
+    def now_in_utc(cls, value: datetime) -> datetime:
+        """La purga compara contra fechas en UTC: sin zona sería ambiguo."""
+        return require_utc(value, "now")
+
+
+class PurgeTermsAcceptancesResponseDTO(BaseModel):
+    """Salida de la purga: cuántas filas se borraron y con qué corte."""
+
+    deleted: int = Field(..., description="Filas borradas.")
+    cutoff: datetime = Field(..., description="Se borran las cuentas borradas antes de esto.")
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Buscar Usuario
+# ======================================================================================
+
+
+class FindUserRequestDTO(BaseModel):
+    """
+    DTO de entrada para el caso de uso de búsqueda de usuario.
+    Permite buscar por email o nombre completo.
+    """
+
+    email: EmailStr | None = Field(
+        None, max_length=FieldLimits.EMAIL_MAX_LENGTH, description=EMAIL_DESCRIPTION
+    )
+    full_name: str | None = Field(
+        None,
+        min_length=3,
+        max_length=FieldLimits.FULL_NAME_MAX_LENGTH,
+        description="Nombre completo del usuario.",
+    )
+
+    @field_validator("email", "full_name", mode="before")
+    @classmethod
+    def check_at_least_one_field(cls, v: Any) -> Any:
+        """Valida que se proporcione al menos un campo de búsqueda."""
+        return v
+
+    def model_post_init(self, __context: Any) -> None:
+        """Valida que se proporcione al menos un criterio de búsqueda."""
+        if not self.email and not self.full_name:
+            raise ValueError("Debe proporcionar al menos 'email' o 'full_name' para la búsqueda.")
+
+
+class FindUserResponseDTO(BaseModel):
+    """
+    DTO de respuesta para el caso de uso de búsqueda de usuario.
+    Devuelve información básica del usuario encontrado.
+    """
+
+    user_id: UUID = Field(..., description="ID único del usuario encontrado.")
+    # Vacío y no None, y el esquema sigue diciendo `format: email`: un null o
+    # quitar el formato lo marca oasdiff como cambio incompatible
+    email: str = Field(
+        ...,
+        description=(
+            "Email del usuario. Solo si se buscó por ese mismo email o es uno "
+            "mismo; vacío en otro caso (BE #531)"
+        ),
+        json_schema_extra={"format": "email"},
+    )
+    full_name: str = Field(..., description="Nombre completo del usuario.")
+    display_name: str = Field(
+        ...,
+        description=(
+            "Nombre con el que se debe mostrar a esta persona: su alias si "
+            "tiene, y si no su nombre completo."
+        ),
+    )
+
+    # Configuración de Pydantic actualizada para V2
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SearchUsersItemDTO(BaseModel):
+    """
+    Un jugador encontrado por su nombre.
+
+    **No lleva correo.** Cualquiera puede buscar por nombre, asi que lo que
+    devuelva esta busqueda es publico entre usuarios registrados: solo nombre,
+    apellidos, alias y foto. Antes devolvia el correo, lo que permitia
+    recolectar direcciones tecleando nombres sueltos. El alias no amplia esa
+    exposicion: es publico por diseño, porque es lo que otros teclean para
+    encontrarte.
+
+    La foto es lo que permite distinguir a dos jugadores que se llamen igual,
+    que es el trabajo que hacia el correo.
+    """
+
+    user_id: UUID = Field(..., description="ID del usuario.")
+    full_name: str = Field(..., description="Nombre completo del usuario.")
+    first_name: str = Field(default="", description="Nombre, ya separado del apellido.")
+    last_name: str = Field(default="", description="Apellidos, ya separados del nombre.")
+    alias: str | None = Field(
+        default=None,
+        description=(
+            "Apodo público, si tiene. Se puede buscar por él, así que aquí se "
+            "devuelve junto al nombre real: es lo que permite saber cuál de los "
+            "dos 'Chuchi' que salen es el que se buscaba."
+        ),
+    )
+    display_name: str = Field(
+        ...,
+        description=(
+            "Nombre con el que se debe mostrar a esta persona. Aquí conviven "
+            "los tres a propósito: `display_name` para pintar, `alias` y "
+            "`full_name` porque esta pantalla es la única que enseña los dos, "
+            "para distinguir a dos jugadores parecidos."
+        ),
+    )
+    avatar_source: str = Field(default="", description="De donde sale su foto de perfil.")
+    avatar_preset_id: int | None = Field(
+        default=None, description="Avatar predefinido, si usa uno."
+    )
+    has_avatar_upload: bool = Field(default=False, description="Si tiene foto propia subida.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SearchUsersRequestDTO(BaseModel):
+    """
+    Una búsqueda del autocompletado de jugadores.
+
+    `viewer_id` es obligatorio: quien busca no sale en sus propios resultados
+    ni ocupa uno de sus huecos (FE #938). Opcional, un llamador nuevo que lo
+    olvidara devolvería el fallo sin que nada avisara.
+    """
+
+    query: str = Field(..., description="Texto parcial del nombre, apellido o alias.")
+    viewer_id: str = Field(..., description="ID de quien busca.")
+
+
+class SearchUsersResponseDTO(BaseModel):
+    """Response for user search autocomplete."""
+
+    users: list[SearchUsersItemDTO] = Field(
+        default_factory=list, description="Lista de usuarios encontrados."
+    )
+
+
+# ======================================================================================
+# DTO de Respuesta Genérico para el Usuario
+# ======================================================================================
+
+
+class UserResponseDTO(BaseModel):
+    """
+    DTO de salida que representa a un usuario.
+    Se utiliza para devolver información del usuario de forma segura (sin contraseña).
+    """
+
+    id: UUID = Field(..., description="ID único del usuario.")
+    email: EmailStr = Field(..., description=EMAIL_DESCRIPTION)
+    first_name: str = Field(..., description="Nombre del usuario.")
+    last_name: str = Field(..., description="Apellido del usuario.")
+    alias: str | None = Field(
+        None,
+        description=(
+            "Apodo público con el que la aplicación muestra a este usuario. "
+            "Null si no ha puesto ninguno, y entonces se muestra su nombre real."
+        ),
+    )
+    display_name: str = Field(
+        ...,
+        description=(
+            "El nombre ya resuelto: el alias si lo hay, y si no el nombre "
+            "completo. Es lo que hay que pintar, para no repetir ese `or` en "
+            "cada pantalla."
+        ),
+    )
+    country_code: str | None = Field(None, description="Código ISO del país (2 letras, ej: 'ES').")
+    handicap: float | None = Field(None, description="Handicap de golf del usuario.")
+    handicap_updated_at: datetime | None = Field(
+        None, description="Fecha y hora de la última actualización del handicap."
+    )
+    created_at: datetime = Field(..., description="Fecha y hora de creación del usuario.")
+    updated_at: datetime = Field(..., description="Fecha y hora de la última actualización.")
+    email_verified: bool = Field(
+        default=False, description="Indica si el email del usuario ha sido verificado."
+    )
+    pending_email: str | None = Field(
+        default=None,
+        description=(
+            "Correo nuevo pendiente de confirmar desde su dirección (24 h). Hasta "
+            "entonces, `email` sigue siendo el de antes."
+        ),
+    )
+    is_admin: bool = Field(
+        default=False,
+        description="Indica si el usuario tiene privilegios de administrador del sistema (RBAC).",
+    )
+    gender: str | None = Field(
+        None,
+        description="Género del usuario (MALE/FEMALE). Usado para resolución automática de tees.",
+    )
+    # OAuth & Auth Method fields (v2.0.10)
+    auth_providers: list[str] = Field(
+        default_factory=list,
+        description="Proveedores OAuth vinculados al usuario (ej: ['google']). Vacío si solo usa email/password.",
+    )
+    has_password: bool = Field(
+        default=True,
+        description="True si el usuario tiene contraseña configurada. False si se registró solo con OAuth.",
+    )
+    # Avatar fields (v2.3.0)
+    avatar_source: str = Field(
+        default="NONE",
+        description="Origen del avatar activo: NONE, PRESET o UPLOAD.",
+    )
+    avatar_preset_id: int | None = Field(
+        None, description="ID del preset activo (1-10), solo si avatar_source=PRESET."
+    )
+    # Feed de actividad (BE #175)
+    share_activity: bool = Field(
+        default=True,
+        description=(
+            "Si los logros del usuario se publican en el feed de sus amigos. "
+            "Se cambia con PUT /social/activity-sharing."
+        ),
+    )
+    # Términos de uso: si tiene aceptada la versión VIGENTE y cuál es. Sin
+    # aceptarla, toda ruta con sesión salvo las exentas responde 403
+    # TERMS_NOT_ACCEPTED; se acepta con POST /users/me/accept-terms
+    terms_accepted: bool = Field(
+        default=False,
+        description=(
+            "True si el usuario tiene aceptada la versión vigente de los Términos. "
+            "False si no los ha aceptado nunca o aceptó una versión anterior."
+        ),
+    )
+    terms_version_required: str = Field(
+        default_factory=current_terms_version,
+        description="Versión vigente de los Términos, la que hay que tener aceptada.",
+    )
+
+    # Configuración de Pydantic actualizada para V2
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("id", "email", "country_code", "handicap", "gender", mode="before")
+    @classmethod
+    def convert_value_objects(cls, v: Any) -> Any:
+        """
+        Convierte nuestros Value Objects a tipos primitivos que Pydantic entiende.
+        Se ejecuta ANTES de la validación estándar de Pydantic.
+        """
+        # Si el valor 'v' tiene un atributo 'value', usamos ese valor.
+        # Esto funciona para UserId, Email, CountryCode y Handicap.
+        if hasattr(v, "value"):
+            return v.value
+        return v
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Login
+# ======================================================================================
+
+
+class LoginRequestDTO(BaseModel):
+    """
+    DTO de entrada para el caso de uso de login.
+    Define las credenciales necesarias para autenticar un usuario.
+
+    Security Logging (v1.8.0):
+    - ip_address y user_agent son opcionales para security audit trail
+    - Proporcionados por API layer, no requeridos en tests
+
+    Device Fingerprinting (v2.0.4):
+    - device_id_from_cookie: ID del dispositivo desde cookie httpOnly (primary identifier)
+    """
+
+    email: EmailStr = Field(
+        ..., max_length=FieldLimits.EMAIL_MAX_LENGTH, description=EMAIL_DESCRIPTION
+    )
+    password: str = Field(
+        ...,
+        max_length=FieldLimits.PASSWORD_MAX_LENGTH,
+        description="Contraseña del usuario.",
+    )
+    # Security context (opcional, proporcionado por API layer)
+    ip_address: str | None = Field(
+        None,
+        max_length=45,  # IPv6 máximo: 39 chars (ej: 2001:0db8:85a3:0000:0000:8a2e:0370:7334)
+        description=IP_ADDRESS_DESCRIPTION,
+    )
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+    # Device Fingerprinting (v2.0.4): Cookie-based identification
+    device_id_from_cookie: str | None = Field(
+        None,
+        min_length=36,
+        max_length=LONGITUD_MAXIMA_DE_LA_COOKIE,  # hasta 5 ids (BE #737)
+        description="ID del dispositivo desde cookie httpOnly (v2.0.4). Primary identifier.",
+    )
+    installed_app: bool = Field(
+        default=False,
+        description="La app instalada (PWA), por la cabecera X-App-Mode: standalone (BE #737)",
+    )
+    country_code: str | None = Field(
+        default=None,
+        max_length=2,
+        description="País (ISO 3166 alfa-2) que da Cloudflare, solo con su secreto (BE #737)",
+    )
+    # La pone la ruta (la clave de red de los límites, BE #732): fuera del esquema
+    red: SkipJsonSchema[str | None] = Field(default=None, max_length=100)
+
+
+class AvisoDeFallosRequestDTO(BaseModel):
+    """El correo de «intentos fallidos» al dueño de la cuenta (BE #732)."""
+
+    user_id: str = Field(..., min_length=1, max_length=36)
+    email: str = Field(..., max_length=FieldLimits.EMAIL_MAX_LENGTH)
+    nombre: str = Field(..., max_length=100)
+    verificado: bool
+    country_code: str | None = Field(default=None, max_length=2)
+    # «red»: una red quedó bloqueada para la cuenta; «aviso»: 25 fallos en la hora
+    # (sin bloqueo); «respaldo»: 50 en la hora; «dia»: 150 en 24 horas
+    motivo: Literal["red", "aviso", "respaldo", "dia"]
+
+    def toca_avisar(self) -> bool:
+        """Nunca a un correo sin confirmar: quizá no es suyo."""
+        return self.verificado
+
+
+class LoginResponseDTO(BaseModel):
+    """
+    DTO de salida para el caso de uso de login.
+    Devuelve la información básica del usuario. Los tokens (acceso, 15 minutos;
+    renovación, 7 días) van solo a las cookies httpOnly (F-03, 2.58.0).
+
+    CSRF Protection (v1.13.0):
+    - csrf_token: Token de 256 bits para validación double-submit (vale lo que el refresh
+      token más 1 h; su cookie dura 15 minutos)
+
+    Device Fingerprinting (v2.0.4):
+    - device_id: el dispositivo de la sesión: toda sesión tiene uno (BE #737), y la
+      ruta lo pone en la cookie siempre
+    """
+
+    # Los tokens, solo para las cookies httpOnly de la ruta: ni en el cuerpo ni en el
+    # esquema (F-03, 2.58.0). Un script inyectado no tiene qué leer
+    access_token: str = Field(..., exclude=True)
+    refresh_token: str = Field(..., exclude=True)
+    csrf_token: str = Field(
+        ...,
+        description=(
+            "Token CSRF para validación double-submit (vale lo que el refresh token "
+            "más 1 h; su cookie dura 15 minutos)."
+        ),
+    )
+    user: UserResponseDTO = Field(..., description="Información del usuario autenticado.")
+    email_verification_required: bool = Field(
+        default=False, description="Indica si el usuario necesita verificar su email."
+    )
+    # El dispositivo de la sesión: toda sesión tiene uno (BE #737)
+    device_id: str = Field(..., description="ID del dispositivo de esta sesión.")
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Logout
+# ======================================================================================
+
+
+class LogoutRequestDTO(BaseModel):
+    """
+    DTO de entrada para el caso de uso de logout.
+    Define el token que se quiere invalidar.
+
+    Security Logging (v1.8.0):
+    - ip_address y user_agent son opcionales para security audit trail
+    - Proporcionados por API layer, no requeridos en tests
+    """
+
+    # Security context (opcional, proporcionado por API layer)
+    ip_address: str | None = Field(None, max_length=45, description=IP_ADDRESS_DESCRIPTION)
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+    # El token de refresco de ESTE dispositivo (BE #376). La API lo pone desde su
+    # cookie httpOnly y descarta lo que llegue en el cuerpo: solo se cierra la
+    # sesión desde la que se sale
+    refresh_token: str | None = Field(None, exclude=True, description="Uso interno.")
+    # El dispositivo de la petición (el de su token de acceso, ya comprobado). Lo pone
+    # la API: sus sesiones se cierran al momento (auditoría de la fase 6, B-05)
+    device_id: str | None = Field(None, exclude=True, description="Uso interno.")
+
+
+class LogoutResponseDTO(BaseModel):
+    """
+    DTO de salida para el caso de uso de logout.
+    Confirma que el logout se realizó correctamente.
+    """
+
+    message: str = Field(default="Logout exitoso", description=CONFIRMATION_MESSAGE_DESCRIPTION)
+    logged_out_at: datetime = Field(..., description="Timestamp del logout.")
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Update Profile
+# ======================================================================================
+
+
+class UpdateProfileRequestDTO(BaseModel):
+    """
+    DTO de entrada para actualización de información personal del usuario.
+    Al menos uno de los campos debe ser proporcionado.
+    """
+
+    first_name: str | None = Field(
+        None,
+        min_length=2,
+        max_length=FieldLimits.NAME_MAX_LENGTH,
+        description="Nuevo nombre del usuario.",
+    )
+    last_name: str | None = Field(
+        None,
+        min_length=2,
+        max_length=FieldLimits.NAME_MAX_LENGTH,
+        description="Nuevo apellido del usuario.",
+    )
+    country_code: str | None = Field(
+        None,
+        min_length=2,
+        max_length=2,
+        pattern="^[A-Z]{2}$",
+        description="Nuevo código ISO del país (2 letras mayúsculas, ej: 'ES', 'FR').",
+    )
+    gender: str | None = Field(
+        None,
+        pattern="^(MALE|FEMALE)$",
+        description="Nuevo género del usuario (MALE/FEMALE). Opcional.",
+    )
+    alias: str | None = Field(
+        None,
+        max_length=FieldLimits.ALIAS_MAX_LENGTH,
+        description=(
+            "Nuevo alias público. Enviar cadena vacía lo borra y devuelve al "
+            "usuario a su nombre real. Omitir el campo —o mandarlo a null— lo "
+            "deja como está."
+        ),
+    )
+
+    @field_validator("alias")
+    @classmethod
+    def sanitize_and_validate_alias(cls, v: str | None) -> str | None:
+        """
+        Sanitiza y valida el alias.
+
+        La cadena vacía NO se valida: es la forma de pedir que se borre, y se
+        deja pasar tal cual para que la entidad la traduzca a NULL.
+        """
+        if v is None:
+            return None
+
+        if v.strip() == "":
+            return ""
+
+        # El formato se valida ANTES de sanear, y sobre lo que la persona
+        # escribió. Al revés, `Chuchi & Co` salía de `sanitize_html` como
+        # `Chuchi &amp; Co` y se rechazaba con un «no puede contener HTML» que
+        # no era verdad: lo que sobra ahí es el `&`, y eso ya lo dice el
+        # mensaje de los caracteres permitidos
+        validated = AliasValidator.validate(v, field_name="alias")
+
+        # Cinturón: la lista de caracteres permitidos ya deja fuera `<`, `>` y
+        # `&`, así que esto no deberia disparar nunca. Si algun dia se ampliara
+        # esa lista, mejor un rechazo que guardar en silencio algo distinto de
+        # lo que se pidió: el alias es único y es lo que otros teclean
+        if sanitize_html(validated) != validated:
+            raise ValueError("alias no puede contener HTML")
+
+        return validated
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def sanitize_and_validate_name(cls, v: str | None, info: ValidationInfo) -> str | None:
+        """Sanitiza HTML y valida formato de nombre según NameValidator."""
+        if v is None:
+            return None
+
+        # Sanitizar HTML primero
+        sanitized = sanitize_html(v)
+        if sanitized is None or not sanitized:
+            raise ValueError(f"{info.field_name} no puede estar vacío")
+
+        # Validar formato de nombre (sin números ni caracteres especiales)
+        return NameValidator.validate(sanitized, field_name=str(info.field_name))
+
+    def model_post_init(self, __context: Any) -> None:
+        """Valida que se proporcione al menos un campo."""
+        # El alias se mira por si VINO en la petición, no por su valor: mandar
+        # `alias: ""` es una petición legítima —«quítame el alias»— y con la
+        # comprobación por valor se leía como «no has mandado nada».
+        #
+        # `null` NO cuenta, igual que en el resto de campos de este endpoint,
+        # donde `"last_name": null` significa «no lo toques». Sin esto,
+        # `{"alias": null}` a secas pasaba el DTO y reventaba mas adentro, en
+        # la entidad, con un 400 y un mensaje en ingles
+        alias_provided = "alias" in self.model_fields_set and self.alias is not None
+        if (
+            not self.first_name
+            and not self.last_name
+            and not self.country_code
+            and not self.gender
+            and not alias_provided
+        ):
+            raise ValueError(
+                "Debe proporcionar al menos 'first_name', 'last_name', 'country_code', "
+                "'gender' o 'alias'."
+            )
+
+
+class UpdateProfileResponseDTO(BaseModel):
+    """DTO de salida para actualización de perfil."""
+
+    user: UserResponseDTO = Field(..., description="Información actualizada del usuario.")
+    message: str = Field(
+        default="Perfil actualizado exitosamente",
+        description=CONFIRMATION_MESSAGE_DESCRIPTION,
+    )
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Update Security
+# ======================================================================================
+
+
+class UpdateSecurityRequestDTO(BaseModel):
+    """
+    DTO de entrada para actualización de datos de seguridad (email y/o password).
+    Requiere contraseña actual para verificación.
+
+    Security Logging (v1.8.0):
+    - ip_address y user_agent son opcionales para security audit trail
+    - Proporcionados por API layer, no requeridos en tests
+    """
+
+    current_password: str = Field(
+        ...,
+        max_length=FieldLimits.PASSWORD_MAX_LENGTH,
+        description="Contraseña actual (requerida).",
+    )
+    new_email: EmailStr | None = Field(
+        None,
+        max_length=FieldLimits.EMAIL_MAX_LENGTH,
+        description="Correo nuevo: queda pendiente hasta confirmarlo desde su dirección (24 h).",
+    )
+    new_password: str | None = Field(
+        None,
+        min_length=12,  # Actualizado según nueva política OWASP
+        max_length=FieldLimits.PASSWORD_MAX_LENGTH,
+        description="Nuevo password (mínimo 12 caracteres, incluir mayúsculas, minúsculas, números y símbolos).",
+    )
+    confirm_password: str | None = Field(
+        None,
+        max_length=FieldLimits.PASSWORD_MAX_LENGTH,
+        description="Confirmación del nuevo password.",
+    )
+    # Security context (opcional, proporcionado por API layer)
+    ip_address: str | None = Field(None, max_length=45, description=IP_ADDRESS_DESCRIPTION)
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+    # El dispositivo de la petición (el del token de acceso, ya comprobado). Lo pone la
+    # API: al cambiar la contraseña sigue dentro con una sesión nueva (B-05)
+    dispositivo_actual: str | None = Field(None, exclude=True, description="Uso interno.")
+
+    def model_post_init(self, __context: Any) -> None:
+        """Valida que se proporcione al menos un campo y confirma password si aplica."""
+        if not self.new_email and not self.new_password:
+            raise ValueError("Debe proporcionar 'new_email' o 'new_password'.")
+
+        if self.new_password and self.new_password != self.confirm_password:
+            raise ValueError("El nuevo password y su confirmación no coinciden.")
+
+
+class SesionNuevaDTO(BaseModel):
+    """La sesión nueva del dispositivo que cambió la contraseña: va en cookies, nunca en el cuerpo."""
+
+    access_token: str
+    refresh_token: str
+    csrf_token: str
+
+
+class UpdateSecurityResponseDTO(BaseModel):
+    """DTO de salida para actualización de seguridad."""
+
+    user: UserResponseDTO = Field(..., description="Información actualizada del usuario.")
+    message: str = Field(
+        default="Datos de seguridad actualizados",
+        description=CONFIRMATION_MESSAGE_DESCRIPTION,
+    )
+    # Con la contraseña cambiada, la sesión nueva de este dispositivo: la ruta la pone
+    # en cookies y no sale en el JSON (B-05)
+    sesion_nueva: SesionNuevaDTO | None = Field(None, exclude=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Verify Email
+# ======================================================================================
+
+
+class VerifyEmailRequestDTO(BaseModel):
+    """
+    DTO de entrada para verificación de email.
+    """
+
+    token: str = Field(..., min_length=1, description="Token de verificación de email.")
+
+
+class VerifyEmailResponseDTO(BaseModel):
+    """
+    DTO de salida para verificación de email. Solo verifica, sin sesión (BE #753):
+    quien se registró con un correo ajeno no entra cuando el dueño pulsa el enlace.
+    """
+
+    message: str = Field(
+        default="Email verified. Please sign in.",
+        description=CONFIRMATION_MESSAGE_DESCRIPTION,
+    )
+    email_verified: bool = Field(
+        default=True, description="Confirmación de que el email fue verificado."
+    )
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Resend Verification Email
+# ======================================================================================
+
+
+class ResendVerificationEmailRequestDTO(BaseModel):
+    """
+    DTO de entrada para reenvío de email de verificación.
+    """
+
+    email: EmailStr = Field(
+        ..., max_length=FieldLimits.EMAIL_MAX_LENGTH, description=EMAIL_DESCRIPTION
+    )
+
+
+class ResendVerificationFromLinkRequestDTO(BaseModel):
+    """El cuerpo de `POST /auth/resend-verification-link` (fase 3): el enlace caducado."""
+
+    token: str = Field(
+        ...,
+        min_length=1,
+        max_length=512,
+        description="El token del enlace de verificación caducado (prueba de tener el buzón).",
+    )
+
+
+class ResendVerificationFromLinkResponseDTO(BaseModel):
+    """La respuesta, la misma tanto si se envió como si no."""
+
+    message: str = Field(
+        default=(
+            "If the link belongs to an account pending verification, a new one has been sent."
+        ),
+        description=CONFIRMATION_MESSAGE_DESCRIPTION,
+    )
+
+
+class ResendVerificationEmailResponseDTO(BaseModel):
+    """DTO de salida para reenvío de email de verificación."""
+
+    message: str = Field(
+        default="Email de verificación enviado exitosamente",
+        description=CONFIRMATION_MESSAGE_DESCRIPTION,
+    )
+    email: EmailStr = Field(..., description="Email al que se envió el mensaje de verificación.")
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Refresh Access Token (Session Timeout - v1.8.0)
+# ======================================================================================
+
+
+class RefreshAccessTokenRequestDTO(BaseModel):
+    """
+    DTO de entrada para renovar el access token usando un refresh token válido.
+
+    Esta operación NO requiere autenticación previa, ya que el refresh token
+    contiene toda la información necesaria para generar un nuevo access token.
+
+    Security Logging (v1.8.0):
+    - ip_address y user_agent son opcionales para security audit trail
+    - Proporcionados por API layer, no requeridos en tests
+
+    El dispositivo es el del refresh token (BE #737): la cookie del dispositivo no
+    hace falta aquí desde BE #738
+    """
+
+    # El refresh token se leerá desde la cookie httpOnly, no del body
+    # Security context (opcional, proporcionado por API layer)
+    ip_address: str | None = Field(None, max_length=45, description=IP_ADDRESS_DESCRIPTION)
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+    installed_app: bool = Field(
+        default=False,
+        description="La app instalada (PWA), por la cabecera X-App-Mode: standalone (BE #737)",
+    )
+    country_code: str | None = Field(
+        default=None,
+        max_length=2,
+        description="País (ISO 3166 alfa-2) que da Cloudflare, solo con su secreto (BE #737)",
+    )
+    # Los dispositivos de la cookie del navegador (uno por cuenta que entró en él): para
+    # no borrar la cookie de una sesión más nueva en un 401 tardío (BE #734)
+    dispositivos_del_navegador: list[str] = Field(default_factory=list, max_length=10)
+
+
+class RefreshAccessTokenResponseDTO(BaseModel):
+    """
+    DTO de salida para renovación de access token.
+
+    Retorna un nuevo access token válido por 15 minutos.
+    El refresh token rota (F-02): el nuevo va solo a la cookie httpOnly, nunca al JSON
+    (`exclude=True`), y no está si no toca emitir otro (dos pestañas a la vez).
+
+    CSRF Protection (v1.13.0):
+    - csrf_token: Nuevo token CSRF generado al renovar access token (vale lo que el
+      refresh token más 1 h; su cookie dura 15 minutos)
+    """
+
+    # El access token nuevo, solo para la cookie httpOnly de la ruta (F-03, 2.58.0)
+    access_token: str = Field(..., exclude=True)
+    csrf_token: str = Field(
+        ...,
+        description=(
+            "Nuevo token CSRF para validación double-submit (vale lo que el refresh "
+            "token más 1 h; su cookie dura 15 minutos)."
+        ),
+    )
+    user: UserResponseDTO = Field(..., description="Información básica del usuario autenticado.")
+    message: str = Field(
+        default="Access token renovado exitosamente",
+        description="Mensaje de confirmación de renovación.",
+    )
+    # El dispositivo de la sesión, el de su token de refresco (BE #737)
+    device_id: str = Field(..., description="ID del dispositivo de esta sesión.")
+    # El refresh token nuevo y lo que le queda en segundos (F-02): para la cookie de la
+    # ruta, nunca para el cuerpo ni el esquema. None: no se emite otro
+    refresh_token: str | None = Field(default=None, exclude=True)
+    refresh_token_max_age: int | None = Field(default=None, exclude=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Request Password Reset (Forgot Password)
+# ======================================================================================
+
+
+class RequestPasswordResetRequestDTO(BaseModel):
+    """
+    DTO de entrada para solicitar el reseteo de contraseña.
+
+    Este endpoint es público (NO requiere autenticación) y se usa cuando el usuario
+    olvida su contraseña. Se envía un email con un token único válido por 24 horas.
+
+    Security:
+    - Rate limiting: 3 intentos/hora por email (configurado en SlowAPI)
+    - Timing attack prevention: Mensaje genérico sin revelar si el email existe
+    - Sanitización de email para prevenir email injection
+    - ip_address y user_agent opcionales para security audit trail
+
+    Nota:
+    - Si el email NO existe, se retorna 200 OK con mensaje genérico
+    - Si el email existe, se envía el email y se retorna 200 OK con el mismo mensaje
+    - Esto previene enumeración de usuarios (OWASP A01)
+    """
+
+    email: EmailStr = Field(
+        ...,
+        max_length=FieldLimits.EMAIL_MAX_LENGTH,
+        description="Email del usuario que solicita resetear su contraseña.",
+    )
+    # Security context (opcional, proporcionado por API layer)
+    ip_address: str | None = Field(None, max_length=45, description=IP_ADDRESS_DESCRIPTION)
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+
+
+class RequestPasswordResetResponseDTO(BaseModel):
+    """
+    DTO de salida para solicitud de reseteo de contraseña.
+
+    IMPORTANTE: El mensaje es genérico para prevenir enumeración de usuarios.
+    No revela si el email existe o no en el sistema.
+    """
+
+    message: str = Field(
+        default="Si el email existe en nuestro sistema, recibirás un enlace para resetear tu contraseña.",
+        description="Mensaje genérico de confirmación (no revela si el email existe).",
+    )
+    email: EmailStr = Field(..., description="Email al que se envió el enlace (si existe).")
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Reset Password (Completar Reseteo)
+# ======================================================================================
+
+
+class ResetPasswordRequestDTO(BaseModel):
+    """
+    DTO de entrada para completar el reseteo de contraseña.
+
+    Este endpoint es público (NO requiere autenticación) y se usa cuando el usuario
+    hace clic en el enlace del email de reseteo.
+
+    Validaciones:
+    - Token debe ser válido y no expirado (< 24 horas)
+    - Nueva contraseña debe cumplir política OWASP ASVS V2.1:
+      * Mínimo 12 caracteres
+      * Al menos 1 mayúscula, 1 minúscula, 1 número, 1 símbolo
+      * No en lista de contraseñas comunes
+
+    Post-Condiciones:
+    - Token invalidado (uso único)
+    - Todas las sesiones activas del usuario invalidadas (refresh tokens revocados)
+    - Email de confirmación enviado al usuario
+
+    Security:
+    - Rate limiting: 3 intentos/hora por IP (configurado en SlowAPI)
+    - Token de un solo uso (se invalida después del primer uso exitoso)
+    - Password policy aplicada por el Value Object Password
+    - ip_address y user_agent opcionales para security audit trail
+    """
+
+    token: str = Field(
+        ...,
+        min_length=32,
+        max_length=100,
+        description="Token de reseteo único recibido por email (válido 1 hora).",
+    )
+    new_password: str = Field(
+        ...,
+        min_length=12,
+        max_length=FieldLimits.PASSWORD_MAX_LENGTH,
+        description="Nueva contraseña (mínimo 12 caracteres, incluir mayúsculas, minúsculas, números y símbolos).",
+    )
+    # Security context (opcional, proporcionado por API layer)
+    ip_address: str | None = Field(None, max_length=45, description=IP_ADDRESS_DESCRIPTION)
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+
+
+class ResetPasswordResponseDTO(BaseModel):
+    """
+    DTO de salida para reseteo de contraseña completado.
+
+    Confirma que la contraseña fue cambiada exitosamente.
+    """
+
+    message: str = Field(
+        default="Contraseña reseteada exitosamente. Todas tus sesiones activas han sido cerradas por seguridad.",
+        description="Mensaje de confirmación de reseteo exitoso.",
+    )
+    email: EmailStr = Field(..., description="Email del usuario que completó el reseteo.")
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Validate Reset Token (Validación Previa - Opcional)
+# ======================================================================================
+
+
+class ValidateResetTokenRequestDTO(BaseModel):
+    """
+    DTO de entrada para validar un token de reseteo antes de mostrar el formulario.
+
+    Este endpoint es OPCIONAL pero mejora la UX:
+    - Valida el token ANTES de que el usuario complete el formulario
+    - Si el token es inválido/expirado, redirige a /forgot-password con mensaje
+    - Si el token es válido, muestra el formulario de nueva contraseña
+
+    Security:
+    - NO requiere autenticación (endpoint público)
+    - NO revela información sobre el usuario (solo valida token)
+    - Rate limiting: 10 intentos/hora por IP
+    """
+
+    token: str = Field(
+        ..., min_length=32, max_length=100, description="Token de reseteo a validar."
+    )
+
+
+class ValidateResetTokenBodyDTO(BaseModel):
+    """
+    El cuerpo de `POST /auth/validate-reset-token` (fase 3, C4): el token, fuera de la URL.
+
+    Sin la longitud exacta aquí: un token imposible responde 200 con valid=False
+    (BE #453), no 422. Con tope, para no aceptar cuerpos enormes.
+    """
+
+    token: str = Field(..., max_length=512, description="Token de reseteo a validar.")
+
+
+class ValidateResetTokenResponseDTO(BaseModel):
+    """
+    DTO de salida para validación de token de reseteo.
+
+    Retorna si el token es válido y no ha expirado.
+    """
+
+    valid: bool = Field(..., description="True si el token es válido y no expiró.")
+    message: str = Field(..., description="Mensaje descriptivo del estado del token.")
+    # NO incluir email del usuario por seguridad (no revelar información)
+
+
+# ======================================================================================
+# DTOs para Account Lockout (v1.13.0)
+# ======================================================================================
+
+
+class UnlockAccountRequestDTO(BaseModel):
+    """
+    DTO de entrada para desbloquear manualmente una cuenta (solo Admin).
+
+    Security (OWASP A01, A09):
+    - Solo Admin puede ejecutar este endpoint (lo comprueba la ruta)
+    - Cada desbloqueo queda en el log de seguridad: quién, a quién y desde dónde
+    """
+
+    user_id: str = Field(
+        ...,
+        min_length=36,
+        max_length=36,
+        description="UUID del usuario cuya cuenta se va a desbloquear.",
+    )
+    unlocked_by_user_id: str = Field(
+        ...,
+        min_length=36,
+        max_length=36,
+        description="UUID del admin que realiza el desbloqueo (para auditoría).",
+    )
+    # Los pone la ruta, para el log de seguridad (hotfix 2.50.1): fuera del esquema
+    # público, y la ruta los pisa siempre con los de la petición
+    ip_address: SkipJsonSchema[str | None] = Field(default=None, max_length=45)
+    user_agent: SkipJsonSchema[str | None] = Field(default=None, max_length=500)
+
+
+class UnlockAccountResponseDTO(BaseModel):
+    """
+    DTO de salida para desbloqueo de cuenta.
+
+    Retorna el resultado de la operación de desbloqueo.
+    """
+
+    success: bool = Field(..., description="True si la cuenta fue desbloqueada exitosamente.")
+    message: str = Field(..., description="Mensaje descriptivo del resultado.")
+    user_id: str = Field(..., description="UUID del usuario cuya cuenta fue desbloqueada.")
+    unlocked_by: str = Field(..., description="UUID del admin que realizó el desbloqueo.")
+
+
+# ======================================================================================
+# DTO para Consultar Roles de Usuario (RBAC)
+# ======================================================================================
+
+
+class UserRolesResponseDTO(BaseModel):
+    """
+    DTO de salida que indica los roles del usuario en una competición específica.
+
+    Utilizado por el frontend para mostrar/ocultar funcionalidades según permisos.
+    """
+
+    is_admin: bool = Field(
+        ..., description="True si el usuario es administrador del sistema (rol global)."
+    )
+    is_creator: bool = Field(
+        ..., description="True si el usuario creó esta competición (rol contextual)."
+    )
+    is_player: bool = Field(
+        ...,
+        description="True si el usuario está enrollado en esta competición con status APPROVED (rol contextual).",
+    )
+    competition_id: str = Field(
+        ..., description="UUID de la competición para la cual se consultaron los roles."
+    )
+
+
+class RefreshOwnHandicapRequestDTO(BaseModel):
+    """Petición para refrescar desde la RFEG el hándicap del propio usuario (#340)."""
+
+    user_id: UUID = Field(..., description="ID del usuario autenticado que lo pide.")
+
+
+class RefreshOwnHandicapResponseDTO(BaseModel):
+    """
+    Resultado del refresco del hándicap propio (#340).
+
+    Sustituye al `needs_handicap` que devolvía el login: el login ya no espera a
+    la RFEG, así que la respuesta llega aparte, cuando el frontend la pide.
+    """
+
+    needs_handicap: bool = Field(
+        ...,
+        description=(
+            "True si hay que pedirle el hándicap al jugador: no es español, no tiene "
+            "país, o es español y la RFEG no lo encontró, no respondió o no se pudo "
+            "guardar lo que dio. El FE debe mostrar HandicapRequestModal."
+        ),
+    )
+    handicap: float | None = Field(
+        None,
+        description="Hándicap vigente tras el refresco, o null si no hay uno guardado.",
+    )
+
+
+class AcceptTermsRequestDTO(BaseModel):
+    """
+    Entrada del caso de uso de aceptar los Términos vigentes.
+
+    La rellena la capa de API: el usuario sale de la sesión, y la IP y el
+    navegador de la petición (los mismos helpers que el login y el logout).
+    """
+
+    user_id: str = Field(..., description="ID del usuario autenticado.")
+    current_user: "UserResponseDTO | None" = Field(
+        None,
+        description=(
+            "El usuario de la sesión, tal como lo cargó get_current_user. Si ya "
+            "tiene aceptada la versión vigente, se responde con él sin leer nada más."
+        ),
+    )
+    ip_address: str | None = Field(None, max_length=45, description=IP_ADDRESS_DESCRIPTION)
+    user_agent: str | None = Field(None, max_length=500, description=USER_AGENT_DESCRIPTION)
+
+
+AcceptTermsRequestDTO.model_rebuild()

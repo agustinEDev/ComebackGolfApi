@@ -1,0 +1,456 @@
+"""Caso de Uso: Actualizar Ronda/Sesión de competición."""
+
+from collections.abc import Callable
+from datetime import datetime
+
+from src.modules.competition.application.dto.round_match_dto import (
+    UpdateRoundRequestDTO,
+    UpdateRoundResponseDTO,
+)
+from src.modules.competition.application.exceptions import (
+    CompetitionNotFoundError,
+    DateOutOfRangeError,
+    FranjaInvalidaError,
+    NotCompetitionCreatorError,
+    RoundNotFoundError,
+    RoundNotModifiableError,
+)
+from src.modules.competition.application.ports.competition_activity_publisher_interface import (
+    CompetitionActivityPublisherInterface,
+)
+from src.modules.competition.application.ports.competition_timezone import ICompetitionTimezone
+from src.modules.competition.application.services.avisos_de_actividad import AvisosDeActividad
+from src.modules.competition.application.services.esperas_de_la_competicion import (
+    EsperasDeLaCompeticion,
+)
+from src.modules.competition.application.services.franjas import (
+    comprobar_agenda,
+    comprobar_que_existen_sus_salidas,
+    comprobar_que_nadie_pierde_su_sitio,
+    comprobar_que_no_ha_pasado,
+    comprobar_solape,
+    comprobar_tipo,
+    hoja_de,
+    primera_salida_de,
+)
+from src.modules.competition.application.services.jugadores_de_la_partida import (
+    JugadoresDeLaPartida,
+)
+from src.modules.competition.application.services.partidas_de_la_franja import (
+    comprobar_que_caben_las_partidas,
+    recalcular_partidas,
+)
+from src.modules.competition.application.services.partidas_del_jugador import (
+    salidas_por_hora,
+)
+from src.modules.competition.application.services.salidas_de_la_ronda import (
+    Salidas,
+    de_las_partidas,
+)
+from src.modules.competition.domain.entities.competition import Competition
+from src.modules.competition.domain.entities.partida import Partida
+from src.modules.competition.domain.entities.round import Round
+from src.modules.competition.domain.policies.zona_horaria import zona_del_campo
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.value_objects.handicap_mode import HandicapMode
+from src.modules.competition.domain.value_objects.hoja_de_salidas import HojaDeSalidas
+from src.modules.competition.domain.value_objects.round_id import RoundId
+from src.modules.competition.domain.value_objects.session_type import SessionType
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_en_utc
+from src.shared.domain.value_objects.match_format import MatchFormat
+
+
+class GolfCourseNotInCompetitionError(Exception):
+    """El campo de golf no está asociado a la competición."""
+
+    pass
+
+
+class DuplicateSessionError(Exception):
+    """Ya existe una sesión con ese tipo en esa fecha."""
+
+    pass
+
+
+class UpdateRoundUseCase:
+    """
+    Caso de uso para actualizar una ronda de competición.
+
+    Restricciones:
+    - La ronda debe existir
+    - Solo el creador puede actualizar
+    - La competición no puede haber terminado ni estar cancelada (BE #365)
+    - La ronda debe estar en estado modificable (PENDING_TEAMS/PENDING_MATCHES)
+    """
+
+    def __init__(
+        self,
+        uow: CompetitionUnitOfWorkInterface,
+        jugadores: JugadoresDeLaPartida | None = None,
+        zonas: ICompetitionTimezone | None = None,
+        reloj: Callable[[], datetime] = ahora_en_utc,
+        actividad: CompetitionActivityPublisherInterface | None = None,
+    ):
+        """
+        Args:
+            jugadores: Para rehacer las fotos de las partidas si una franja cambia
+                de campo (#251). Sin él, ese cambio con partidas se rechaza
+            actividad: Los avisos de salida en Actividad (G); sin el, no se avisa
+        """
+        self._uow = uow
+        self._jugadores = jugadores
+        self._zonas = zonas
+        self._reloj = reloj
+        self._actividad = AvisosDeActividad(actividad)
+
+    async def execute(
+        self, request: UpdateRoundRequestDTO, user_id: UserId, is_admin: bool = False
+    ) -> UpdateRoundResponseDTO:
+        """
+        Edita una sesión: fecha, campo, formato o su hoja de salidas.
+
+        Si la franja crece, sus plazas nuevas son para los que esperan, y a cada uno
+        se le avisa (A3, 28 oct 2026).
+
+        Raises:
+            RoundNotFoundError, CompetitionNotFoundError, NotCompetitionCreatorError,
+            RoundNotModifiableError y los de la hoja de salidas
+        """
+        async with self._uow:
+            round_entity, competition = await self._ronda_y_competicion(request, user_id, is_admin)
+
+            # La agenda se edita desde que la competición existe (BE #365): lo
+            # que se protege es la sesión ya jugada, y eso lo mira la sesión. Las
+            # franjas de un stroke play, hasta iniciar (#251)
+            comprobar_agenda(competition)
+
+            # 5. Verificar campo de golf si se cambia
+            golf_course_id = self._campo_nuevo(competition, request)
+
+            # 6. Verificar fecha y sesión duplicada si se cambia fecha o tipo
+            del_dia = await self._sesiones_del_dia(request, competition, round_entity)
+
+            # 6b. Una franja solo cambia su hoja (no tiene formato), y no puede
+            #     acabar solapada con otra de su jornada (#251)
+            hoja = self._comprobar_franja(request, competition, round_entity, del_dia)
+            # Si su primera salida cambia, que no sea a una ya pasada; si no
+            # cambia, una franja ya empezada se sigue tocando como antes (QA del
+            # 11 oct 2026)
+            await self._que_no_salga_en_el_pasado(request, round_entity, hoja)
+            # Y que nadie de dentro pierda su sitio (#251)
+            await comprobar_que_nadie_pierde_su_sitio(
+                self._uow, round_entity, hoja, request.round_date
+            )
+            # Y que sus partidas quepan en la hoja nueva (D9, #251)
+            partidas = await self._partidas_que_caben(round_entity, hoja)
+            campo_anterior = round_entity.golf_course_id
+            # Las salidas de cada uno antes del cambio: la hoja o el dia mueven horas
+            antes = de_las_partidas(round_entity, partidas)
+
+            # 7. Actualizar la ronda (validación de estado dentro del dominio)
+            await self._actualizar(round_entity, request, golf_course_id, hoja)
+
+            await self._recalcular_partidas(competition, round_entity, partidas, campo_anterior)
+
+            await self._uow.rounds.update(round_entity)
+            # Si la franja creció, sus nuevas plazas para los que esperan (#251); si
+            # no hay sitio libre o no es una franja, no hace nada
+            asignadas = await self._listas_al_dia(competition, round_entity, request)
+
+        await self._avisar(competition, round_entity, antes, partidas, asignadas)
+
+        return UpdateRoundResponseDTO(
+            id=round_entity.id.value,
+            status=round_entity.status.value,
+            updated_at=round_entity.updated_at,
+        )
+
+    async def _ronda_y_competicion(
+        self, request: UpdateRoundRequestDTO, user_id: UserId, is_admin: bool
+    ) -> tuple[Round, Competition]:
+        """
+        La ronda y su competición, bloqueadas, si quien pide es su creador o admin.
+
+        Raises:
+            RoundNotFoundError, CompetitionNotFoundError, NotCompetitionCreatorError
+        """
+        # 1. Buscar la ronda
+        round_id = RoundId(request.round_id)
+        round_entity = await self._uow.rounds.find_by_id(round_id)
+
+        if not round_entity:
+            raise RoundNotFoundError(f"No existe ronda con ID {request.round_id}")
+
+        # 2. Buscar la competición
+        # Con la fila bloqueada: cambiar el formato tira los sobres de la
+        # sesion (FE #655), y hacerlo mientras un capitan entrega el suyo
+        # dejaria uno del formato viejo dentro
+        competition = await self._uow.competitions.find_by_id_for_update(
+            round_entity.competition_id
+        )
+
+        if not competition:
+            raise CompetitionNotFoundError("La competición asociada no existe")
+
+        # Releída tras el bloqueo: si mientras se esperaba otra petición
+        # generó sus partidos, se decide con eso y no con lo de antes
+        # Si otra petición la borró mientras se esperaba, ya no existe
+        releida = await self._uow.rounds.find_by_id_for_update(round_id)
+        if releida is None:
+            raise RoundNotFoundError(f"No existe ronda con ID {request.round_id}")
+        round_entity = releida
+
+        # 3. Verificar creador
+        if not is_admin and not competition.is_creator(user_id):
+            raise NotCompetitionCreatorError("Solo el creador puede actualizar rondas")
+        return round_entity, competition
+
+    async def _sesiones_del_dia(
+        self, request: UpdateRoundRequestDTO, competition: Competition, round_entity: Round
+    ) -> list[Round]:
+        """
+        Las sesiones del día de destino, una sola vez: para el duplicado y para el
+        solape de una franja (#251).
+
+        Raises:
+            DateOutOfRangeError: Si la fecha nueva cae fuera del torneo
+            DuplicateSessionError: Si ese día ya hay otra sesión de ese tipo
+        """
+        # Dentro del torneo, como al crearla: con la agenda abierta desde el
+        # principio, mover una sesión fuera de las fechas ya no esperaba al
+        # cierre para ser posible (BE #365, CodeRabbit)
+        if request.round_date and not (
+            competition.dates.start_date <= request.round_date <= competition.dates.end_date
+        ):
+            raise DateOutOfRangeError(
+                f"La fecha {request.round_date} está fuera del rango "
+                f"({competition.dates.start_date} - {competition.dates.end_date})"
+            )
+
+        dia = request.round_date or round_entity.round_date
+        del_dia = await self._uow.rounds.find_by_competition_and_date(
+            round_entity.competition_id, dia
+        )
+        if request.session_type or request.round_date:
+            check_session = (
+                SessionType(request.session_type)
+                if request.session_type
+                else round_entity.session_type
+            )
+            for existing in del_dia:
+                if existing.id != round_entity.id and existing.session_type == check_session:
+                    raise DuplicateSessionError(
+                        f"Ya existe una sesión {check_session.value} en la fecha {dia}"
+                    )
+        return del_dia
+
+    async def _actualizar(
+        self,
+        round_entity: Round,
+        request: UpdateRoundRequestDTO,
+        golf_course_id: GolfCourseId | None,
+        hoja: HojaDeSalidas | None,
+    ) -> None:
+        """
+        Cambia la ronda (el dominio valida su estado) y, si cambia el formato,
+        tira sus sobres.
+
+        Raises:
+            RoundNotModifiableError: Si la sesión ya no se puede tocar
+        """
+        session_type = SessionType(request.session_type) if request.session_type else None
+        match_format = MatchFormat(request.match_format) if request.match_format else None
+        handicap_mode = HandicapMode(request.handicap_mode) if request.handicap_mode else None
+
+        formato_anterior = round_entity.match_format
+        try:
+            round_entity.update_details(
+                round_date=request.round_date,
+                session_type=session_type,
+                golf_course_id=golf_course_id,
+                match_format=match_format,
+                handicap_mode=handicap_mode,
+                allowance_percentage=request.allowance_percentage,
+                clear_allowance=request.clear_allowance,
+            )
+            if hoja is not None:
+                round_entity.cambiar_hoja_de_salidas(hoja)
+        except ValueError as e:
+            raise RoundNotModifiableError(str(e)) from e
+
+        if formato_anterior is not None and formato_anterior != round_entity.match_format:
+            # Los sobres eran de otro formato: uno de parejas no vale para
+            # unos individuales —el capitan ya no podria ni corregirlo— y al
+            # reves revienta al generar los partidos. Se tiran, y los
+            # capitanes vuelven a entregar (FE #655)
+            await self._uow.envelopes.delete_by_round(round_entity.id)
+            # Y el motivo por el que no salieron los partidos era de ESOS
+            # sobres: si se queda, «Generar» se ofrece como reintento y, sin
+            # sobres, empareja por handicap (revision de la FE #711)
+            round_entity.clear_match_generation_block()
+
+    async def _partidas_que_caben(self, franja: Round, hoja: HojaDeSalidas | None) -> list[Partida]:
+        """
+        Las partidas de la franja, si caben en la hoja nueva (D9, #251).
+
+        Con alguna ya salida (por su estado o por su hora), la franja ya no se toca:
+        cambiaría la hora o las barras de quien ya está en el campo (D11).
+        """
+        partidas = await self._uow.partidas.de_la_franja(franja.id)
+        salidas = await salidas_por_hora(franja, partidas, self._zonas, self._reloj())
+        if any(p.empezada or p.id in salidas for p in partidas):
+            raise FranjaInvalidaError("La franja ya ha empezado: sus partidas no se cambian.")
+        if hoja is not None:
+            comprobar_que_caben_las_partidas(partidas, hoja)
+        return partidas
+
+    async def _recalcular_partidas(
+        self,
+        competition: Competition,
+        franja: Round,
+        partidas: list[Partida],
+        campo_anterior: GolfCourseId,
+    ) -> None:
+        """
+        Otro campo: otras barras y otros golpes en las partidas sin salir. Si alguien
+        no tiene barras en el nuevo, se rechaza con la lista (D9, G2, #251).
+        """
+        if not partidas or franja.golf_course_id == campo_anterior:
+            return
+        if self._jugadores is None:
+            raise FranjaInvalidaError(
+                "No se puede cambiar el campo de una franja con partidas aquí."
+            )
+        # D10: sin zona no se sabe cuándo sale nadie, ni qué partidas salieron
+        if self._zonas is not None and (
+            zona_del_campo(await self._zonas.for_course(franja.golf_course_id)) is None
+        ):
+            raise FranjaInvalidaError(
+                "El campo nuevo no tiene zona horaria: una franja con partidas la necesita."
+            )
+        await recalcular_partidas(self._uow, self._jugadores, competition, franja, partidas)
+
+    async def _que_no_salga_en_el_pasado(
+        self, request: UpdateRoundRequestDTO, franja: Round, hoja: HojaDeSalidas | None
+    ) -> None:
+        """
+        Raises:
+            FranjaEnElPasadoError: Si su primera salida pasa a una que ya llegó
+            FranjaInvalidaError: Si con el cambio alguna salida cae en la hora
+                que no existe por el cambio de hora
+        """
+        if franja.hoja_de_salidas is None:
+            return
+        antes = await primera_salida_de(
+            franja.hoja_de_salidas, franja.round_date, franja.golf_course_id, self._zonas
+        )
+        campo = (
+            GolfCourseId(request.golf_course_id)
+            if request.golf_course_id
+            else franja.golf_course_id
+        )
+        nueva = await primera_salida_de(
+            hoja or franja.hoja_de_salidas,
+            request.round_date or franja.round_date,
+            campo,
+            self._zonas,
+        )
+        if hoja is not None or request.round_date or request.golf_course_id:
+            await comprobar_que_existen_sus_salidas(
+                hoja or franja.hoja_de_salidas,
+                request.round_date or franja.round_date,
+                campo,
+                self._zonas,
+            )
+        if nueva != antes:
+            comprobar_que_no_ha_pasado(nueva, self._reloj())
+
+    @staticmethod
+    def _comprobar_franja(
+        request: UpdateRoundRequestDTO,
+        competition: Competition,
+        round_entity: Round,
+        del_dia: list[Round],
+    ) -> HojaDeSalidas | None:
+        """
+        La hoja nueva, si viene; y que la sesión sigue siendo de su tipo y no choca
+        con otra franja de su jornada y su campo (se cambie la hoja, el día o el campo).
+        """
+        hoja = hoja_de(request.tee_sheet)
+        comprobar_tipo(
+            competition,
+            hoja,
+            con_formato=request.match_format is not None
+            or request.handicap_mode is not None
+            or request.allowance_percentage is not None
+            or request.clear_allowance,
+            trae_formato=request.match_format is not None,
+            exige_formato=False,
+        )
+        hoja_final = hoja or round_entity.hoja_de_salidas
+        if hoja_final is not None and (
+            hoja is not None or request.round_date or request.golf_course_id
+        ):
+            comprobar_solape(
+                hoja_final,
+                request.round_date or round_entity.round_date,
+                GolfCourseId(request.golf_course_id)
+                if request.golf_course_id
+                else round_entity.golf_course_id,
+                del_dia,
+                excepto=round_entity.id,
+            )
+        return hoja
+
+    @staticmethod
+    def _campo_nuevo(
+        competition: Competition, request: UpdateRoundRequestDTO
+    ) -> GolfCourseId | None:
+        """
+        El campo al que se cambia, si se cambia.
+
+        Raises:
+            GolfCourseNotInCompetitionError: Si no es uno de los de la competición
+        """
+        if not request.golf_course_id:
+            return None
+        golf_course_id = GolfCourseId(request.golf_course_id)
+        if not competition.has_golf_course(golf_course_id):
+            raise GolfCourseNotInCompetitionError(
+                f"El campo de golf {request.golf_course_id} no está asociado a la competición"
+            )
+        return golf_course_id
+
+    async def _avisar(
+        self,
+        competition: Competition,
+        round_entity: Round,
+        antes: Salidas,
+        partidas: list[Partida],
+        asignadas: list[tuple[Round, UserId]],
+    ) -> None:
+        """Ya guardado, lo que se cuenta en Actividad."""
+        # Solo a quien le cambia la hora o el dia (G3)
+        await self._actividad.salidas_cambiadas(
+            competition, round_entity.id, antes, de_las_partidas(round_entity, partidas)
+        )
+        # Y a quien la lista dio una de las plazas nuevas (A3)
+        await self._actividad.desde_la_espera(competition, asignadas)
+
+    async def _listas_al_dia(
+        self, competition: Competition, round_entity: Round, request: UpdateRoundRequestDTO
+    ) -> list[tuple[Round, UserId]]:
+        """
+        Las plazas que haya ahora libres, para los que esperan (#251); y si la
+        franja cambió de día, cambia qué días juega cada uno: listas al día.
+        """
+        esperas = EsperasDeLaCompeticion(self._uow)
+        if request.tee_sheet is not None:
+            await esperas.rellenar(competition, round_entity.id, self._reloj())
+        if request.round_date:
+            await esperas.limpiar(competition)
+        return esperas.asignadas

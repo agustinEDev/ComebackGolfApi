@@ -1,0 +1,222 @@
+"""
+Request Password Reset Use Case
+
+Caso de uso para solicitar el reseteo de contraseña (flujo "Olvidé mi contraseña").
+Este endpoint es público y NO requiere autenticación.
+
+Security Features:
+- Timing attack prevention: Siempre retorna 200 OK con mensaje genérico
+- Rate limiting: 3 intentos/hora por correo + red (la ruta, fase 3 H1) y como mucho 10
+  correos por cuenta en 24 horas, vengan de donde vengan (aquí, fase 3 H2)
+- Email injection prevention: Validación con Pydantic EmailStr
+- Security logging: Registra todas las solicitudes (exitosas y fallidas)
+"""
+
+from src.modules.user.application.dto.user_dto import (
+    RequestPasswordResetRequestDTO,
+    RequestPasswordResetResponseDTO,
+)
+from src.modules.user.application.ports.correo_en_segundo_plano_port import (
+    ICorreoEnSegundoPlano,
+)
+from src.modules.user.application.ports.email_service_interface import IEmailService
+from src.modules.user.application.ports.security_audit_interface import ISecurityAuditLogger
+from src.modules.user.application.services.registra_sin_romper import registra_sin_romper
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.value_objects.email import Email
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+
+
+class RequestPasswordResetUseCase:
+    """
+    Caso de uso para solicitar el reseteo de contraseña.
+
+    Responsabilidades:
+    - Buscar usuario por email (sin revelar si existe)
+    - Generar token de reseteo con expiración de 1 hora (se guarda su hash)
+    - Enviar email con enlace de reseteo
+    - Aplicar timing attack prevention
+
+    Security (OWASP A01, A07):
+    - Usuario no autenticado (endpoint público)
+    - Mensaje genérico para prevenir enumeración de usuarios
+    - Delay artificial si el email NO existe (evita timing attacks)
+    - Token de 256 bits criptográficamente seguro
+    - Expiración automática en 1 hora
+    - Como mucho 10 correos por cuenta en 24 horas: por encima no se envía nada, el
+      enlace de antes sigue valiendo y la respuesta es la misma
+    """
+
+    def __init__(
+        self,
+        uow: UserUnitOfWorkInterface,
+        email_service: IEmailService,
+        *,
+        frontend_url: str,
+        security_audit: ISecurityAuditLogger,
+        correo_en_segundo_plano: ICorreoEnSegundoPlano | None = None,
+    ):
+        """
+        Inicializa el caso de uso.
+
+        Args:
+            uow: Unit of Work para acceso a repositorio de usuarios
+            email_service: Servicio para envío de emails (Mailgun)
+            frontend_url: URL del frontend para el enlace de reseteo; la pone
+                la composition root desde `FRONTEND_URL`
+        """
+        self._frontend_url = frontend_url.rstrip("/")
+        self._security_audit = security_audit
+        self._uow = uow
+        self._email_service = email_service
+        # El correo sale sin que la respuesta lo espere (fase 3, B-2): así tarda lo mismo
+        # exista o no la cuenta, sin retardo artificial. Sin él (tests de antes), se espera
+        self._correo_en_segundo_plano = correo_en_segundo_plano
+
+    async def execute(
+        self, request: RequestPasswordResetRequestDTO
+    ) -> RequestPasswordResetResponseDTO:
+        """
+        Ejecuta el caso de uso de solicitud de reseteo de contraseña.
+
+        Args:
+            request: DTO con email y contexto de seguridad (IP, User-Agent)
+
+        Returns:
+            RequestPasswordResetResponseDTO con mensaje genérico
+            SIEMPRE retorna 200 OK, sin importar si el email existe
+
+        Security Flow:
+            1. Busca usuario por email
+            2. Si NO existe (o la cuenta agotó su cupo) → mensaje genérico + log
+            3. Si existe → Genera token + guarda + lanza el correo + log
+            4. Ambos casos retornan el MISMO mensaje (previene enumeración)
+
+        Example:
+            >>> request = RequestPasswordResetRequestDTO(
+            ...     email="user@example.com",
+            ...     ip_address="192.168.1.1",
+            ...     user_agent="Mozilla/5.0..."
+            ... )
+            >>> response = await use_case.execute(request)
+            >>> print(response.message)
+            "Si el email existe en nuestro sistema, recibirás un enlace..."
+        """
+        # Obtener security logger
+        security_logger = self._security_audit
+
+        # Valores por defecto para security logging
+        ip_address = request.ip_address or "unknown"
+        user_agent = request.user_agent or "unknown"
+
+        # Buscar usuario por email
+        email_vo = Email(request.email)
+        user = await self._uow.users.find_by_email(email_vo)
+
+        # CASO 1: Email NO existe en el sistema
+        if not user:
+            # Security Logging: Solicitud fallida (email no existe)
+            registra_sin_romper(
+                "Request password reset",
+                lambda: security_logger.log_password_reset_requested(
+                    user_id=None,
+                    email=request.email,
+                    success=False,
+                    failure_reason="Email not found (not revealed to client)",
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                ),
+            )
+
+            # Retornar mensaje genérico (NO revelar que el email no existe)
+            return RequestPasswordResetResponseDTO(
+                message="Si el email existe en nuestro sistema, recibirás un enlace para resetear tu contraseña.",
+                email=request.email,
+            )
+
+        # CASO 2: Email existe → Generar token (1 h) y enviar email, si la cuenta no
+        # agotó sus 10 correos del día (H2). Contado sobre la fila bloqueada: dos
+        # peticiones a la vez no se pasan del tope
+        async with self._uow:
+            bloqueado = await self._uow.users.find_by_id_for_update(user.id)
+            cabe = bloqueado is not None and bloqueado.cuenta_un_correo_de_reset(
+                ahora_utc_sin_zona()
+            )
+            if cabe and bloqueado is not None:
+                user = bloqueado
+                token = user.generate_password_reset_token()
+                await self._uow.users.save(user)
+            # Commit automático al salir del contexto
+
+        if not cabe:
+            # Sin correo: el enlace de antes sigue valiendo, y la respuesta no lo dice (H3)
+            registra_sin_romper(
+                "Request password reset",
+                lambda: security_logger.log_password_reset_requested(
+                    user_id=str(user.id.value),
+                    email=request.email,
+                    success=False,
+                    failure_reason="Daily reset email limit reached (not revealed to client)",
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                ),
+            )
+            return RequestPasswordResetResponseDTO(
+                message="Si el email existe en nuestro sistema, recibirás un enlace para resetear tu contraseña.",
+                email=request.email,
+            )
+
+        # Enviar email con enlace de reseteo, en segundo plano si se puede (B-2)
+        reset_link = self._build_reset_link(token)
+        email_service = self._email_service
+        user_name = user.get_full_name()
+
+        async def envia() -> bool:
+            return await email_service.send_password_reset_email(
+                to_email=request.email, reset_link=reset_link, user_name=user_name
+            )
+
+        if self._correo_en_segundo_plano is not None:
+            self._correo_en_segundo_plano.lanza("enlace-de-restablecer", envia)
+        else:
+            await envia()
+
+        # Security Logging: Solicitud exitosa
+        registra_sin_romper(
+            "Request password reset",
+            lambda: security_logger.log_password_reset_requested(
+                user_id=str(user.id.value),
+                email=request.email,
+                success=True,
+                failure_reason=None,
+                ip_address=ip_address,
+                user_agent=user_agent,
+            ),
+        )
+
+        # Retornar el MISMO mensaje genérico (previene enumeración)
+        return RequestPasswordResetResponseDTO(
+            message="Si el email existe en nuestro sistema, recibirás un enlace para resetear tu contraseña.",
+            email=request.email,
+        )
+
+    def _build_reset_link(self, token: str) -> str:
+        """
+        Construye el enlace de reseteo para incluir en el email.
+
+        El enlace apunta al frontend, que mostrará el formulario de nueva contraseña.
+
+        Args:
+            token: Token de reseteo generado
+
+        Returns:
+            URL completa: {FRONTEND_URL}/reset-password/{token}
+
+        Example:
+            >>> link = self._build_reset_link("abc123...")
+            >>> print(link)
+            "http://localhost:5173/reset-password/abc123..."
+        """
+        return f"{self._frontend_url}/reset-password/{token}"

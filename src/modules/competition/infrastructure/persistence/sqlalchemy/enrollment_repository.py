@@ -1,0 +1,305 @@
+"""
+Enrollment Repository - SQLAlchemy Implementation.
+
+Implementación concreta del repositorio de inscripciones usando SQLAlchemy async.
+"""
+
+from sqlalchemy import and_, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.modules.competition.domain.entities.enrollment import Enrollment
+from src.modules.competition.domain.repositories.enrollment_repository_interface import (
+    EnrollmentRepositoryInterface,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.enrollment_id import EnrollmentId
+from src.modules.competition.domain.value_objects.enrollment_status import (
+    EnrollmentStatus,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class SQLAlchemyEnrollmentRepository(EnrollmentRepositoryInterface):
+    """
+    Implementación asíncrona del repositorio de inscripciones con SQLAlchemy.
+
+    Maneja la persistencia de la entidad Enrollment usando async/await.
+    """
+
+    def __init__(self, session: AsyncSession):
+        """
+        Constructor del repositorio.
+
+        Args:
+            session: Sesión asíncrona de SQLAlchemy
+        """
+        self._session = session
+
+    async def add(self, enrollment: Enrollment) -> None:
+        """
+        Agrega una nueva inscripción al repositorio.
+
+        Args:
+            enrollment: Entidad Enrollment a guardar
+        """
+        self._session.add(enrollment)
+
+    async def update(self, enrollment: Enrollment) -> None:
+        """
+        Actualiza una inscripción existente.
+
+        Args:
+            enrollment: Entidad Enrollment con datos actualizados
+        """
+        self._session.add(enrollment)
+
+    async def find_by_id(self, enrollment_id: EnrollmentId) -> Enrollment | None:
+        """
+        Busca una inscripción por su ID único.
+
+        Args:
+            enrollment_id: ID de la inscripción
+
+        Returns:
+            Optional[Enrollment]: La inscripción encontrada o None
+        """
+        return await self._session.get(Enrollment, enrollment_id)
+
+    async def find_by_id_for_update(self, enrollment_id: EnrollmentId) -> Enrollment | None:
+        # `populate_existing`: sin él, SQLAlchemy devuelve el objeto que la sesión
+        # ya tenía, con el estado de antes del bloqueo (mismo patrón que las
+        # invitaciones y las franjas)
+        stmt = (
+            select(Enrollment)
+            .where(Enrollment._id == enrollment_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def find_by_competition(
+        self, competition_id: CompetitionId, limit: int | None = None, offset: int = 0
+    ) -> list[Enrollment]:
+        """
+        Busca todas las inscripciones de una competición.
+
+        Args:
+            competition_id: ID de la competición
+            limit: Número máximo de resultados; None = todos
+            offset: Número de resultados a saltar
+
+        Returns:
+            List[Enrollment]: Lista de inscripciones de la competición
+        """
+        statement = (
+            select(Enrollment)
+            .where(Enrollment._competition_id == competition_id)
+            .order_by(Enrollment._created_at.asc())  # Primero en inscribirse, primero en lista
+            .limit(limit)  # None = sin LIMIT
+            .offset(offset)
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_competition_and_status(
+        self,
+        competition_id: CompetitionId,
+        status: EnrollmentStatus,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Enrollment]:
+        """
+        Busca inscripciones de una competición filtradas por estado.
+
+        Args:
+            competition_id: ID de la competición
+            status: Estado de inscripción (enum)
+            limit: Número máximo de resultados; None = todos
+            offset: Número de resultados a saltar
+
+        Returns:
+            List[Enrollment]: Lista de inscripciones con el estado especificado
+
+        Note:
+            Usamos el atributo privado _status_value porque status es un composite.
+        """
+        statement = (
+            select(Enrollment)
+            .where(
+                and_(
+                    Enrollment._competition_id == competition_id,
+                    Enrollment._status_value == status.value,
+                )
+            )
+            .order_by(Enrollment._created_at.asc())
+            .limit(limit)  # None = sin LIMIT
+            .offset(offset)
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_user(
+        self, user_id: UserId, limit: int | None = None, offset: int = 0
+    ) -> list[Enrollment]:
+        """
+        Busca todas las inscripciones de un usuario.
+
+        Args:
+            user_id: ID del usuario
+            limit: Número máximo de resultados; None = todos
+            offset: Número de resultados a saltar
+
+        Returns:
+            List[Enrollment]: Lista de inscripciones del usuario
+        """
+        statement = (
+            select(Enrollment)
+            .where(Enrollment._user_id == user_id)
+            .order_by(Enrollment._created_at.desc())  # Más recientes primero
+            .limit(limit)  # None = sin LIMIT
+            .offset(offset)
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_user_ids_and_competition(
+        self, user_ids: list[UserId], competition_id: CompetitionId
+    ) -> list[Enrollment]:
+        """
+        Busca las inscripciones de un conjunto conocido de usuarios en una competición.
+
+        Una sola consulta con `IN`, sin límite ni paginación: llamado con los
+        jugadores que ya aparecen en la clasificación, que es un conjunto
+        acotado por `max_players` (`MAX_PLAYERS`) en un momento dado — al revés
+        que `find_by_competition`, que devuelve también las filas acumuladas con
+        el tiempo (rechazos, retiros, altas de nuevo).
+
+        Args:
+            user_ids: IDs de los usuarios de interés
+            competition_id: ID de la competición
+
+        Returns:
+            List[Enrollment]: Las inscripciones encontradas
+        """
+        if not user_ids:
+            return []
+        statement = select(Enrollment).where(
+            and_(
+                Enrollment._competition_id == competition_id,
+                Enrollment._user_id.in_([str(uid) for uid in user_ids]),
+            )
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_user_and_competition(
+        self, user_id: UserId, competition_id: CompetitionId
+    ) -> Enrollment | None:
+        """
+        Busca un enrollment específico de un usuario en una competición.
+
+        Args:
+            user_id: ID del usuario
+            competition_id: ID de la competición
+
+        Returns:
+            Enrollment | None: El enrollment si existe, None si no existe
+        """
+        statement = select(Enrollment).where(
+            and_(
+                Enrollment._user_id == user_id,
+                Enrollment._competition_id == competition_id,
+            )
+        )
+        result = await self._session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def count_approved(self, competition_id: CompetitionId) -> int:
+        """
+        Cuenta el total de inscripciones aprobadas en una competición.
+
+        Args:
+            competition_id: ID de la competición
+
+        Returns:
+            int: Número total de inscripciones aprobadas
+        """
+        statement = (
+            select(func.count())
+            .select_from(Enrollment)
+            .where(
+                and_(
+                    Enrollment._competition_id == competition_id,
+                    Enrollment._status_value == EnrollmentStatus.APPROVED.value,
+                )
+            )
+        )
+        result = await self._session.execute(statement)
+        return result.scalar_one()
+
+    async def count_approved_by_competition(self, competition_id: CompetitionId) -> int:
+        """
+        Alias para count_approved.
+        Cuenta el total de inscripciones aprobadas en una competición.
+
+        Args:
+            competition_id: ID de la competición
+
+        Returns:
+            int: Número total de inscripciones aprobadas
+        """
+        return await self.count_approved(competition_id)
+
+    async def count_active_by_user(self, user_id: UserId) -> int:
+        """
+        Cuenta el total de inscripciones activas de un usuario.
+
+        Considera activas las inscripciones con estado APPROVED o REQUESTED.
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            int: Número total de inscripciones activas
+        """
+        statement = (
+            select(func.count())
+            .select_from(Enrollment)
+            .where(
+                and_(
+                    Enrollment._user_id == user_id,
+                    Enrollment._status_value.in_(
+                        [
+                            EnrollmentStatus.APPROVED.value,
+                            EnrollmentStatus.REQUESTED.value,
+                        ]
+                    ),
+                )
+            )
+        )
+        result = await self._session.execute(statement)
+        return result.scalar_one()
+
+    async def count_pending(self, competition_id: CompetitionId) -> int:
+        """
+        Cuenta el total de inscripciones pendientes (REQUESTED) en una competición.
+
+        Args:
+            competition_id: ID de la competición
+
+        Returns:
+            int: Número total de inscripciones con estado REQUESTED
+        """
+        statement = (
+            select(func.count())
+            .select_from(Enrollment)
+            .where(
+                and_(
+                    Enrollment._competition_id == competition_id,
+                    Enrollment._status_value == EnrollmentStatus.REQUESTED.value,
+                )
+            )
+        )
+        result = await self._session.execute(statement)
+        return result.scalar_one()

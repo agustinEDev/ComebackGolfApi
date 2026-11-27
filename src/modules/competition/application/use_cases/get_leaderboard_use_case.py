@@ -1,0 +1,329 @@
+"""Caso de Uso: Obtener leaderboard de una competicion."""
+
+from typing import Any
+
+from src.modules.competition.application.dto.scoring_dto import (
+    DecidedResultDTO,
+    LeaderboardMatchDTO,
+    LeaderboardPlayerDTO,
+    LeaderboardResponseDTO,
+)
+from src.modules.competition.application.exceptions import CompetitionNotFoundError
+from src.modules.competition.application.ports.eventos_de_amigos_interface import (
+    EventosDeAmigosInterface,
+)
+from src.modules.competition.application.services.lo_jugado_de_una_privada import (
+    LoJugadoQueVe,
+    NoPuedeVerloError,
+    esta_dentro,
+    exigir_la_clasificacion,
+    la_ve_un_visitante,
+)
+from src.modules.competition.application.services.player_names import PlayerNames
+from src.modules.competition.domain.entities.competition import Competition, TournamentTypeError
+from src.modules.competition.domain.entities.match import Match
+from src.modules.competition.domain.entities.round import Round
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.services.scoring_service import ScoringService
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.match_player import MatchPlayer
+from src.modules.competition.domain.value_objects.round_id import RoundId
+from src.modules.user.domain.repositories.user_repository_interface import (
+    UserRepositoryInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.value_objects.match_format import MatchFormat
+
+
+class GetLeaderboardUseCase:
+    """Obtiene el leaderboard completo de una competicion."""
+
+    def __init__(
+        self,
+        uow: CompetitionUnitOfWorkInterface,
+        user_repo: UserRepositoryInterface,
+        scoring_service: ScoringService,
+        eventos: EventosDeAmigosInterface | None = None,
+    ):
+        self._uow = uow
+        self._user_repo = user_repo
+        self._scoring_service = scoring_service
+        # La llave de quien está fuera de una privada (27 oct 2026)
+        self._eventos = eventos
+
+    async def _dentro(
+        self, competition: Competition, quien: UserId | None, es_admin: bool, visitante: bool
+    ) -> bool:
+        """
+        Con el `uow` abierto y lo ya leído: solo su inscripción, y solo si hace
+        falta (PR 2). Sin sesión, solo una pública (L1, L3, 28 oct 2026).
+        """
+        if visitante:
+            return la_ve_un_visitante(competition)
+        return quien is None or await esta_dentro(self._uow, competition, quien, es_admin=es_admin)
+
+    async def _que_ve(
+        self, competition: Competition, dentro: bool, quien: UserId | None, visitante: bool
+    ) -> LoJugadoQueVe | None:
+        """
+        De fuera, la llave antes de leer rondas y partidos; sin sesión no hay
+        llave que buscar. None: todo.
+
+        Raises:
+            NoPuedeVerloError: Si no puede verla
+        """
+        if dentro:
+            return None
+        if visitante:
+            raise NoPuedeVerloError()
+        if quien is None:
+            return None
+        return await exigir_la_clasificacion(competition.id, quien, self._eventos)
+
+    async def execute(
+        self,
+        competition_id_str: str,
+        *,
+        quien: UserId | None = None,
+        es_admin: bool = False,
+        visitante: bool = False,
+    ) -> LeaderboardResponseDTO:
+        """
+        La clasificación. Quien está fuera de una privada, con la llave, ve el
+        marcador por equipos y solo los partidos de sus amigos (27 oct 2026);
+        dentro, o sin decir quién mira (usos internos), todos.
+
+        Raises:
+            NoPuedeVerloError: Si es una privada en la que no está, sin llave
+        """
+        async with self._uow:
+            comp_id = CompetitionId(competition_id_str)
+            competition = await self._uow.competitions.find_by_id(comp_id)
+            if not competition:
+                raise CompetitionNotFoundError(f"No existe competicion con ID {competition_id_str}")
+            dentro = await self._dentro(competition, quien, es_admin, visitante)
+        ve = await self._que_ve(competition, dentro, quien, visitante)
+        async with self._uow:
+            # Un Stableford o un Medal no tiene todavía su clasificación: se dice
+            # antes de leer rondas y partidos, y con su motivo (Agustín, 4 oct 2026)
+            tipo = competition.tournament_type
+            if not tipo.has_teams:
+                raise TournamentTypeError(
+                    f"La clasificación de un {tipo.label} llega con sus rondas: "
+                    "todavía no se puede consultar"
+                )
+
+            rounds = await self._uow.rounds.find_by_competition(comp_id)
+
+            total_a_points = 0.0
+            total_b_points = 0.0
+            matches_dto = []
+
+            matches_by_round = await self._partidos_por_ronda(rounds)
+
+            # Resolve all names
+            all_user_ids = {
+                p.user_id
+                for matches in matches_by_round.values()
+                for match in matches
+                for p in (*match.team_a_players, *match.team_b_players)
+            }
+            user_names = await self._resolve_user_names(list(all_user_ids), comp_id)
+
+            for round_entity in rounds:
+                for match in matches_by_round[round_entity.id]:
+                    partido, points = await self._partido(
+                        match, round_entity, user_names, visitante
+                    )
+                    total_a_points += points["team_a"]
+                    total_b_points += points["team_b"]
+                    matches_dto.append(partido)
+
+            # Hoy son enfrentamientos entre dos equipos: un torneo de stroke
+            # play tendrá los suyos (#251)
+            ryder_cup = competition.require_ryder_cup()
+            team_a_name = ryder_cup.team_1_name
+            team_b_name = ryder_cup.team_2_name
+
+            clasificacion = LeaderboardResponseDTO(
+                competition_id=str(competition.id),
+                competition_name=competition.name.value
+                if hasattr(competition.name, "value")
+                else str(competition.name),
+                team_a_name=team_a_name,
+                team_b_name=team_b_name,
+                team_a_points=total_a_points,
+                team_b_points=total_b_points,
+                matches=matches_dto,
+            )
+        return self._la_que_ve(clasificacion, ve)
+
+    async def _partidos_por_ronda(self, rounds: list[Round]) -> dict[RoundId, list[Match]]:
+        """Los partidos de cada ronda, leídos una vez (con el `uow` abierto)."""
+        matches_by_round: dict[RoundId, list[Match]] = {}
+        for round_entity in rounds:
+            matches_by_round[round_entity.id] = await self._uow.matches.find_by_round(
+                round_entity.id
+            )
+        return matches_by_round
+
+    async def _partido(
+        self,
+        match: Match,
+        round_entity: Round,
+        user_names: dict[UserId, str],
+        visitante: bool,
+    ) -> tuple[LeaderboardMatchDTO, dict[str, float]]:
+        """Un partido de la clasificación y los puntos que da a cada equipo."""
+        standing_str = None
+        leading_team = None
+        current_hole = None
+        result_dto = None
+        points = {"team_a": 0.0, "team_b": 0.0}
+
+        if match.is_finished() and match.result:
+            points = await self._puntos(match, round_entity)
+            final_result = await self._resolve_final_result(match, round_entity, match.result)
+            result_dto = DecidedResultDTO(
+                winner=final_result.get("winner", ""),
+                score=final_result.get("score", ""),
+            )
+        elif match.status.can_record_scores():
+            (
+                standing_str,
+                leading_team,
+                current_hole,
+            ) = await self._compute_in_progress_standing(match, round_entity)
+
+        partido = LeaderboardMatchDTO(
+            match_id=str(match.id),
+            match_number=match.match_number,
+            match_format=round_entity.match_format.value if round_entity.match_format else "",
+            round_date=round_entity.round_date,
+            session_type=round_entity.session_type.value if round_entity.session_type else None,
+            status=match.status.value,
+            current_hole=current_hole,
+            standing=standing_str,
+            leading_team=leading_team,
+            team_a_players=_jugadores(match.team_a_players, user_names, visitante),
+            team_b_players=_jugadores(match.team_b_players, user_names, visitante),
+            result=result_dto,
+        )
+        return partido, points
+
+    async def _puntos(self, match: Match, round_entity: Round) -> dict[str, float]:
+        """
+        Los puntos Ryder de un partido acabado: con el ganador guardado si es
+        válido; si no, con los hoyos, y sin hoyos, empate.
+        """
+        score_result = None
+        if isinstance(match.result, dict) and match.result:
+            stored_winner = match.result.get("winner")
+            if stored_winner in ("A", "B", "HALVED"):
+                score_result = match.result
+
+        if not score_result:
+            score_result = await self._compute_decided_result(match, round_entity.match_format) or {
+                "winner": "HALVED",
+                "score": "AS",
+            }
+
+        return self._scoring_service.calculate_ryder_cup_points(score_result, match.status.value)
+
+    @staticmethod
+    def _la_que_ve(
+        clasificacion: LeaderboardResponseDTO, ve: LoJugadoQueVe | None
+    ) -> LeaderboardResponseDTO:
+        """
+        Dentro, o sin decir quién mira (`ve` None), entera. De fuera con la
+        llave: el marcador, que se cuenta con todos, y solo los partidos de
+        sus amigos.
+        """
+        if ve is None:
+            return clasificacion
+        clasificacion.matches = [
+            m
+            for m in clasificacion.matches
+            # Con `ve` no hay visitante, así que todos los ids van puestos
+            if ve.ve_la_partida(
+                UserId(p.user_id)
+                for p in (*m.team_a_players, *m.team_b_players)
+                if p.user_id is not None
+            )
+        ]
+        return clasificacion
+
+    async def _resolve_final_result(
+        self, match: Match, round_entity: Round, stored_result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Determines the final result for a finished match (`stored_result`: `match.result`)."""
+        # Concedido o walkover: manda ese resultado, no el de los hoyos, igual
+        # que en la vista de anotacion (BE #384)
+        if match.closing_result is not None:
+            return match.closing_result
+        if match.is_decided and match.decided_result:
+            return match.decided_result
+        # `Round.match_format` nunca es None: el `is not None` de antes no filtraba nada
+        return await self._compute_decided_result(match, round_entity.match_format) or stored_result
+
+    async def _compute_in_progress_standing(
+        self, match: Match, round_entity: Round
+    ) -> tuple[str | None, str | None, int | None]:
+        """Computes standing for an in-progress match (`standing_in_hole_order`)."""
+        hole_scores = await self._uow.hole_scores.find_by_match(match.id)
+        if hole_scores and round_entity.match_format:
+            results = self._scoring_service.hole_results_by_hole(
+                hole_scores, round_entity.match_format, match.bolas_fuera
+            )
+            if results:
+                standing = self._scoring_service.standing_in_hole_order(results)
+                return standing["status"], standing["leading_team"], standing["holes_played"]
+        return None, None, None
+
+    async def _compute_decided_result(
+        self, match: Match, match_format: MatchFormat
+    ) -> dict[str, Any] | None:
+        """
+        El resultado con los hoyos anotados: el de la decision en el orden de
+        los hoyos, como lo guarda `SubmitHoleScoreUseCase`, o la ventaja tal cual.
+        """
+        hole_scores = await self._uow.hole_scores.find_by_match(match.id)
+        results = self._scoring_service.hole_results_by_hole(
+            hole_scores, match_format, match.bolas_fuera
+        )
+        if not results:
+            return None
+        return self._scoring_service.result_in_hole_order(results)
+
+    async def _resolve_user_names(
+        self, user_ids: list[UserId], competition_id: CompetitionId
+    ) -> dict[UserId, str]:
+        """
+        Resuelve user_id → el nombre con el que se pinta a esa persona.
+
+        `display_name` por defecto —el alias de quien lo tenga (BE #239)—,
+        salvo que la inscripción de esa persona en ESTA competición haya
+        elegido el nombre legal (BE #254). La clasificación es de las
+        pantallas donde más se lee un nombre, así que la preferencia por
+        competición se lee de las inscripciones, no del perfil.
+
+        La misma regla que usa la sala de draft (FE #653), en un solo sitio.
+        """
+        return await PlayerNames.de_la_competicion(
+            user_ids, competition_id, self._user_repo, self._uow
+        )
+
+
+def _jugadores(
+    players: tuple[MatchPlayer, ...], user_names: dict[UserId, str], visitante: bool
+) -> list[LeaderboardPlayerDTO]:
+    """Los jugadores de un lado; a un visitante, sin el id interno (code-review, 28 oct)."""
+    return [
+        LeaderboardPlayerDTO(
+            user_id=None if visitante else str(p.user_id),
+            user_name=user_names.get(p.user_id, ""),
+        )
+        for p in players
+    ]

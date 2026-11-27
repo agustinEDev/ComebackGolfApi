@@ -1,0 +1,123 @@
+version: 2
+updates:
+  # Dependencias de Python: requirements.txt (producción) y requirements-dev.txt
+  - package-ecosystem: "pip"
+    directory: "/"
+    target-branch: "develop"  # GitFlow: dependabot → develop → release → main
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Europe/Madrid"
+    open-pull-requests-limit: 10
+    # Espera 5 días antes de proponer una versión recién publicada: es la ventana
+    # de los paquetes envenenados de PyPI y npm, que se retiran en horas o días
+    # (INF-12). Las actualizaciones de seguridad no esperan.
+    cooldown:
+      default-days: 5
+    labels:
+      - "dependencies"
+      - "automated"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    # El primer grupo único (25 paquetes, #397) no instalaba y mezclaba un salto de
+    # ruff con SQLAlchemy 2.1 y uvicorn 0.54: si algo rompe, no se sabe qué. Ahora:
+    # - herramientas de desarrollo: juntas, menores y parches
+    # - librerías de producción: parches juntos; cada menor en su propia PR
+    # - ruff y mypy: siempre solos. Son checks bloqueantes con versión exacta, y
+    #   subirlos es decidir qué hacer con sus reglas nuevas
+    groups:
+      # Las de seguridad, todas en UNA PR: pip-audit revisa el entorno entero,
+      # así que con dos avisos a la vez cada PR suelta fallaba por el otro y
+      # ninguna se podía mergear (revisión local de la #446)
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      dev-tools:
+        patterns:
+          - "pytest*"
+          - "pip-audit"
+          - "pip-tools"
+          - "bandit*"
+          - "cyclonedx*"
+          - "import-linter"
+          # Con import-linter: pide una grimp mínima y por separado no instalan (#924, #874)
+          - "grimp"
+          - "msgpack"
+          - "zipp"
+          - "pygments"
+          - "coverage*"
+        update-types:
+          - "minor"
+          - "patch"
+      runtime-patches:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "ruff"
+          - "mypy"
+        update-types:
+          - "patch"
+    # Las majors llegan cada una en su PR y se revisan a mano. Ojo con estas:
+    # - bcrypt: es el hash de las contraseñas; una major puede cambiar el formato
+    # - sqlalchemy / alembic / asyncpg: toda la persistencia y las migraciones
+    # - fastapi / starlette / pydantic: el contrato de la API
+
+  # Imagen base del Dockerfile (python:3.14-slim): la mayoría de alertas de Trivy
+  # son paquetes del sistema operativo de esta imagen
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    target-branch: "develop"
+    # Espera 3 días con un digest nuevo de la imagen (INF-12): menos que el resto
+    # porque es como entran los parches del sistema operativo que señala Trivy, y una
+    # imagen oficial retirada se nota antes. Las de seguridad no esperan.
+    cooldown:
+      default-days: 3
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Europe/Madrid"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "automated"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    # El FROM va fijado por digest (python:3.14-slim@sha256:…): Dependabot propone
+    # cada semana el digest nuevo, que es como entran los parches del SO. Los saltos
+    # de Python (3.14 → 3.15, 3 → 4) no los propone: son una decisión, y antes la
+    # versión nueva tiene que estar en la matriz obligatoria del CI. Se suben a mano.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # Acciones de GitHub usadas en los workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "develop"
+    # Espera 5 días antes de proponer una versión nueva de una acción (INF-12): la
+    # ventana en que se detecta una acción comprometida, como tj-actions en 2025. Las
+    # de seguridad no esperan.
+    # Ojo: Dependabot toma la fecha de la Release de GitHub; una etiqueta sin Release
+    # usa la fecha de su commit, que puede ser vieja o falsa, y se salta la espera. Por
+    # eso las acciones van fijadas por SHA y se revisa cada salto a mano (CodeRabbit)
+    cooldown:
+      default-days: 5
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Europe/Madrid"
+    labels:
+      - "github-actions"
+      - "automated"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"

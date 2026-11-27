@@ -1,0 +1,228 @@
+"""In-Memory Unit of Work para Competition Module (testing)."""
+
+import copy
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from src.modules.competition.domain.repositories.barras_por_campo_repository_interface import (
+    BarrasPorCampoRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.competition_repository_interface import (
+    CompetitionRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.repositories.draft_repository_interface import (
+    DraftRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.enrollment_repository_interface import (
+    EnrollmentRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.envelope_repository_interface import (
+    EnvelopeRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.espera_en_franja_repository_interface import (
+    EsperaEnFranjaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.golpe_de_partida_repository_interface import (
+    GolpeDePartidaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.handicap_update_repository_interface import (
+    HandicapUpdateRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.hole_score_repository_interface import (
+    HoleScoreRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.invitation_repository_interface import (
+    InvitationRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.match_repository_interface import (
+    MatchRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.partida_repository_interface import (
+    PartidaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.plaza_en_franja_repository_interface import (
+    PlazaEnFranjaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.round_repository_interface import (
+    RoundRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.team_assignment_repository_interface import (
+    TeamAssignmentRepositoryInterface,
+)
+from src.shared.domain.repositories.country_repository_interface import (
+    CountryRepositoryInterface,
+)
+from src.shared.infrastructure.persistence.in_memory.in_memory_country_repository import (
+    InMemoryCountryRepository,
+)
+
+from .in_memory_barras_por_campo_repository import InMemoryBarrasPorCampoRepository
+from .in_memory_competition_repository import InMemoryCompetitionRepository
+from .in_memory_draft_repository import InMemoryDraftRepository
+from .in_memory_enrollment_repository import InMemoryEnrollmentRepository
+from .in_memory_envelope_repository import InMemoryEnvelopeRepository
+from .in_memory_espera_en_franja_repository import InMemoryEsperaEnFranjaRepository
+from .in_memory_golpe_de_partida_repository import InMemoryGolpeDePartidaRepository
+from .in_memory_handicap_update_repository import InMemoryHandicapUpdateRepository
+from .in_memory_hole_score_repository import InMemoryHoleScoreRepository
+from .in_memory_invitation_repository import InMemoryInvitationRepository
+from .in_memory_match_repository import InMemoryMatchRepository
+from .in_memory_partida_repository import InMemoryPartidaRepository
+from .in_memory_plaza_en_franja_repository import InMemoryPlazaEnFranjaRepository
+from .in_memory_round_repository import InMemoryRoundRepository
+from .in_memory_team_assignment_repository import InMemoryTeamAssignmentRepository
+
+
+class InMemoryUnitOfWork(CompetitionUnitOfWorkInterface):
+    """Implementacion en memoria de la Unit of Work para testing."""
+
+    def __init__(self):
+        self._competitions = InMemoryCompetitionRepository()
+        self._enrollments = InMemoryEnrollmentRepository()
+        self._countries = InMemoryCountryRepository()
+        self._rounds = InMemoryRoundRepository()
+        self._matches = InMemoryMatchRepository()
+        self._team_assignments = InMemoryTeamAssignmentRepository()
+        self._drafts = InMemoryDraftRepository()
+        self._envelopes = InMemoryEnvelopeRepository()
+        self._invitations = InMemoryInvitationRepository()
+        self._hole_scores = InMemoryHoleScoreRepository()
+        self._handicap_updates = InMemoryHandicapUpdateRepository()
+        self._plazas = InMemoryPlazaEnFranjaRepository()
+        self._partidas = InMemoryPartidaRepository()
+        self._golpes_de_partida = InMemoryGolpeDePartidaRepository()
+        self._esperas = InMemoryEsperaEnFranjaRepository()
+        self._barras_por_campo = InMemoryBarrasPorCampoRepository(self._enrollments)
+        self.committed = False
+
+    @property
+    def competitions(self) -> CompetitionRepositoryInterface:
+        return self._competitions
+
+    @property
+    def enrollments(self) -> EnrollmentRepositoryInterface:
+        return self._enrollments
+
+    @property
+    def countries(self) -> CountryRepositoryInterface:
+        return self._countries
+
+    @property
+    def handicap_updates(self) -> HandicapUpdateRepositoryInterface:
+        return self._handicap_updates
+
+    @property
+    def barras_por_campo(self) -> BarrasPorCampoRepositoryInterface:
+        return self._barras_por_campo
+
+    @property
+    def plazas(self) -> PlazaEnFranjaRepositoryInterface:
+        return self._plazas
+
+    @property
+    def partidas(self) -> PartidaRepositoryInterface:
+        return self._partidas
+
+    @property
+    def golpes_de_partida(self) -> GolpeDePartidaRepositoryInterface:
+        return self._golpes_de_partida
+
+    @property
+    def esperas(self) -> EsperaEnFranjaRepositoryInterface:
+        return self._esperas
+
+    @property
+    def rounds(self) -> RoundRepositoryInterface:
+        return self._rounds
+
+    @property
+    def matches(self) -> MatchRepositoryInterface:
+        return self._matches
+
+    @property
+    def team_assignments(self) -> TeamAssignmentRepositoryInterface:
+        return self._team_assignments
+
+    @property
+    def drafts(self) -> DraftRepositoryInterface:
+        return self._drafts
+
+    @property
+    def envelopes(self) -> EnvelopeRepositoryInterface:
+        return self._envelopes
+
+    @property
+    def invitations(self) -> InvitationRepositoryInterface:
+        return self._invitations
+
+    @property
+    def hole_scores(self) -> HoleScoreRepositoryInterface:
+        return self._hole_scores
+
+    async def __aenter__(self):
+        self.committed = False
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            await self.rollback()
+        else:
+            try:
+                await self.commit()
+            except Exception:
+                await self.rollback()
+                raise
+
+    async def commit(self) -> None:
+        self.committed = True
+
+    async def rollback(self) -> None:
+        self.committed = False
+
+    async def flush(self) -> None:
+        pass
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator[None]:
+        """Guarda una copia de todo y la repone si algo falla dentro.
+
+        El `rollback` de aqui no deshace nada, asi que sin esto un test no
+        veria la diferencia entre deshacer lo escrito a medias y dejarlo.
+        """
+        repositorios = [
+            self._competitions,
+            self._enrollments,
+            self._rounds,
+            self._matches,
+            self._team_assignments,
+            self._drafts,
+            self._envelopes,
+            self._invitations,
+            self._hole_scores,
+            # Las de stroke play (#251): sin ellas, un fallo dentro las dejaba a
+            # medias en los tests (CodeRabbit en la #534)
+            self._handicap_updates,
+            self._plazas,
+            self._esperas,
+            self._partidas,
+            self._golpes_de_partida,
+            self._barras_por_campo,
+        ]
+        # Cada repositorio se copia a sí mismo como él mismo: el de barras por
+        # campo mira el de inscripciones vivo, y al reponer debe seguir haciéndolo
+        # (no una copia desconectada de antes del savepoint)
+        memo: dict[int, object] = {id(repo): repo for repo in repositorios}
+        copias = [copy.deepcopy(repo.__dict__, memo) for repo in repositorios]
+        try:
+            yield
+        except BaseException:
+            for repo, copia in zip(repositorios, copias, strict=True):
+                repo.__dict__.clear()
+                repo.__dict__.update(copia)
+            raise
+
+    def is_active(self) -> bool:
+        return True

@@ -1,0 +1,155 @@
+"""
+Caso de Uso: Iniciar Competition.
+
+Permite iniciar una competición (CLOSED → IN_PROGRESS).
+Solo el creador puede realizar esta acción.
+"""
+
+from src.modules.competition.application.dto.competition_dto import (
+    StartCompetitionRequestDTO,
+    StartCompetitionResponseDTO,
+)
+from src.modules.competition.application.exceptions import (
+    CompetitionNotFoundError,
+    NotCompetitionCreatorError,
+)
+from src.modules.competition.application.ports.competition_activity_publisher_interface import (
+    CompetitionActivityPublisherInterface,
+)
+from src.modules.competition.application.services.actualizaciones_de_handicaps import (
+    ActualizacionesDeHandicaps,
+)
+from src.modules.competition.application.services.avisos_de_actividad import AvisosDeActividad
+from src.modules.competition.application.services.franjas_al_cerrar import FranjasAlCerrar
+from src.modules.competition.application.services.solicitudes_al_empezar import (
+    avisar_de_lo_cerrado,
+    cerrar_lo_pendiente,
+)
+from src.modules.competition.domain.entities.competition import CompetitionStateError
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.competition_status import CompetitionStatus
+from src.modules.user.domain.repositories.user_repository_interface import (
+    UserRepositoryInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class StartCompetitionUseCase:
+    """
+    Caso de uso para iniciar una competición.
+
+    Transición: CLOSED → IN_PROGRESS
+    Efecto: La competición comienza, los matches pueden jugarse
+
+    Restricciones:
+    - Solo se puede iniciar desde estado CLOSED
+    - Solo el creador puede iniciar
+    - La competición debe existir
+
+    Orquesta:
+    1. Buscar la competición por ID
+    2. Verificar que el usuario sea el creador
+    3. Iniciar la competición (delega validación de estado a la entidad)
+    4. Persistir cambios
+    5. Commit de la transacción
+    """
+
+    def __init__(
+        self,
+        uow: CompetitionUnitOfWorkInterface,
+        user_repository: UserRepositoryInterface | None = None,
+        actividad: CompetitionActivityPublisherInterface | None = None,
+    ):
+        """
+        Constructor.
+
+        Args:
+            uow: Unit of Work para gestionar transacciones
+            user_repository: Para nombrar a quien no tenga franja en un stroke play
+            actividad: Los avisos de Actividad (BE-2); sin el, no se avisa
+        """
+        self._uow = uow
+        self._users = user_repository
+        self._actividad = AvisosDeActividad(actividad)
+
+    async def execute(
+        self, request: StartCompetitionRequestDTO, user_id: UserId, is_admin: bool = False
+    ) -> StartCompetitionResponseDTO:
+        """
+        Ejecuta el caso de uso de inicio de competición.
+
+        Args:
+            request: DTO con el ID de la competición a iniciar
+            user_id: ID del usuario que solicita el inicio
+
+        Returns:
+            DTO con datos de la competición iniciada
+
+        Raises:
+            CompetitionNotFoundError: Si la competición no existe
+            NotCompetitionCreatorError: Si el usuario no es el creador
+            CompetitionStateError: Si la transición de estado no es válida
+        """
+        async with self._uow:
+            # 1. Buscar la competición
+            competition_id = CompetitionId(request.competition_id)
+            # Bloqueada, como la lee el primer golpe al arrancarla
+            competition = await self._uow.competitions.find_by_id_for_update(competition_id)
+
+            if not competition:
+                raise CompetitionNotFoundError(
+                    f"No existe competición con ID {request.competition_id}"
+                )
+
+            # 2. Verificar que el usuario sea el creador
+            if not is_admin and not competition.is_creator(user_id):
+                raise NotCompetitionCreatorError("Solo el creador puede iniciar la competición")
+
+            # 3. Sin ninguna sesión no hay torneo que jugar (decidido el 25 sep,
+            # #710). El arranque automático no pasa por aquí: lo hace el primer
+            # golpe de una sesión, que por tanto existe. Solo si por lo demás se
+            # podría iniciar: a una en borrador se le dice antes su estado
+            if competition.status.can_transition_to(
+                CompetitionStatus.IN_PROGRESS
+            ) and not await self._uow.rounds.find_by_competition(competition_id):
+                raise CompetitionStateError(
+                    "Añade al menos una sesión antes de iniciar la competición"
+                )
+
+            # 3b. En un stroke play, cada aprobado con su franja, como al cerrar:
+            #     tras el cierre se puede mover a la gente (#251)
+            if competition.stroke_play is not None:
+                if self._users is None:
+                    raise RuntimeError(
+                        "Hace falta el repositorio de usuarios para iniciar un stroke play"
+                    )
+                await FranjasAlCerrar(self._uow, self._users).comprobar(competition)
+
+            # 4. Iniciar la competición (la entidad valida la transición). El
+            #    hándicap de cada uno ya quedó fijado al cerrar las inscripciones
+            competition.start()
+
+            # 4b. La actualización de hándicaps que esté a medias se corta: lo que
+            #     no se actualizó antes de empezar se queda como estaba (#251)
+            await ActualizacionesDeHandicaps(self._uow, None).cortar(competition.id)
+
+            # 4c. Una solicitud que siga pendiente ya no cabe (21 oct), ni una
+            #     invitación que esperaba a que se reabriera (P3, 15 nov 2026)
+            cerrado = await cerrar_lo_pendiente(self._uow, competition.id)
+
+            # 5. Persistir cambios
+            await self._uow.competitions.update(competition)
+
+        # 5b. Ya guardado: a cada uno, «tu solicitud se cerró sin plaza» (BE-2), y
+        #     a cada invitado que esperaba, «no hubo plaza» (P3)
+        await avisar_de_lo_cerrado(self._actividad, competition, cerrado)
+
+        # 6. Retornar DTO de respuesta
+        return StartCompetitionResponseDTO(
+            id=competition.id.value,
+            status=competition.status.value,
+            started_at=competition.updated_at,
+        )

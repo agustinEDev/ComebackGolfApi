@@ -1,0 +1,292 @@
+"""DTOs del perfil de un jugador y del feed de actividad."""
+
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from src.modules.social.application.dto.head_to_head_dto import (
+    GamesTogetherPageDTO,
+    HeadToHeadDTO,
+)
+from src.modules.user.application.dto.player_stats_dto import PlayerStatsResponseDTO
+from src.shared.application.utc_datetime import UtcDatetime
+
+
+class FriendshipStateDTO(BaseModel):
+    """
+    En que punto esta la relacion con el jugador del perfil.
+
+    Va en el perfil para que el cliente sepa que boton pintar sin tener que
+    cruzar la lista de amigos con la de solicitudes. `PENDING_SENT` y
+    `PENDING_RECEIVED` se distinguen porque no llevan al mismo sitio: una espera
+    respuesta del otro, la otra pide una respuesta tuya.
+    """
+
+    status: str = Field(
+        description="NONE, PENDING_SENT, PENDING_RECEIVED, ACCEPTED, DECLINED o BLOCKED"
+    )
+    friendship_id: str | None = Field(
+        default=None,
+        description=(
+            "Id de la relacion, necesario para aceptarla o deshacerla. "
+            "None cuando todavia no hay ninguna"
+        ),
+    )
+
+
+class PlayerProfileResponseDTO(BaseModel):
+    """
+    El perfil de un jugador, con dos niveles de detalle segun quien mire.
+
+    **Cualquiera ve la ficha minima**: nombre, apellidos y foto. Es lo que hace
+    falta para encontrar a alguien por su nombre y reconocerlo antes de mandarle
+    una solicitud, y no dice nada de el que no diga ya la busqueda.
+
+    **El handicap, cualquiera con sesion** (BE-3), salvo que haya un bloqueo
+    entre los dos, en cualquier sentido: entonces solo nombre y foto.
+
+    **Solo el propio jugador y sus amigos ven lo de detras**: estadisticas,
+    actividad, cara a cara y partidas juntos. Esos campos llegan en None a cualquier otro, no
+    recortados ni a cero — un cero se leeria como "juega fatal" en lugar de "no
+    puedes ver esto".
+
+    **El correo, solo el propio jugador** (#531, 21 oct): ni los amigos lo
+    reciben; os comunicais por la aplicacion. A cualquier otro llega en None.
+    """
+
+    id: str
+    first_name: str
+    last_name: str
+    display_name: str = Field(
+        ...,
+        description=(
+            "Nombre con el que se debe mostrar a esta persona: su alias si "
+            "tiene, y si no su nombre completo."
+        ),
+    )
+    alias: str | None = Field(
+        None,
+        description=(
+            "Su alias, si tiene: la app lo enseña delante y el nombre real pequeño "
+            "debajo. Es un apodo, no un dato oculto (SB-08, 17 nov 2026)."
+        ),
+    )
+    avatar_source: str
+    avatar_preset_id: int | None = None
+    has_avatar_upload: bool = Field(
+        default=False,
+        description="Si tiene foto propia subida; la imagen se pide al endpoint de avatares",
+    )
+    friends_count: int = Field(
+        default=0,
+        description=(
+            "Cuantos amigos tiene. Va en la ficha publica, como el contador de "
+            "seguidores de cualquier perfil: es un numero, no dice quienes son. "
+            "Con un bloqueo entre los dos, en cualquier sentido, llega a 0 (solo "
+            "nombre y foto): el cliente no lo pinta en un perfil bloqueado"
+        ),
+    )
+    friendship: FriendshipStateDTO = Field(
+        description="En que punto esta tu relacion con el, para saber que boton ofrecer"
+    )
+    is_friend: bool = Field(default=False, description="Atajo de `friendship.status == ACCEPTED`")
+    blocked_by_me: bool = Field(
+        default=False,
+        description=(
+            "True si quien mira bloqueo a este jugador (puede desbloquearlo). Con "
+            "`friendship.status == BLOCKED` y esto en false, el bloqueo lo puso el otro. "
+            "Con un bloqueo en cualquier sentido el perfil llega sin hándicap y con "
+            "`friends_count` a 0"
+        ),
+    )
+    email: str | None = Field(
+        default=None,
+        description="Solo uno mismo (BE #531). None para cualquier otro, amigos incluidos",
+    )
+    handicap: float | None = Field(
+        default=None,
+        description=(
+            "Cualquier usuario con sesion (BE-3). None si hay un bloqueo entre los "
+            "dos, en cualquier sentido, o si no lo ha fijado"
+        ),
+    )
+    stats: PlayerStatsResponseDTO | None = Field(
+        default=None,
+        description=(
+            "Solo uno mismo y sus amigos: el mismo resumen que su propio panel "
+            "(BE #128, #167). None para cualquier otro"
+        ),
+    )
+    head_to_head: HeadToHeadDTO | None = Field(
+        default=None,
+        description=(
+            "Solo entre amigos: ganadas, empatadas y perdidas contra él y con él. "
+            "None para cualquier otro, para uno mismo y si no habeis jugado nada que contar"
+        ),
+    )
+    games_together: GamesTogetherPageDTO | None = Field(
+        default=None,
+        description=(
+            "Solo entre amigos: la primera pagina de partidas terminadas juntos (5); "
+            "el resto, en `GET /users/{id}/games-together`. None para cualquier otro "
+            "y para uno mismo"
+        ),
+    )
+
+
+class ActivityEventDTO(BaseModel):
+    """Una entrada del feed."""
+
+    id: str
+    user_id: str
+    type: str
+    occurred_at: UtcDatetime = Field(
+        description=(
+            "Cuando se jugo, en UTC (con «Z»): el dia de la ronda a las 12:00, para que caiga "
+            "en el mismo dia en cualquier zona, o la creacion de la partida"
+        )
+    )
+    published_at: UtcDatetime | None = Field(
+        default=None,
+        description=(
+            "Cuando llego al feed, en UTC (con «Z»). Es la fecha por la que se ordena "
+            "el feed y se cuentan las novedades; `occurred_at` es cuando se jugo, y "
+            "un torneo publica dias despues de sus vueltas"
+        ),
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "El detalle propio de cada tipo: cuantos birdies, en que hoyos, que campo. "
+            "En `TEE_TIME_ASSIGNED` (tu salida o tu partido en una ronda): "
+            "`competition_id`, `competition_name`, `start_date`, `end_date`, `round_id`, "
+            "`round_date` (AAAA-MM-DD), `session_type` (MORNING, AFTERNOON, EVENING), "
+            "`kind` (TEE_GROUP en stroke play, MATCH en una Ryder), `tee_time` («HH:MM» "
+            "en stroke play, null en una Ryder), `partner_ids` (compañeros de grupo o de "
+            "pareja), `opponent_ids` (rivales; vacio en stroke play), `match_id` (null en "
+            "stroke play) y `changed` (true si sustituye a una salida anterior de esa "
+            "ronda). Los nombres salen de `authors`: quien falte se pinta «un jugador». "
+            "En `ENROLLMENTS_CLOSED` (el plazo cerró las inscripciones, para el "
+            "organizador): `competition_id`, `competition_name`, `start_date` y `end_date`. "
+            "En `ENROLLMENT_CLOSE_BLOCKED` (el plazo no pudo cerrarlas): lo mismo, más "
+            "`reason` (NO_TEE_WINDOW o NO_HANDICAP) y `player_count` (cuántos aprobados). "
+            "En `INVITATION_ACCEPTABLE_AGAIN` (se reabrió y ya puedes aceptar la "
+            "invitación; su origen es la invitación): los cuatro del torneo. En "
+            "`TEAMS_UNDONE_BY_ENTRY` (entró alguien y los equipos se deshicieron, para el "
+            "organizador): los cuatro del torneo, más `player_id` y `player_name`"
+        ),
+    )
+    source_match_id: str = Field(
+        description=(
+            "De donde sale, para enlazar y para no duplicar: la partida en los logros "
+            "y resultados; en los avisos de torneo, la inscripcion, la invitacion o el "
+            "torneo (su id va en `payload.competition_id`); en el aviso de salida, la "
+            "ronda: hay uno por jugador y ronda"
+        )
+    )
+    group_key: str | None = Field(
+        default=None,
+        description=(
+            "La tarjeta en la que se pinta: los logros de una misma vuelta de un "
+            "jugador comparten clave y van en una sola tarjeta con sus cuentas; cada "
+            "aviso lleva la suya. El contador de novedades cuenta tarjetas"
+        ),
+    )
+
+
+class FeedAuthorDTO(BaseModel):
+    """Quien publico una entrada, para no obligar al cliente a pedir cada perfil."""
+
+    id: str
+    first_name: str
+    last_name: str
+    display_name: str = Field(
+        ...,
+        description=(
+            "Nombre con el que se debe mostrar a esta persona: su alias si "
+            "tiene, y si no su nombre completo."
+        ),
+    )
+    avatar_source: str
+    avatar_preset_id: int | None = None
+    alias: str | None = Field(
+        None,
+        description=(
+            "Su alias, si tiene: la app lo enseña delante y el nombre real pequeño "
+            "debajo. Es un apodo, no un dato oculto (SB-08, 17 nov 2026)."
+        ),
+    )
+
+
+class FriendRequestNoticeDTO(BaseModel):
+    """Una solicitud de amistad recibida y sin responder, para aceptarla desde Actividad."""
+
+    friendship_id: str
+    requester: FeedAuthorDTO
+    created_at: UtcDatetime = Field(description="Cuando se envio")
+
+
+class FeedResponseDTO(BaseModel):
+    """
+    Una pagina del feed, con el cursor para pedir la siguiente.
+
+    El cursor son **dos** valores y no solo la fecha: todos los logros de una
+    misma vuelta comparten `published_at`, asi que paginar por fecha sola se
+    dejaria fuera los que aun no se han enseñado de esa vuelta.
+    """
+
+    events: list[ActivityEventDTO] = Field(
+        default_factory=list,
+        description=(
+            "Las entradas de la pagina, de la mas reciente a la mas antigua. Un "
+            "ENROLLED_IN_TOURNAMENT de un torneo que ahora es privado no sale aunque "
+            "siga guardado, asi que una pagina puede venir con menos de `limit` "
+            "entradas y aun asi traer `next_cursor`: sigue pidiendo mientras lo traiga"
+        ),
+    )
+    authors: dict[str, FeedAuthorDTO] = Field(
+        default_factory=dict, description="Autores de esta pagina, indexados por id"
+    )
+    courses: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Nombre de cada campo citado en esta pagina, indexado por id. "
+            "El nombre va aparte y no dentro del `payload` del evento porque el "
+            "payload se escribio al publicar el logro: un campo renombrado dejaria "
+            "el feed contando el nombre viejo para siempre"
+        ),
+    )
+    next_cursor: str | None = Field(
+        default=None,
+        description="Pasalo como `cursor` para la siguiente pagina. None cuando no hay mas",
+    )
+    unseen_count: int = Field(
+        default=0,
+        description=(
+            "Cuantas tarjetas de este feed se han publicado desde la ultima visita, "
+            "las propias y las solicitudes de amistad recibidas incluidas, con tope de 99. Sin "
+            "visita previa cuenta todo. Es el mismo numero que da "
+            "`GET /users/me/feed/unseen-count`. Solo se calcula en la primera pagina: "
+            "con `cursor` llega a 0"
+        ),
+    )
+    pending_friend_requests: list[FriendRequestNoticeDTO] = Field(
+        default_factory=list,
+        description=(
+            "Solicitudes de amistad recibidas y sin responder, de la mas reciente a la "
+            "mas antigua. No son eventos: se leen en vivo, asi que al responderlas en "
+            "otro sitio desaparecen. Cuentan en `unseen_count` las llegadas tras la "
+            "ultima visita. Solo en la primera pagina"
+        ),
+    )
+
+
+class FeedUnseenCountResponseDTO(BaseModel):
+    """El numero del boton de Actividad, sin cargar el feed."""
+
+    unseen_count: int = Field(
+        description=(
+            "Cuantas entradas del feed se han publicado desde la ultima visita, "
+            "las propias incluidas, con tope de 99. Sin visita previa cuenta todo"
+        ),
+    )

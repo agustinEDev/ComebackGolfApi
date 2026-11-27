@@ -1,0 +1,457 @@
+"""
+Entidad de dominio UserDevice - Dispositivo de usuario.
+
+Este módulo define la entidad UserDevice, que representa un dispositivo
+registrado desde el cual un usuario ha accedido al sistema.
+
+Responsabilidades:
+- Crear nuevos dispositivos con validación completa
+- Gestionar ciclo de vida del dispositivo (activo/revocado)
+- Actualizar información de último uso
+- Mantener invariantes del dominio (consistencia)
+
+Reglas de Negocio:
+- Un dispositivo pertenece a UN solo usuario
+- Un dispositivo tiene fingerprint único (hash)
+- Un dispositivo puede estar activo o revocado (soft delete)
+- Un dispositivo revocado NO puede reactivarse (crear uno nuevo)
+- Cada acceso actualiza el timestamp de último uso
+"""
+
+from datetime import datetime, timedelta
+
+from src.modules.user.domain.value_objects.device_fingerprint import DeviceFingerprint
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+
+# Tiempo sin usar la app tras el que la sesión de ESE dispositivo deja de valer
+# (BE #376). OWASP A07 pide invalidar por inactividad, y el servidor es quien
+# puede hacerlo: un temporizador en el navegador no invalida nada con la pestaña
+# cerrada. 24 h cubren una jornada de torneo aunque el móvil no se toque en horas
+SESSION_IDLE_TIMEOUT = timedelta(hours=24)
+
+
+class UserDevice:
+    """
+    Entidad que representa un dispositivo desde el cual un usuario accede al sistema.
+
+    Esta entidad es el Aggregate Root del contexto de Device Fingerprinting.
+    Encapsula toda la lógica de negocio relacionada con dispositivos de usuario.
+
+    Attributes (privados):
+        _id (UserDeviceId): Identificador único del dispositivo
+        _user_id (UserId): ID del usuario propietario
+        _fingerprint (DeviceFingerprint): Huella digital del dispositivo
+        _is_active (bool): Estado del dispositivo (True=activo, False=revocado)
+        _last_used_at (datetime): Última vez que se usó el dispositivo
+        _created_at (datetime): Timestamp de creación del registro
+
+    Properties (públicos):
+        id, user_id, fingerprint, device_name, fingerprint_hash,
+        ip_address, user_agent, is_active, last_used_at, created_at
+
+    Examples:
+        >>> # Crear nuevo dispositivo
+        >>> fingerprint = DeviceFingerprint.create("Mozilla/5.0...", "192.168.1.100")
+        >>> device = UserDevice.create(user_id, fingerprint)
+        >>> device.device_name
+        'Chrome on macOS'
+
+        >>> # Revocar dispositivo
+        >>> device.revoke()
+        >>> device.is_active
+        False
+    """
+
+    def __init__(
+        self,
+        id: UserDeviceId,
+        user_id: UserId,
+        device_name: str,
+        user_agent: str,
+        ip_address: str,
+        fingerprint_hash: str,
+        is_active: bool,
+        last_used_at: datetime,
+        created_at: datetime,
+        installed_app: bool = False,
+        country_code: str | None = None,
+    ) -> None:
+        """
+        Constructor privado de UserDevice.
+
+        IMPORTANTE: NO usar directamente. Usar métodos factory:
+        - UserDevice.create() para dispositivos nuevos
+        - UserDevice.reconstitute() para reconstruir desde BD
+
+        Args:
+            id: Identificador único del dispositivo
+            user_id: ID del usuario propietario
+            device_name: Nombre legible del dispositivo
+            user_agent: User-Agent HTTP header
+            ip_address: IP normalizada
+            fingerprint_hash: Hash SHA256 del fingerprint
+            is_active: Estado del dispositivo
+            last_used_at: Último timestamp de uso
+            created_at: Timestamp de creación
+        """
+        self._id = id
+        self._user_id = user_id
+        self._device_name = device_name
+        self._user_agent = user_agent
+        self._ip_address = ip_address
+        self._fingerprint_hash = fingerprint_hash
+        self._is_active = is_active
+        self._last_used_at = last_used_at
+        self._created_at = created_at
+        # La app instalada (PWA) y el país de la última conexión (BE #737)
+        self._installed_app = installed_app
+        self._country_code = country_code
+
+    @staticmethod
+    def create(
+        user_id: UserId,
+        fingerprint: DeviceFingerprint,
+        installed_app: bool = False,
+        country_code: str | None = None,
+    ) -> "UserDevice":
+        """
+        Factory method para crear un nuevo dispositivo.
+
+        Este es el método principal para crear dispositivos nuevos cuando
+        se detecta un login desde un dispositivo desconocido.
+
+        Automáticamente:
+        1. Genera un ID único
+        2. Marca el dispositivo como activo
+        3. Establece timestamps (created_at, last_used_at)
+
+        Args:
+            user_id: ID del usuario propietario del dispositivo
+            fingerprint: Huella digital del dispositivo (con hash, nombre, etc.)
+
+        Returns:
+            UserDevice: Nueva entidad de dispositivo
+
+        Raises:
+            ValueError: Si user_id o fingerprint son inválidos
+
+        Examples:
+            >>> user_id = UserId.generate()
+            >>> fingerprint = DeviceFingerprint.create("Mozilla/5.0...", "192.168.1.100")
+            >>> device = UserDevice.create(user_id, fingerprint)
+            >>> device.is_active
+            True
+        """
+        # Validaciones
+        if not isinstance(user_id, UserId):
+            raise ValueError("user_id debe ser una instancia de UserId")
+        if not isinstance(fingerprint, DeviceFingerprint):
+            raise ValueError("fingerprint debe ser una instancia de DeviceFingerprint")
+
+        # Crear entidad
+        now = ahora_utc_sin_zona()
+        device = UserDevice(
+            id=UserDeviceId.generate(),
+            user_id=user_id,
+            device_name=fingerprint.device_name,
+            user_agent=fingerprint.user_agent,
+            ip_address=fingerprint.ip_address,
+            fingerprint_hash=fingerprint.fingerprint_hash,
+            is_active=True,
+            last_used_at=now,
+            created_at=now,
+            installed_app=installed_app,
+            country_code=country_code,
+        )
+
+        return device
+
+    @staticmethod
+    def reconstitute(
+        id: UserDeviceId,
+        user_id: UserId,
+        device_name: str,
+        user_agent: str,
+        ip_address: str,
+        fingerprint_hash: str,
+        is_active: bool,
+        last_used_at: datetime,
+        created_at: datetime,
+        installed_app: bool = False,
+        country_code: str | None = None,
+    ) -> "UserDevice":
+        """
+        Factory method para reconstruir un dispositivo desde la base de datos.
+
+        Se usa cuando el repository lee dispositivos de la BD.
+
+        Args:
+            id: ID del dispositivo (ya existente)
+            user_id: ID del usuario propietario
+            device_name: Nombre legible del dispositivo
+            user_agent: User-Agent HTTP header
+            ip_address: IP normalizada
+            fingerprint_hash: Hash SHA256
+            is_active: Estado del dispositivo
+            last_used_at: Último timestamp de uso
+            created_at: Timestamp de creación original
+
+        Returns:
+            UserDevice: Entidad reconstruida desde BD
+        """
+        device = UserDevice(
+            id=id,
+            user_id=user_id,
+            device_name=device_name,
+            user_agent=user_agent,
+            ip_address=ip_address,
+            fingerprint_hash=fingerprint_hash,
+            is_active=is_active,
+            last_used_at=last_used_at,
+            created_at=created_at,
+            installed_app=installed_app,
+            country_code=country_code,
+        )
+        return device
+
+    def revoke(self) -> None:
+        """
+        Revoca el dispositivo (soft delete).
+
+        Marca el dispositivo como inactivo. El usuario no podrá usarlo
+        más para autenticarse, pero el registro se mantiene en BD para auditoría.
+
+        Un dispositivo revocado NO puede reactivarse. Si el usuario vuelve
+        a usar ese dispositivo, se creará un nuevo registro.
+
+        Raises:
+            ValueError: Si el dispositivo ya estaba revocado
+
+        Examples:
+            >>> device = UserDevice.create(user_id, fingerprint)
+            >>> device.is_active
+            True
+            >>> device.revoke()
+            >>> device.is_active
+            False
+        """
+        if not self._is_active:
+            raise RuntimeError("Device already revoked")
+
+        self._is_active = False
+
+    def is_idle(self, now: datetime | None = None) -> bool:
+        """Si lleva más de `SESSION_IDLE_TIMEOUT` sin usarse (BE #376)."""
+        return (now or ahora_utc_sin_zona()) - self._last_used_at > SESSION_IDLE_TIMEOUT
+
+    def update_last_used(self) -> None:
+        """
+        Actualiza el timestamp de último uso al momento actual.
+
+        Se llama cada vez que el usuario hace login desde este dispositivo.
+        Permite trackear dispositivos inactivos para futuras políticas de cleanup.
+
+        Examples:
+            >>> device = UserDevice.create(user_id, fingerprint)
+            >>> original_time = device.last_used_at
+            >>> # ... pasa tiempo ...
+            >>> device.update_last_used()
+            >>> device.last_used_at > original_time
+            True
+        """
+        self._last_used_at = ahora_utc_sin_zona()
+
+    def update_country(self, country_code: str | None) -> None:
+        """El país de la última conexión, si Cloudflare lo dio (BE #737)."""
+        if country_code:
+            self._country_code = country_code
+
+    def update_installed_app(self, installed_app: bool) -> None:
+        """Si la última conexión fue desde la app instalada o desde el navegador (BE #737).
+
+        Los dispositivos de antes de esta versión nacieron como navegador; en
+        Android y en escritorio la app y el navegador comparten cookies, así que
+        es el mismo dispositivo y manda la última conexión.
+        """
+        self._installed_app = installed_app
+
+    def cierra_las_sesiones(self, cuando: datetime) -> None:
+        """
+        Cierra las sesiones abiertas en este dispositivo hasta `cuando` (en UTC): los
+        tokens de acceso emitidos antes dejan de valer al momento, no al caducar. El
+        dispositivo sigue activo y de fiar (auditoría de la fase 6, B-05).
+        """
+        self._session_closed_at = cuando
+
+    @property
+    def sesiones_cerradas_en(self) -> datetime | None:
+        """Cuándo se cerraron sus sesiones por última vez, o None si nunca."""
+        return getattr(self, "_session_closed_at", None)
+
+    def admite_el_acceso(self, emitido_en: float | None) -> bool:
+        """
+        Si un token de acceso emitido en `emitido_en` (segundos desde 1970, su `iat`)
+        vale aquí. Sin cierre, cualquiera; con cierre, solo los emitidos después. Uno
+        sin `iat` (de antes de desplegar esto) no se sabe cuándo nació: tras un cierre,
+        no vale.
+        """
+        cerradas = self.sesiones_cerradas_en
+        if cerradas is None:
+            return True
+        if emitido_en is None:
+            return False
+        return emitido_en > cerradas.timestamp()
+
+    def apunta_el_aviso(self, cuando: datetime) -> None:
+        """Apunta que este dispositivo avisó de un nuevo inicio de sesión (BE #737)."""
+        self._new_login_notice_at = cuando
+
+    @property
+    def aviso_enviado_at(self) -> datetime | None:
+        """Cuándo avisó de un nuevo inicio de sesión, o None si nunca."""
+        return getattr(self, "_new_login_notice_at", None)
+
+    @property
+    def installed_app(self) -> bool:
+        """Si es la app instalada (PWA) y no el navegador."""
+        return getattr(self, "_installed_app", False) or False
+
+    @property
+    def country_code(self) -> str | None:
+        """El país (ISO 3166 alfa-2) de la última conexión, o None."""
+        return getattr(self, "_country_code", None)
+
+    def update_user_agent(self, user_agent: str) -> None:
+        """
+        El navegador se ha actualizado, o es otro en el mismo dispositivo (BE #737).
+
+        Se guarda el nuevo y su nombre legible. La huella no cambia: ya solo sirve
+        para reconocerlo cuando falta la cookie, y cambiarla podría chocar con el
+        índice único de otro dispositivo activo.
+        """
+        limpio = (user_agent or "").strip()
+        if not limpio or limpio == self._user_agent:
+            return
+        self._user_agent = limpio
+        self._device_name = DeviceFingerprint.create(
+            limpio, self._ip_address or "0.0.0.1"
+        ).device_name
+
+    def update_ip_address(self, ip_address: str) -> None:
+        """
+        Actualiza la dirección IP del dispositivo (audit trail).
+
+        Se llama cuando el dispositivo es identificado via cookie y la IP
+        ha cambiado desde la última vez. Permite mantener un registro de
+        la última IP conocida para auditoría de seguridad.
+
+        Args:
+            ip_address: Nueva dirección IP del dispositivo
+
+        Examples:
+            >>> device = UserDevice.create(user_id, fingerprint)
+            >>> device.ip_address
+            '192.168.1.100'
+            >>> device.update_ip_address('192.168.1.200')
+            >>> device.ip_address
+            '192.168.1.200'
+
+        Note:
+            - La IP se almacena tal cual se recibe (no se normaliza)
+        """
+        self._ip_address = ip_address
+
+    # ==========================================================================
+    # PROPERTIES (Encapsulación - solo lectura)
+    # ==========================================================================
+
+    @property
+    def id(self) -> UserDeviceId:
+        """ID único del dispositivo."""
+        return self._id
+
+    @property
+    def user_id(self) -> UserId:
+        """ID del usuario propietario."""
+        return self._user_id
+
+    @property
+    def device_name(self) -> str:
+        """Nombre legible del dispositivo (ej: 'Chrome on macOS')."""
+        return self._device_name
+
+    @property
+    def fingerprint_hash(self) -> str:
+        """Hash SHA256 del fingerprint."""
+        return self._fingerprint_hash
+
+    @property
+    def ip_address(self) -> str:
+        """Dirección IP normalizada del dispositivo."""
+        return self._ip_address
+
+    @property
+    def user_agent(self) -> str:
+        """User-Agent HTTP header completo."""
+        return self._user_agent
+
+    @property
+    def is_active(self) -> bool:
+        """Estado del dispositivo (True=activo, False=revocado)."""
+        return self._is_active
+
+    @property
+    def last_used_at(self) -> datetime:
+        """Timestamp del último uso del dispositivo."""
+        return self._last_used_at
+
+    @property
+    def created_at(self) -> datetime:
+        """Timestamp de creación del registro."""
+        return self._created_at
+
+    # ==========================================================================
+    # MAGIC METHODS
+    # ==========================================================================
+
+    def __eq__(self, other: object) -> bool:
+        """
+        Compara dos UserDevice por identidad (ID).
+
+        Dos dispositivos son iguales si tienen el mismo ID.
+
+        Args:
+            other: Otro objeto a comparar
+
+        Returns:
+            bool: True si tienen el mismo ID
+        """
+        if not isinstance(other, UserDevice):
+            return False
+        return self._id == other._id
+
+    def __hash__(self) -> int:
+        """
+        Genera hash del UserDevice basado en su ID.
+
+        Returns:
+            int: Hash del ID
+        """
+        return hash(self._id)
+
+    def __repr__(self) -> str:
+        """
+        Representación técnica para debugging.
+
+        Returns:
+            str: Representación legible
+        """
+        return (
+            f"UserDevice("
+            f"id={self._id}, "
+            f"user_id={self._user_id}, "
+            f"device='{self.device_name}', "
+            f"active={self._is_active})"
+        )

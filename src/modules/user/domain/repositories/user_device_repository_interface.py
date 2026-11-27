@@ -1,0 +1,303 @@
+"""
+Interfaz del repositorio de dispositivos de usuario (Puerto en Hexagonal Architecture).
+
+Este módulo define el contrato (interface) que debe implementar cualquier
+repositorio de dispositivos, sin especificar CÓMO se implementa.
+
+Responsabilidades:
+- Definir operaciones de persistencia abstractas
+- Servir como puerto (port) para el adaptador de infraestructura
+- Permitir inversión de dependencias (Domain no depende de Infrastructure)
+- Facilitar testing (mocks, in-memory repos)
+
+Implementaciones:
+- SQLAlchemyUserDeviceRepository (Infrastructure Layer) - Producción
+- InMemoryUserDeviceRepository (Tests) - Testing unitario
+
+Patrón: Repository Pattern + Dependency Inversion Principle (SOLID)
+"""
+
+from abc import ABC, abstractmethod
+from datetime import datetime
+
+from src.modules.user.domain.entities.user_device import UserDevice
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class UserDeviceRepositoryInterface(ABC):
+    """
+    Interfaz (puerto) para el repositorio de dispositivos de usuario.
+
+    Define el contrato que debe cumplir cualquier implementación de
+    repositorio de dispositivos, independientemente de la tecnología
+    de persistencia subyacente (PostgreSQL, MongoDB, in-memory, etc.).
+
+    Esta interfaz vive en la Domain Layer y es implementada en la
+    Infrastructure Layer, siguiendo el principio de Inversión de
+    Dependencias (Dependency Inversion Principle).
+
+    Métodos:
+        save: Persiste un dispositivo (nuevo o actualizado)
+        find_by_id: Busca un dispositivo por su ID
+        find_by_user_and_fingerprint: Busca por usuario + fingerprint hash
+        find_active_by_user: Lista dispositivos activos de un usuario
+        revoke: Marca un dispositivo como inactivo
+
+    Examples:
+        >>> # En Use Case (Application Layer)
+        >>> class DetectDeviceUseCase:
+        ...     def __init__(self, repo: UserDeviceRepositoryInterface):
+        ...         self._repo = repo  # ← Depende de interfaz, no implementación
+        ...
+        ...     async def execute(self, user_id, fingerprint):
+        ...         device = await self._repo.find_by_user_and_fingerprint(...)
+        ...         if not device:
+        ...             new_device = UserDevice.create(user_id, fingerprint)
+        ...             await self._repo.save(new_device)
+    """
+
+    @abstractmethod
+    async def add_unless_registered(self, device: UserDevice) -> UserDevice:
+        """
+        Da de alta un dispositivo nuevo, salvo que ese usuario ya tenga uno activo
+        con la misma huella: entonces devuelve ese (BE #692, 28 oct 2026).
+
+        Dos inicios de sesión a la vez leían los dos «no está» y lo daban de alta
+        los dos; el índice único parcial rechazaba al segundo con un 500.
+
+        Returns:
+            El que queda dado de alta: el nuevo, o el que ya estaba
+        """
+
+    @abstractmethod
+    async def save(self, device: UserDevice) -> None:
+        """
+        Persiste un dispositivo en el almacenamiento.
+
+        Este método maneja tanto dispositivos nuevos (INSERT) como
+        actualizaciones de dispositivos existentes (UPDATE).
+
+        Responsabilidades adicionales:
+        - Hacer commit de la transacción (si usa UoW)
+        - Manejar errores de persistencia
+
+        Args:
+            device: Entidad UserDevice a persistir
+
+        Raises:
+            DuplicateDeviceError: Si el fingerprint ya existe para ese usuario
+
+        Examples:
+            >>> # Guardar dispositivo nuevo
+            >>> device = UserDevice.create(user_id, fingerprint)
+            >>> await repo.save(device)
+
+            >>> # Actualizar dispositivo existente
+            >>> device = await repo.find_by_id(device_id)
+            >>> device.update_last_used()
+            >>> await repo.save(device)  # UPDATE
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_id(self, device_id: UserDeviceId) -> UserDevice | None:
+        """
+        Busca un dispositivo por su ID.
+
+        Args:
+            device_id: ID del dispositivo a buscar
+
+        Returns:
+            Optional[UserDevice]: Dispositivo si existe, None si no se encuentra
+
+        Examples:
+            >>> device_id = UserDeviceId.from_string("550e8400-...")
+            >>> device = await repo.find_by_id(device_id)
+            >>> if device:
+            ...     print(device.device_name)
+            ... else:
+            ...     print("Dispositivo no encontrado")
+        """
+        pass
+
+    @abstractmethod
+    async def find_active_ids_of_user(
+        self, device_ids: list[UserDeviceId], user_id: UserId
+    ) -> list[UserDeviceId]:
+        """
+        De estos ids, los de dispositivos ACTIVOS de este usuario, en una consulta
+        (BE #732: el dispositivo fiable del login, desde los ids de la cookie).
+        """
+
+    @abstractmethod
+    async def find_by_id_for_update(self, device_id: UserDeviceId) -> UserDevice | None:
+        """
+        El dispositivo con su fila bloqueada (SELECT … FOR UPDATE) hasta el final de la
+        transacción (F-02): los refrescos, el cierre de sesión y el robo de un mismo
+        dispositivo se ordenan, y quien espera lee la fila ya cambiada.
+        """
+
+    @abstractmethod
+    async def find_active_by_user_for_update(self, user_id: UserId) -> list[UserDevice]:
+        """
+        Los dispositivos activos del usuario con sus filas bloqueadas, en orden de id
+        (siempre el mismo orden: dos que bloqueen varios no se interbloquean). Antes que
+        sus tokens, como los refrescos y el cierre de sesión (F-02, B-05).
+        """
+
+    @abstractmethod
+    async def find_by_id_and_user(
+        self, device_id: UserDeviceId, user_id: UserId
+    ) -> UserDevice | None:
+        """
+        Busca un dispositivo por su ID validando ownership.
+
+        Este método es crítico para la identificación cookie-based de dispositivos.
+        Busca un dispositivo activo que:
+        1. Tenga el ID especificado
+        2. Pertenezca al usuario especificado (ownership validation)
+        3. Esté activo (is_active=True)
+
+        La validación de ownership previene ataques de escalación horizontal
+        donde un usuario intenta usar el device_id de otro usuario.
+
+        Args:
+            device_id: ID del dispositivo (desde cookie)
+            user_id: ID del usuario (desde JWT)
+
+        Returns:
+            Optional[UserDevice]: Dispositivo si existe, pertenece al usuario,
+                                 y está activo. None en caso contrario.
+
+        Security:
+            - OWASP A01: Previene Broken Access Control validando ownership
+            - El device_id viene de cookie httpOnly (no manipulable por JS)
+            - El user_id viene del JWT verificado
+
+        Examples:
+            >>> # En get_current_user dependency
+            >>> device_id = UserDeviceId.from_string(cookie_device_id)
+            >>> user_id = UserId(jwt_user_id)
+            >>> device = await repo.find_by_id_and_user(device_id, user_id)
+            >>> if device:
+            ...     # ✅ Dispositivo válido y activo
+            ...     pass
+            ... else:
+            ...     # ❌ Dispositivo no encontrado, no pertenece al usuario, o revocado
+            ...     raise HTTPException(401, "Dispositivo no válido")
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_user_and_fingerprint(
+        self, user_id: UserId, fingerprint_hash: str
+    ) -> UserDevice | None:
+        """
+        Busca un dispositivo por usuario y hash de fingerprint.
+
+        Este método es crítico para detectar si un dispositivo es nuevo o conocido.
+        Busca un dispositivo activo que pertenezca al usuario y tenga el mismo
+        fingerprint hash.
+
+        Args:
+            user_id: ID del usuario propietario
+            fingerprint_hash: Hash SHA256 del fingerprint a buscar
+
+        Returns:
+            Optional[UserDevice]: Dispositivo si existe y está activo, None en caso contrario
+
+        Examples:
+            >>> # En login, verificar si dispositivo es conocido
+            >>> fingerprint = DeviceFingerprint.create(user_agent, ip)
+            >>> existing = await repo.find_by_user_and_fingerprint(
+            ...     user_id,
+            ...     fingerprint.fingerprint_hash
+            ... )
+            >>> if existing:
+            ...     # ✅ Dispositivo conocido
+            ...     existing.update_last_used()
+            ...     await repo.save(existing)
+            ... else:
+            ...     # ❌ Dispositivo nuevo → Crear + Email
+            ...     new_device = UserDevice.create(user_id, fingerprint)
+            ...     await repo.save(new_device)
+        """
+        pass
+
+    @abstractmethod
+    async def find_active_by_user(self, user_id: UserId) -> list[UserDevice]:
+        """
+        Lista todos los dispositivos activos de un usuario.
+
+        Retorna solo dispositivos con is_active=True, ordenados por
+        last_used_at descendente (más reciente primero).
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            List[UserDevice]: Lista de dispositivos activos (puede estar vacía)
+
+        Examples:
+            >>> # Endpoint: GET /users/me/devices
+            >>> devices = await repo.find_active_by_user(user_id)
+            >>> for device in devices:
+            ...     print(f"{device.device_name} - Usado: {device.last_used_at}")
+            Chrome on macOS - Usado: 2026-01-09 10:30:00
+            Safari on iOS - Usado: 2026-01-08 14:20:00
+        """
+        pass
+
+    @abstractmethod
+    async def find_last_login_map(self, user_ids: list[UserId]) -> dict[str, datetime]:
+        """
+        Devuelve, para cada usuario con al menos un dispositivo registrado,
+        el last_used_at más reciente entre todos sus dispositivos (activos o no).
+
+        Usado por el panel de administración para mostrar la "última conexión"
+        sin añadir una columna dedicada en `users` (se reutiliza el tracking
+        de dispositivos ya existente).
+
+        Args:
+            user_ids: IDs de usuario a consultar (p.ej. la página actual del listado admin)
+
+        Returns:
+            dict[str, datetime]: user_id (str) -> último last_used_at. Usuarios sin
+            dispositivos registrados no aparecen en el dict.
+        """
+        pass
+
+    @abstractmethod
+    async def revoke(self, device_id: UserDeviceId) -> None:
+        """
+        Revoca un dispositivo (marca como inactivo).
+
+        Este método es un shortcut para:
+        1. Buscar dispositivo por ID
+        2. Llamar a device.revoke()
+        3. Guardar dispositivo
+
+        Opcionalmente puede implementarse directamente con UPDATE en BD
+        por eficiencia.
+
+        Args:
+            device_id: ID del dispositivo a revocar
+
+        Raises:
+            DeviceNotFoundError: Si el dispositivo no existe
+            DeviceAlreadyRevokedError: Si ya estaba revocado
+
+        Examples:
+            >>> # Endpoint: DELETE /users/me/devices/{device_id}
+            >>> device_id = UserDeviceId.from_string(request_device_id)
+            >>> await repo.revoke(device_id)
+        """
+        pass
+
+    @abstractmethod
+    async def delete_unused_since(self, antes: datetime) -> int:
+        """
+        Borra los dispositivos sin usar desde antes de `antes`, activos o revocados, y
+        con ellos sus refresh tokens (BE #737). Devuelve cuántos.
+        """

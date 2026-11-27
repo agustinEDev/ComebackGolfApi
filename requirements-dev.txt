@@ -1,0 +1,143 @@
+# ================================
+# DEPENDENCIAS DE DESARROLLO
+# ================================
+# Este archivo contiene las dependencias necesarias solo para desarrollo,
+# testing, linting, type checking y CI/CD.
+# NO se incluyen en producción.
+
+# Primero, instalar todas las dependencias de producción
+-r requirements.txt
+
+# ================================
+# LINTING Y FORMATEO
+# ================================
+
+# Ruff - Linter y formateador ultra-rápido escrito en Rust
+# Reemplaza: flake8, isort, pydocstyle, pyupgrade, autoflake
+# Ventajas: 10-100x más rápido, configuración simple, todo-en-uno
+# Versión EXACTA: el CI la usa como check bloqueante, y con un rango cada release
+# nueva de ruff puede traer reglas y poner el CI en rojo sin tocar código (la 0.16
+# añadió PLR0917: 143 avisos). Subirla es una PR propia, que Dependabot propondrá.
+ruff==0.17.5
+
+# import-linter - Contratos de arquitectura (capas, dominio puro, módulos), ver .importlinter
+# Versión exacta: el workflow "Architecture & API Contract" instala la que diga esta línea
+import-linter==2.17
+# grimp - el grafo de importaciones que usa import-linter; lo importa también la prueba de ciclos
+# del dominio de usuarios (tests/unit/modules/user/domain/test_capas_del_dominio_de_usuarios.py)
+grimp==3.20
+
+# ================================
+# TYPE CHECKING
+# ================================
+
+# Mypy - Verificador estático de tipos para Python
+# Analiza el código usando type hints para detectar errores antes de runtime
+# Esencial para proyectos grandes con arquitectura clean
+# Versión EXACTA, por lo mismo que ruff: es un check bloqueante del CI
+mypy==2.4.1
+
+# Tipos stub para SQLAlchemy (necesario para mypy con SQLAlchemy)
+sqlalchemy[mypy]>=2.1.9
+
+# ================================
+# SEGURIDAD
+# ================================
+
+# Bandit - Encuentra problemas de seguridad comunes en código Python
+# Detecta: SQL injection, uso de eval(), contraseñas hardcodeadas, etc.
+bandit[toml]>=1.9.4
+
+# safety se retiró el 28 sep 2026: nunca tumbaba el CI (continue-on-error),
+# pip-audit ya era el árbitro, y arrastraba cuatro paquetes con CVEs recurrentes
+# (nltk, authlib, marshmallow, filelock) que solo existían por él.
+
+# pip-audit - Auditoría oficial de PyPA para dependencias
+# Escanea contra PyPI Advisory Database y OSV (Open Source Vulnerabilities)
+# Alternativa oficial mantenida por Python Packaging Authority
+# Cumple con OWASP Top 10: A06 (Vulnerable and Outdated Components)
+pip-audit==2.10.1
+
+# ================================
+# PINS TRANSITIVOS DE LAS HERRAMIENTAS DE AUDITORÍA
+# ================================
+# Ninguno de estos lo usa la aplicación: los arrastra pip-audit, que
+# solo se ejecutan aquí y en el job "Security Checks" del CI. Viven en este
+# fichero para que la imagen de producción no los instale (#289).
+# Comprobado con `pip show <paquete>`: su "Required-by" es exclusivamente de dev.
+# Los que sí necesita producción se quedan en requirements.txt — click (uvicorn),
+# urllib3 (sentry-sdk) y mako (alembic).
+
+# msgpack - Serialización binaria (dependencia transitiva de pip-audit > cachecontrol)
+# Fijada explícitamente para resolver SNYK-PYTHON-MSGPACK-17391445 (Use After Free)
+msgpack==1.2.4
+
+# zipp - Pathlib-compatible Zipfile object wrapper (dependencia transitiva de importlib-metadata,
+# que a su vez entra con las herramientas de auditoría: ya no existe en producción)
+# Fijada explícitamente para resolver CVE-2024-5569 (Infinite loop DoS via Path module)
+zipp==4.1.2
+
+# ================================
+# TESTING
+# ================================
+# La suite no se ejecuta nunca dentro del contenedor: `.dockerignore` excluye `tests/`,
+# y el CI corre pytest directamente en el runner de GitHub. Vivían en requirements.txt,
+# de modo que la imagen de producción instalaba un ejecutor de pruebas y ninguna prueba
+# que ejecutar — 10 paquetes contando su árbol (#291).
+
+# pytest - Framework de testing moderno y potente
+# Más simple que unittest, mejor output de errores, fixtures potentes
+# Actualizado a 9.0.3 para resolver CVE-2025-71176 (arbitrary code execution via deserialization)
+pytest==9.2.0
+
+# pytest-json-report - Plugin para pytest que genera reportes en formato JSON
+# Esencial para el análisis programático de los resultados de los tests
+pytest-json-report==1.5.0
+
+# pytest-xdist - Plugin para pytest que permite ejecutar tests en paralelo
+# Acelera significativamente la suite de tests distribuyendo el trabajo
+pytest-xdist==3.8.0
+
+# respx - Simula respuestas de httpx en los tests (BE #532)
+# El cliente de Overpass (OpenStreetMap) se prueba sin red: sus caídas, límites
+# de uso y respuestas ilegibles, sin depender de un servicio público
+respx==0.23.1
+
+# pytest-asyncio - Plugin para pytest que proporciona soporte para tests asíncronos
+# Permite usar async/await en tests y fixtures con asyncio_mode = auto
+# 1.5.0: pide pytest>=8.4, sin techo (compatible con pytest 9.x)
+pytest-asyncio==1.5.0
+
+# pytest-cov - Plugin de cobertura para pytest
+# Sin versión fijada, como estaba en requirements.txt: se mueve tal cual para no
+# mezclar el traslado con un cambio de resolución
+pytest-cov
+
+# pygments - Syntax highlighter (dependencia transitiva de pytest)
+# Estaba pinneado en requirements.txt solo porque pytest lo arrastraba hasta producción.
+# Al mover el bloque de test, su único consumidor viene aquí, y el pin con él.
+# Fijada explícitamente para resolver CVE-2026-4539
+pygments==2.21.0
+
+# ================================
+# ANÁLISIS DE CÓDIGO
+# ================================
+
+# Radon - Calcula métricas de complejidad ciclomática y mantenibilidad
+# Ayuda a identificar código complejo que necesita refactorización
+radon>=6.0.1
+
+# ================================
+# SOFTWARE SUPPLY CHAIN SECURITY
+# ================================
+
+# cyclonedx-bom - Genera Software Bill of Materials (SBOM) en formato CycloneDX
+# Cumple con OWASP A08:2021 Software and Data Integrity Failures
+# Permite auditoría completa de la cadena de suministro de software
+cyclonedx-bom>=8.0.1
+
+# pip-tools - Herramientas para gestión de dependencias con pip
+# pip-compile: Genera requirements.lock con hashes SHA256 para verificación de integridad
+# pip-sync: Sincroniza el entorno con el lock file
+# Previene ataques de dependency substitution
+pip-tools>=7.6.2

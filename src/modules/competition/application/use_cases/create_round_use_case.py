@@ -1,0 +1,189 @@
+"""Caso de Uso: Crear Ronda/Sesión de competición."""
+
+from collections.abc import Callable
+from datetime import datetime
+
+from src.modules.competition.application.dto.round_match_dto import (
+    CreateRoundRequestDTO,
+    CreateRoundResponseDTO,
+)
+from src.modules.competition.application.exceptions import (
+    CompetitionNotFoundError,
+    DateOutOfRangeError,
+    NotCompetitionCreatorError,
+)
+from src.modules.competition.application.ports.competition_timezone import ICompetitionTimezone
+from src.modules.competition.application.services.franjas import (
+    comprobar_agenda,
+    comprobar_que_existen_sus_salidas,
+    comprobar_que_no_ha_pasado,
+    comprobar_solape,
+    comprobar_tipo,
+    hoja_de,
+    primera_salida_de,
+)
+from src.modules.competition.domain.entities.round import Round
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.handicap_mode import HandicapMode
+from src.modules.competition.domain.value_objects.session_type import SessionType
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_en_utc
+from src.shared.domain.value_objects.match_format import MatchFormat
+
+
+class GolfCourseNotInCompetitionError(Exception):
+    """El campo de golf no está asociado a la competición."""
+
+    pass
+
+
+class DuplicateSessionError(Exception):
+    """Ya existe una sesión con ese tipo en esa fecha."""
+
+    pass
+
+
+class CreateRoundUseCase:
+    """
+    Caso de uso para crear una ronda/sesión de competición.
+
+    Restricciones:
+    - La competición no puede haber terminado ni estar cancelada (BE #365)
+    - Solo el creador puede crear rondas
+    - El campo de golf debe estar asociado a la competición
+    - No pueden existir sesiones duplicadas (misma fecha + tipo)
+    - La fecha debe estar dentro del rango de la competición
+    - Una franja, con su primera salida aún por llegar (QA del 11 oct 2026)
+    """
+
+    def __init__(
+        self,
+        uow: CompetitionUnitOfWorkInterface,
+        zonas: ICompetitionTimezone | None = None,
+        reloj: Callable[[], datetime] = ahora_en_utc,
+    ):
+        """
+        Args:
+            zonas: Para saber si la primera salida de una franja ya pasó; sin
+                ellas (o sin zona en el campo), no se mira
+        """
+        self._uow = uow
+        self._zonas = zonas
+        self._reloj = reloj
+
+    async def execute(
+        self, request: CreateRoundRequestDTO, user_id: UserId, is_admin: bool = False
+    ) -> CreateRoundResponseDTO:
+        async with self._uow:
+            # 1. Buscar la competición
+            competition_id = CompetitionId(request.competition_id)
+            # Bloqueada, como la agenda automática: si no, una sesión creada
+            # mientras se sustituye la agenda se quedaba fuera de la sustitución
+            competition = await self._uow.competitions.find_by_id_for_update(competition_id)
+
+            if not competition:
+                raise CompetitionNotFoundError(
+                    f"No existe competición con ID {request.competition_id}"
+                )
+
+            # 2. Verificar creador
+            if not is_admin and not competition.is_creator(user_id):
+                raise NotCompetitionCreatorError("Solo el creador puede crear rondas")
+
+            # La agenda se edita desde que la competición existe (BE #365): lo
+            # que se protege es la sesión ya jugada, y eso lo mira la sesión. Las
+            # franjas de un stroke play, hasta iniciar (#251)
+            comprobar_agenda(competition)
+
+            # 4. Verificar campo de golf en la competición
+            golf_course_id = GolfCourseId(request.golf_course_id)
+            if not competition.has_golf_course(golf_course_id):
+                raise GolfCourseNotInCompetitionError(
+                    f"El campo de golf {request.golf_course_id} no está asociado a la competición"
+                )
+
+            # 5. Verificar fecha dentro del rango
+            if not (
+                competition.dates.start_date <= request.round_date <= competition.dates.end_date
+            ):
+                raise DateOutOfRangeError(
+                    f"La fecha {request.round_date} está fuera del rango "
+                    f"({competition.dates.start_date} - {competition.dates.end_date})"
+                )
+
+            # 6. Verificar sesión duplicada
+            existing_rounds = await self._uow.rounds.find_by_competition_and_date(
+                competition_id, request.round_date
+            )
+            session_type = SessionType(request.session_type)
+            for existing in existing_rounds:
+                if existing.session_type == session_type:
+                    raise DuplicateSessionError(
+                        f"Ya existe una sesión {request.session_type} "
+                        f"en la fecha {request.round_date}"
+                    )
+
+            # 6b. Franja con su hoja de salidas, o sesión de Ryder con su formato,
+            #     y una franja no se solapa con otra de la jornada (#251)
+            hoja = hoja_de(request.tee_sheet)
+            comprobar_tipo(
+                competition,
+                hoja,
+                con_formato=request.match_format is not None
+                or request.handicap_mode is not None
+                or request.allowance_percentage is not None,
+                trae_formato=request.match_format is not None,
+                exige_formato=True,
+            )
+            if hoja is not None:
+                comprobar_solape(hoja, request.round_date, golf_course_id, existing_rounds)
+                comprobar_que_no_ha_pasado(
+                    await primera_salida_de(hoja, request.round_date, golf_course_id, self._zonas),
+                    self._reloj(),
+                )
+                await comprobar_que_existen_sus_salidas(
+                    hoja, request.round_date, golf_course_id, self._zonas
+                )
+
+            # 7. Crear la ronda
+            if hoja is not None:
+                round_entity = Round.create_franja(
+                    competition_id=competition_id,
+                    golf_course_id=golf_course_id,
+                    round_date=request.round_date,
+                    session_type=session_type,
+                    hoja_de_salidas=hoja,
+                )
+            else:
+                handicap_mode = (
+                    HandicapMode(request.handicap_mode) if request.handicap_mode else None
+                )
+                round_entity = Round.create(
+                    competition_id=competition_id,
+                    golf_course_id=golf_course_id,
+                    round_date=request.round_date,
+                    session_type=session_type,
+                    match_format=MatchFormat(str(request.match_format)),
+                    handicap_mode=handicap_mode,
+                    allowance_percentage=request.allowance_percentage,
+                )
+
+            # 8. Si ya hay equipos asignados, transicionar a PENDING_MATCHES
+            existing_assignment = await self._uow.team_assignments.find_by_competition(
+                competition_id
+            )
+            if existing_assignment:
+                round_entity.mark_teams_assigned()
+
+            await self._uow.rounds.add(round_entity)
+
+        return CreateRoundResponseDTO(
+            id=round_entity.id.value,
+            competition_id=round_entity.competition_id.value,
+            status=round_entity.status.value,
+            created_at=round_entity.created_at,
+        )

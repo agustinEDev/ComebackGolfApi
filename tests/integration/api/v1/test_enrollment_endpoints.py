@@ -1,0 +1,1115 @@
+"""
+Tests E2E para Enrollment Endpoints.
+
+Tests de integración que verifican el flujo completo de los endpoints
+de inscripciones incluyendo autenticación, validaciones y persistencia.
+"""
+
+import uuid
+from datetime import timedelta
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+from tests.conftest import (
+    _URL_DE_LA_BD_DE_TEST,
+    activate_competition,
+    add_one_session,
+    create_admin_user,
+    create_authenticated_user,
+    create_competition,
+    inscrito_por_invitacion,
+    set_auth_cookies,
+    solicitud_pendiente,
+)
+
+
+class TestRequestEnrollment:
+    """Tests para POST /api/v1/competitions/{id}/enrollments"""
+
+    @pytest.mark.asyncio
+    async def test_request_enrollment_success(self, client: AsyncClient):
+        """Solicitar inscripción en competición ACTIVE retorna 201."""
+        # Arrange
+        creator = await create_authenticated_user(
+            client, "creator@test.com", "P@ssw0rd123!", "Creator", "User"
+        )
+        player = await create_authenticated_user(
+            client, "player@test.com", "P@ssw0rd123!", "Player", "User"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        # Act
+        set_auth_cookies(client, player["cookies"])
+        response = await client.post(
+            f"/api/v1/competitions/{comp['id']}/enrollments", json={"tee_color": "YELLOW"}
+        )
+
+        # Assert
+        assert response.status_code == 201
+        data = response.json()
+        # En una pública se entra directamente (release social 3, 28 oct 2026)
+        assert data["status"] == "APPROVED"
+        assert data["user_id"] == player["user"]["id"]
+
+    @pytest.mark.asyncio
+    async def test_request_enrollment_draft_competition_returns_400(self, client: AsyncClient):
+        """Solicitar inscripción en competición DRAFT retorna 400."""
+        creator = await create_authenticated_user(
+            client, "creator2@test.com", "P@ssw0rd123!", "Creator", "Two"
+        )
+        player = await create_authenticated_user(
+            client, "player2@test.com", "P@ssw0rd123!", "Player", "Two"
+        )
+
+        # Publica y con apertura programada. Las dos cosas hacen falta: desde
+        # BE #332 la unica que sigue en DRAFT es la programada, y desde BE #318
+        # una privada rechaza la solicitud con 403 antes de mirar el estado, asi
+        # que con una privada este test no llegaria a probar lo que dice probar
+        start = ahora_utc_sin_zona().date() + timedelta(days=30)
+        comp = await create_competition(
+            client,
+            creator["cookies"],
+            {
+                "name": f"Publica programada {uuid.uuid4().hex[:8]}",
+                "start_date": start.isoformat(),
+                "end_date": (start + timedelta(days=3)).isoformat(),
+                "main_country": "ES",
+                "play_mode": "SCRATCH",
+                "visibility": "PUBLIC",
+                "enrollment_opens_days_before": 5,
+            },
+        )
+
+        set_auth_cookies(client, player["cookies"])
+        response = await client.post(
+            f"/api/v1/competitions/{comp['id']}/enrollments", json={"tee_color": "YELLOW"}
+        )
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_request_enrollment_duplicate_returns_409(self, client: AsyncClient):
+        """Solicitar inscripción duplicada retorna 409."""
+        creator = await create_authenticated_user(
+            client, "creator3@test.com", "P@ssw0rd123!", "Creator", "Three"
+        )
+        player = await create_authenticated_user(
+            client, "player3@test.com", "P@ssw0rd123!", "Player", "Three"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        # Entra (directa desde el 28 oct 2026)
+        set_auth_cookies(client, player["cookies"])
+        primera = await client.post(
+            f"/api/v1/competitions/{comp['id']}/enrollments", json={"tee_color": "YELLOW"}
+        )
+        assert primera.status_code == 201, primera.text
+
+        # Otra vez: ya está dentro
+        response = await client.post(
+            f"/api/v1/competitions/{comp['id']}/enrollments", json={"tee_color": "YELLOW"}
+        )
+
+        assert response.status_code == 409
+
+
+class TestSinInscripcionDirectaDelOrganizador:
+    """B-02 (15 nov 2026), O1: el organizador solo invita.
+
+    POST /api/v1/competitions/{id}/enrollments/direct ya no existe: ni para el
+    organizador ni para un admin, y nadie queda inscrito.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("quien", ["organizador", "admin"])
+    async def test_la_ruta_ya_no_existe(self, client: AsyncClient, quien: str):
+        creator = await create_authenticated_user(
+            client, f"o1-{quien}-creator@test.com", "P@ssw0rd123!", "Creator", "Directa"
+        )
+        player = await create_authenticated_user(
+            client, f"o1-{quien}-player@test.com", "P@ssw0rd123!", "Player", "Directa"
+        )
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+        if quien == "admin":
+            admin = await create_admin_user(
+                client, "o1-admin@test.com", "AdminPass123!", "Admin", "Directa"
+            )
+            cookies = admin["cookies"]
+        else:
+            cookies = creator["cookies"]
+
+        set_auth_cookies(client, cookies)
+        response = await client.post(
+            f"/api/v1/competitions/{comp['id']}/enrollments/direct",
+            json={"competition_id": comp["id"], "user_id": player["user"]["id"]},
+        )
+
+        assert response.status_code in (404, 405), response.text
+        set_auth_cookies(client, creator["cookies"])
+        inscritos = await client.get(f"/api/v1/competitions/{comp['id']}/enrollments")
+        assert player["user"]["id"] not in [e["user_id"] for e in inscritos.json()]
+
+
+class TestListEnrollments:
+    """Tests para GET /api/v1/competitions/{id}/enrollments"""
+
+    @pytest.mark.asyncio
+    async def test_list_enrollments_empty(self, client: AsyncClient):
+        """Listar inscripciones vacío retorna lista vacía."""
+        creator = await create_authenticated_user(
+            client, "creator6@test.com", "P@ssw0rd123!", "Creator", "Six"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+
+        response = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments", cookies=creator["cookies"]
+        )
+
+        assert response.status_code == 200
+        assert len(response.json()) == 1  # Creator auto-enrolled
+
+    @pytest.mark.asyncio
+    async def test_list_enrollments_with_data(self, client: AsyncClient):
+        """Listar inscripciones retorna las existentes."""
+        creator = await create_authenticated_user(
+            client, "creator7@test.com", "P@ssw0rd123!", "Creator", "Seven"
+        )
+        player1 = await create_authenticated_user(
+            client, "player7a@test.com", "P@ssw0rd123!", "Player", "Alpha"
+        )
+        player2 = await create_authenticated_user(
+            client, "player7b@test.com", "P@ssw0rd123!", "Player", "Beta"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        # Crear 2 inscripciones
+        set_auth_cookies(client, player1["cookies"])
+        await solicitud_pendiente(client, comp["id"])
+        set_auth_cookies(client, player2["cookies"])
+        await solicitud_pendiente(client, comp["id"])
+
+        response = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments", cookies=creator["cookies"]
+        )
+
+        assert response.status_code == 200
+        assert len(response.json()) == 3  # Creator auto-enrolled + 2 players
+
+
+async def _sembrar_inscritos(competition_id: str, estados: dict[str, int]) -> None:
+    """Crea en la BD de la API un usuario y su inscripción por cada plaza pedida.
+
+    Directo en la base de datos: registrar más de cien jugadores por la API
+    costaría minutos, y aquí solo importa que existan las filas.
+    """
+    engine = create_async_engine(_URL_DE_LA_BD_DE_TEST["url"])
+    try:
+        async with engine.begin() as conn:
+            for estado, cuantos in estados.items():
+                for n in range(cuantos):
+                    user_id = str(uuid.uuid4())
+                    await conn.execute(
+                        text(
+                            "INSERT INTO users (id, first_name, last_name, email, password, "
+                            "created_at, updated_at, email_verified, failed_login_attempts, "
+                            "is_admin) VALUES (:id, :fn, :ln, :email, 'x', now(), now(), "
+                            "false, 0, false)"
+                        ),
+                        {
+                            "id": user_id,
+                            "fn": f"Jugador{n}",
+                            "ln": estado.title(),
+                            "email": f"sembrado-{user_id}@test.com",
+                        },
+                    )
+                    await conn.execute(
+                        text(
+                            "INSERT INTO enrollments (id, competition_id, user_id, status, "
+                            "created_at, updated_at) VALUES (:id, :c, :u, :s, now(), now())"
+                        ),
+                        {"id": str(uuid.uuid4()), "c": competition_id, "u": user_id, "s": estado},
+                    )
+    finally:
+        await engine.dispose()
+
+
+class TestListEnrollmentsBeyondOneHundred:
+    """BE #314: el listado ya no se corta en 100 filas."""
+
+    @pytest.mark.asyncio
+    async def test_list_returns_every_enrollment_with_its_user(self, client: AsyncClient):
+        """
+        Given 110 aprobados y 15 rechazados, además del creador
+        When se listan sin filtro
+        Then llegan los 126, cada uno con los datos de su usuario
+        """
+        creator = await create_authenticated_user(
+            client, "cien@test.com", "P@ssw0rd123!", "Creator", "Cien"
+        )
+        comp = await create_competition(client, creator["cookies"])
+        await _sembrar_inscritos(comp["id"], {"APPROVED": 110, "REJECTED": 15})
+
+        response = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments", cookies=creator["cookies"]
+        )
+
+        assert response.status_code == 200, response.text
+        filas = response.json()
+        assert len(filas) == 126
+        assert all(f["user"] and f["user"]["id"] == f["user_id"] for f in filas)
+
+    @pytest.mark.asyncio
+    async def test_status_filter_returns_more_than_one_hundred_and_only_that_status(
+        self, client: AsyncClient
+    ):
+        """
+        Given 110 aprobados y 15 rechazados, además del creador (aprobado)
+        When se filtra por APPROVED
+        Then llegan los 111 aprobados y ningún rechazado
+        """
+        creator = await create_authenticated_user(
+            client, "cienfiltro@test.com", "P@ssw0rd123!", "Creator", "Filtro"
+        )
+        comp = await create_competition(client, creator["cookies"])
+        await _sembrar_inscritos(comp["id"], {"APPROVED": 110, "REJECTED": 15})
+
+        response = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments?status=APPROVED",
+            cookies=creator["cookies"],
+        )
+
+        assert response.status_code == 200, response.text
+        filas = response.json()
+        assert len(filas) == 111
+        assert {f["status"] for f in filas} == {"APPROVED"}
+
+
+class TestListEnrollmentsPrivacy:
+    """
+    BE #531 y release social 2: quién ve qué filas y qué correos.
+
+    La competición del montaje es pública y aún sin publicar: cada uno ve su
+    fila y, de los aprobados, solo a sus amigos.
+    """
+
+    async def _montaje(self, client: AsyncClient, sufijo: str) -> dict:
+        """Creador, un aprobado, dos pendientes y uno rechazado."""
+        gente = {}
+        for rol in ("creador", "aprobado", "pendiente", "otro_pendiente", "rechazado"):
+            gente[rol] = await create_authenticated_user(
+                client, f"{rol}_{sufijo}@test.com", "P@ssw0rd123!", "Jugador", "Privacidad"
+            )
+        comp = await create_competition(client, gente["creador"]["cookies"])
+        await activate_competition(client, gente["creador"]["cookies"], comp["id"])
+        ids = {}
+        for rol in ("aprobado", "pendiente", "otro_pendiente", "rechazado"):
+            set_auth_cookies(client, gente[rol]["cookies"])
+            ids[rol] = (await solicitud_pendiente(client, comp["id"]))["id"]
+        for rol, accion in (("aprobado", "approve"), ("rechazado", "reject")):
+            r = await client.post(
+                f"/api/v1/enrollments/{ids[rol]}/{accion}", cookies=gente["creador"]["cookies"]
+            )
+            assert r.status_code == 200, r.text
+        return {"comp": comp, "gente": gente}
+
+    async def _lista(self, client: AsyncClient, m: dict, quien: dict, filtro: str = "") -> list:
+        r = await client.get(
+            f"/api/v1/competitions/{m['comp']['id']}/enrollments{filtro}", cookies=quien["cookies"]
+        )
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    @staticmethod
+    def _por_email(m: dict, filas: list) -> dict:
+        """Cada fila, por el correo REAL de su dueño (no el que llega)."""
+        por_id = {g["user"]["id"]: g["user"]["email"] for g in m["gente"].values()}
+        return {por_id[f["user_id"]]: f for f in filas}
+
+    @pytest.mark.asyncio
+    async def test_organizer_sees_every_row_and_every_email(self, client: AsyncClient):
+        m = await self._montaje(client, "p531a")
+
+        filas = await self._lista(client, m, m["gente"]["creador"])
+
+        assert {f["status"] for f in filas} == {"APPROVED", "REQUESTED", "REJECTED"}
+        assert len(filas) == 5
+        assert all(f["user"]["email"] == e for e, f in self._por_email(m, filas).items())
+
+    @pytest.mark.asyncio
+    async def test_admin_sees_every_row_and_every_email(self, client: AsyncClient):
+        m = await self._montaje(client, "p531b")
+        admin = await create_admin_user(client, "admin_p531b@test.com", "P@ssw0rd123!", "Ad", "Min")
+
+        filas = await self._lista(client, m, admin)
+
+        assert len(filas) == 5
+        assert all(f["user"]["email"] == e for e, f in self._por_email(m, filas).items())
+
+    async def _amigos(self, client: AsyncClient, a: dict, b: dict) -> None:
+        set_auth_cookies(client, a["cookies"])
+        pedida = await client.post(
+            "/api/v1/friends/requests", json={"addressee_id": b["user"]["id"]}
+        )
+        assert pedida.status_code == 201, pedida.text
+        set_auth_cookies(client, b["cookies"])
+        aceptada = await client.post(
+            f"/api/v1/friends/requests/{pedida.json()['id']}/respond", json={"action": "ACCEPT"}
+        )
+        assert aceptada.status_code == 200, aceptada.text
+
+    @pytest.mark.asyncio
+    async def test_pending_player_sees_only_own_row_and_own_email(self, client: AsyncClient):
+        m = await self._montaje(client, "p531c")
+        yo = m["gente"]["pendiente"]
+
+        filas = await self._lista(client, m, yo)
+
+        assert [f["user_id"] for f in filas] == [yo["user"]["id"]]
+        assert filas[0]["status"] == "REQUESTED"
+        assert filas[0]["user"]["email"] == yo["user"]["email"]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_user_sees_nobody_before_it_is_published(self, client: AsyncClient):
+        m = await self._montaje(client, "p531d")
+        extrano = await create_authenticated_user(
+            client, "extrano_p531d@test.com", "P@ssw0rd123!", "Extra", "No"
+        )
+
+        respuesta = await client.get(
+            f"/api/v1/competitions/{m['comp']['id']}/enrollments", cookies=extrano["cookies"]
+        )
+
+        assert respuesta.json() == []
+        for g in m["gente"].values():
+            assert g["user"]["email"] not in respuesta.text
+
+    @pytest.mark.asyncio
+    async def test_a_friend_of_the_approved_one_sees_them_without_email(self, client: AsyncClient):
+        m = await self._montaje(client, "p531g")
+        amigo = await create_authenticated_user(
+            client, "amigo_p531g@test.com", "P@ssw0rd123!", "Ami", "Go"
+        )
+        await self._amigos(client, amigo, m["gente"]["aprobado"])
+        # Amigo también del pendiente: ese no sale, no está aprobado
+        await self._amigos(client, amigo, m["gente"]["pendiente"])
+
+        filas = await self._lista(client, m, amigo)
+
+        assert [f["user_id"] for f in filas] == [m["gente"]["aprobado"]["user"]["id"]]
+        assert filas[0]["user"]["email"] == ""
+
+    @pytest.mark.asyncio
+    async def test_status_filter_goes_on_top_of_what_each_one_sees(self, client: AsyncClient):
+        m = await self._montaje(client, "p531e")
+        g = m["gente"]
+        extrano = await create_authenticated_user(
+            client, "extrano_p531e@test.com", "P@ssw0rd123!", "Extra", "No"
+        )
+
+        del_creador = await self._lista(client, m, g["creador"], "?status=REQUESTED")
+        del_pendiente = await self._lista(client, m, g["pendiente"], "?status=REQUESTED")
+        del_aprobado = await self._lista(client, m, g["aprobado"], "?status=REJECTED")
+        del_extrano = await self._lista(client, m, extrano, "?status=APPROVED")
+
+        assert len(del_creador) == 2
+        assert [f["user_id"] for f in del_pendiente] == [g["pendiente"]["user"]["id"]]
+        assert del_aprobado == []
+        assert del_extrano == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_status_filter_is_a_422(self, client: AsyncClient):
+        """
+        Given: una competición
+        When: se lista con un estado que no existe
+        Then: 422, como cualquier otro parámetro mal formado
+        """
+        creador = await create_authenticated_user(
+            client, "creador_p531f@test.com", "P@ssw0rd123!", "Jugador", "Privacidad"
+        )
+        comp = await create_competition(client, creador["cookies"])
+
+        r = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments?status=foo",
+            cookies=creador["cookies"],
+        )
+
+        assert r.status_code == 422, r.text
+
+
+class TestApproveRejectEnrollment:
+    """Tests para POST /api/v1/enrollments/{id}/approve y /reject"""
+
+    @pytest.mark.asyncio
+    async def test_approve_enrollment_success(self, client: AsyncClient):
+        """Aprobar inscripción cambia estado a APPROVED."""
+        creator = await create_authenticated_user(
+            client, "creator8@test.com", "P@ssw0rd123!", "Creator", "Eight"
+        )
+        player = await create_authenticated_user(
+            client, "player8@test.com", "P@ssw0rd123!", "Player", "Eight"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        # Solicitar inscripción
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        # Aprobar
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/approve")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "APPROVED"
+
+    @pytest.mark.asyncio
+    async def test_reject_enrollment_success(self, client: AsyncClient):
+        """Rechazar inscripción cambia estado a REJECTED."""
+        creator = await create_authenticated_user(
+            client, "creator9@test.com", "P@ssw0rd123!", "Creator", "Nine"
+        )
+        player = await create_authenticated_user(
+            client, "player9@test.com", "P@ssw0rd123!", "Player", "Nine"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/reject")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "REJECTED"
+
+
+class TestCancelWithdrawEnrollment:
+    """Tests para POST /api/v1/enrollments/{id}/cancel y /withdraw"""
+
+    @pytest.mark.asyncio
+    async def test_cancel_enrollment_success(self, client: AsyncClient):
+        """Cancelar inscripción propia cambia estado a CANCELLED."""
+        creator = await create_authenticated_user(
+            client, "creator10@test.com", "P@ssw0rd123!", "Creator", "Ten"
+        )
+        player = await create_authenticated_user(
+            client, "player10@test.com", "P@ssw0rd123!", "Player", "Ten"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/cancel")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "CANCELLED"
+
+    @pytest.mark.asyncio
+    async def test_withdraw_enrollment_success(self, client: AsyncClient):
+        """Retirarse de inscripción aprobada cambia estado a WITHDRAWN."""
+        creator = await create_authenticated_user(
+            client, "creator11@test.com", "P@ssw0rd123!", "Creator", "Eleven"
+        )
+        player = await create_authenticated_user(
+            client, "player11@test.com", "P@ssw0rd123!", "Player", "Eleven"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        # Solicitar y aprobar
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/enrollments/{enrollment_id}/approve")
+
+        # Retirarse
+        set_auth_cookies(client, player["cookies"])
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/withdraw")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "WITHDRAWN"
+
+    @pytest.mark.asyncio
+    async def test_cancel_other_user_enrollment_returns_403(self, client: AsyncClient):
+        """Cancelar inscripción de otro usuario retorna 403."""
+        creator = await create_authenticated_user(
+            client, "creator12@test.com", "P@ssw0rd123!", "Creator", "Twelve"
+        )
+        player = await create_authenticated_user(
+            client, "player12@test.com", "P@ssw0rd123!", "Player", "Twelve"
+        )
+        other = await create_authenticated_user(
+            client, "other12@test.com", "P@ssw0rd123!", "Other", "Twelve"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        set_auth_cookies(client, other["cookies"])
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/cancel")
+
+        assert response.status_code == 403
+
+
+class TestSetCustomHandicap:
+    """Tests para PUT /api/v1/enrollments/{id}/handicap"""
+
+    @pytest.mark.asyncio
+    async def test_set_custom_handicap_success(self, client: AsyncClient):
+        """Creador establece handicap personalizado exitosamente."""
+        creator = await create_authenticated_user(
+            client, "creator13@test.com", "P@ssw0rd123!", "Creator", "Thirteen"
+        )
+        player = await create_authenticated_user(
+            client, "player13@test.com", "P@ssw0rd123!", "Player", "Thirteen"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        # Inscripción directa
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        # Establecer handicap
+        response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            json={"enrollment_id": enrollment_id, "custom_handicap": 15.5},
+            cookies=creator["cookies"],
+        )
+
+        assert response.status_code == 200
+        assert float(response.json()["custom_handicap"]) == pytest.approx(15.5)
+
+    @pytest.mark.asyncio
+    async def test_set_custom_handicap_by_admin_not_creator_succeeds(self, client: AsyncClient):
+        """Admin (no creador) puede establecer handicap personalizado."""
+        creator = await create_authenticated_user(
+            client, "creator13b@test.com", "P@ssw0rd123!", "Creator", "ThirteenB"
+        )
+        admin = await create_admin_user(
+            client, "admin13b@test.com", "AdminPass123!", "Admin", "ThirteenB"
+        )
+        player = await create_authenticated_user(
+            client, "player13b@test.com", "P@ssw0rd123!", "Player", "ThirteenB"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            json={"enrollment_id": enrollment_id, "custom_handicap": 12.0},
+            cookies=admin["cookies"],
+        )
+
+        assert response.status_code == 200
+        assert float(response.json()["custom_handicap"]) == pytest.approx(12.0)
+
+
+class TestRemoveCustomHandicap:
+    """Tests para DELETE /api/v1/enrollments/{id}/handicap"""
+
+    @pytest.mark.asyncio
+    async def test_remove_custom_handicap_success(self, client: AsyncClient):
+        """Creador elimina el handicap personalizado y vuelve a None."""
+        creator = await create_authenticated_user(
+            client, "creator14@test.com", "P@ssw0rd123!", "Creator", "Fourteen"
+        )
+        player = await create_authenticated_user(
+            client, "player14@test.com", "P@ssw0rd123!", "Player", "Fourteen"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            json={"enrollment_id": enrollment_id, "custom_handicap": 15.5},
+            cookies=creator["cookies"],
+        )
+
+        response = await client.delete(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            cookies=creator["cookies"],
+        )
+
+        assert response.status_code == 200
+        assert response.json()["custom_handicap"] is None
+
+    @pytest.mark.asyncio
+    async def test_remove_custom_handicap_by_admin_not_creator_succeeds(self, client: AsyncClient):
+        """Admin (no creador) puede eliminar el handicap personalizado."""
+        creator = await create_authenticated_user(
+            client, "creator14b@test.com", "P@ssw0rd123!", "Creator", "FourteenB"
+        )
+        admin = await create_admin_user(
+            client, "admin14b@test.com", "AdminPass123!", "Admin", "FourteenB"
+        )
+        player = await create_authenticated_user(
+            client, "player14b@test.com", "P@ssw0rd123!", "Player", "FourteenB"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            json={"enrollment_id": enrollment_id, "custom_handicap": 12.0},
+            cookies=creator["cookies"],
+        )
+
+        response = await client.delete(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            cookies=admin["cookies"],
+        )
+
+        assert response.status_code == 200
+        assert response.json()["custom_handicap"] is None
+
+    @pytest.mark.asyncio
+    async def test_remove_custom_handicap_not_creator_returns_403(self, client: AsyncClient):
+        """Un jugador que no es el creador no puede eliminar el handicap."""
+        creator = await create_authenticated_user(
+            client, "creator14c@test.com", "P@ssw0rd123!", "Creator", "FourteenC"
+        )
+        player = await create_authenticated_user(
+            client, "player14c@test.com", "P@ssw0rd123!", "Player", "FourteenC"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        response = await client.delete(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            cookies=player["cookies"],
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_set_and_remove_custom_handicap_return_400_once_in_progress(
+        self, client: AsyncClient
+    ):
+        """Ni establecer ni eliminar el handicap personalizado funcionan una vez IN_PROGRESS."""
+        creator = await create_authenticated_user(
+            client, "creator14d@test.com", "P@ssw0rd123!", "Creator", "FourteenD"
+        )
+        player = await create_authenticated_user(
+            client, "player14d@test.com", "P@ssw0rd123!", "Player", "FourteenD"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            json={"enrollment_id": enrollment_id, "custom_handicap": 15.5},
+            cookies=creator["cookies"],
+        )
+
+        await client.post(
+            f"/api/v1/competitions/{comp['id']}/close-enrollments",
+            cookies=creator["cookies"],
+        )
+        await add_one_session(client, creator["cookies"], comp)
+        await client.post(
+            f"/api/v1/competitions/{comp['id']}/start",
+            cookies=creator["cookies"],
+        )
+
+        set_response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            json={"enrollment_id": enrollment_id, "custom_handicap": 20.0},
+            cookies=creator["cookies"],
+        )
+        remove_response = await client.delete(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            cookies=creator["cookies"],
+        )
+
+        assert set_response.status_code == 400
+        assert remove_response.status_code == 400
+
+
+class TestSetNamePreference:
+    """Tests para PUT /api/v1/enrollments/{id}/name-preference (BE #254)."""
+
+    @pytest.mark.asyncio
+    async def test_set_name_preference_success(self, client: AsyncClient):
+        """El propio jugador elige mostrar su nombre legal en esta competición."""
+        creator = await create_authenticated_user(
+            client, "creator_np1@test.com", "P@ssw0rd123!", "Creator", "NamePrefOne"
+        )
+        player = await create_authenticated_user(
+            client, "player_np1@test.com", "P@ssw0rd123!", "Player", "NamePrefOne"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/name-preference",
+            json={"use_real_name": True},
+            cookies=player["cookies"],
+        )
+
+        assert response.status_code == 200
+        assert response.json()["use_real_name"] is True
+
+    @pytest.mark.asyncio
+    async def test_set_name_preference_not_owner_returns_403(self, client: AsyncClient):
+        """
+        A diferencia del hándicap personalizado, aquí decide el DUEÑO de la
+        inscripción, no el creador: el creador intentándolo recibe 403.
+        """
+        creator = await create_authenticated_user(
+            client, "creator_np2@test.com", "P@ssw0rd123!", "Creator", "NamePrefTwo"
+        )
+        player = await create_authenticated_user(
+            client, "player_np2@test.com", "P@ssw0rd123!", "Player", "NamePrefTwo"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/name-preference",
+            json={"use_real_name": True},
+            cookies=creator["cookies"],
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_enrolled_players_list_shows_the_chosen_name(self, client: AsyncClient):
+        """
+        La lista de inscritos —la que ve cualquiera que mire la competición—
+        arranca con el nombre legal, que es el defecto de una competición, y
+        pasa al alias en cuanto el jugador lo pide.
+        """
+        creator = await create_authenticated_user(
+            client, "creator_np3@test.com", "P@ssw0rd123!", "Creator", "NamePrefThree"
+        )
+        player = await create_authenticated_user(
+            client, "player_np3@test.com", "P@ssw0rd123!", "Player", "NamePrefThree"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        before = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments",
+            cookies=creator["cookies"],
+        )
+        before_dto = next(e for e in before.json() if e["id"] == enrollment_id)
+        # Nadie ha elegido nada todavía y ya se muestra el nombre legal
+        assert before_dto["use_real_name"] is True
+        assert before_dto["user"]["display_name"] == "Player NamePrefThree"
+
+        await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/name-preference",
+            json={"use_real_name": False},
+            cookies=player["cookies"],
+        )
+
+        after = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments",
+            cookies=creator["cookies"],
+        )
+        after_dto = next(e for e in after.json() if e["id"] == enrollment_id)
+        assert after_dto["use_real_name"] is False
+        # Este jugador no tiene alias, así que el nombre que se pinta no cambia
+        assert after_dto["user"]["display_name"] == "Player NamePrefThree"
+
+    @pytest.mark.asyncio
+    async def test_set_name_preference_succeeds_once_in_progress(self, client: AsyncClient):
+        """
+        A diferencia del hándicap personalizado, la elección NO se congela:
+        quien se equivocó al elegir puede corregirlo con el torneo ya en
+        marcha, sin esperar a que acabe.
+        """
+        creator = await create_authenticated_user(
+            client, "creator_np4@test.com", "P@ssw0rd123!", "Creator", "NamePrefFour"
+        )
+        player = await create_authenticated_user(
+            client, "player_np4@test.com", "P@ssw0rd123!", "Player", "NamePrefFour"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        await client.post(
+            f"/api/v1/competitions/{comp['id']}/close-enrollments",
+            cookies=creator["cookies"],
+        )
+        await add_one_session(client, creator["cookies"], comp)
+        await client.post(
+            f"/api/v1/competitions/{comp['id']}/start",
+            cookies=creator["cookies"],
+        )
+
+        response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/name-preference",
+            json={"use_real_name": True},
+            cookies=player["cookies"],
+        )
+
+        assert response.status_code == 200
+        assert response.json()["use_real_name"] is True
+
+    @pytest.mark.asyncio
+    async def test_body_carries_only_the_preference(self, client: AsyncClient):
+        """
+        El `enrollment_id` va en la ruta y NO se repite en el cuerpo. Pidiéndolo
+        en los dos sitios, FastAPI validaba antes de entrar al endpoint y el
+        cuerpo natural —solo la preferencia— se comía un 422.
+        """
+        creator = await create_authenticated_user(
+            client, "creator_np5@test.com", "P@ssw0rd123!", "Creator", "NamePrefFive"
+        )
+        player = await create_authenticated_user(
+            client, "player_np5@test.com", "P@ssw0rd123!", "Player", "NamePrefFive"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/name-preference",
+            json={"use_real_name": True},
+            cookies=player["cookies"],
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == enrollment_id
+        assert response.json()["use_real_name"] is True
+
+
+class TestEnrollmentEdgeCases:
+    """Tests de edge cases para Enrollment"""
+
+    @pytest.mark.asyncio
+    async def test_approve_already_approved_returns_400(self, client: AsyncClient):
+        """Aprobar inscripción ya aprobada retorna 400."""
+        creator = await create_authenticated_user(
+            client, "creator_ec1@test.com", "P@ssw0rd123!", "Creator", "EdgeOne"
+        )
+        player = await create_authenticated_user(
+            client, "player_ec1@test.com", "P@ssw0rd123!", "Player", "EdgeOne"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        # Primera aprobación
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/enrollments/{enrollment_id}/approve")
+
+        # Segunda aprobación
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/approve")
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_withdraw_from_requested_returns_400(self, client: AsyncClient):
+        """Retirarse de inscripción REQUESTED retorna 400 (debe estar APPROVED)."""
+        creator = await create_authenticated_user(
+            client, "creator_ec2@test.com", "P@ssw0rd123!", "Creator", "EdgeTwo"
+        )
+        player = await create_authenticated_user(
+            client, "player_ec2@test.com", "P@ssw0rd123!", "Player", "EdgeTwo"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        # Intentar withdraw sin aprobar
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/withdraw")
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_cancel_approved_returns_400(self, client: AsyncClient):
+        """Cancelar inscripción APPROVED retorna 400 (debe usar withdraw)."""
+        creator = await create_authenticated_user(
+            client, "creator_ec3@test.com", "P@ssw0rd123!", "Creator", "EdgeThree"
+        )
+        player = await create_authenticated_user(
+            client, "player_ec3@test.com", "P@ssw0rd123!", "Player", "EdgeThree"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        set_auth_cookies(client, player["cookies"])
+        enrollment_id = (await solicitud_pendiente(client, comp["id"]))["id"]
+
+        # Aprobar
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/enrollments/{enrollment_id}/approve")
+
+        # Intentar cancel en vez de withdraw
+        set_auth_cookies(client, player["cookies"])
+        response = await client.post(f"/api/v1/enrollments/{enrollment_id}/cancel")
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_set_handicap_not_creator_returns_403(self, client: AsyncClient):
+        """Establecer handicap sin ser creador retorna 403."""
+        creator = await create_authenticated_user(
+            client, "creator_ec4@test.com", "P@ssw0rd123!", "Creator", "EdgeFour"
+        )
+        player = await create_authenticated_user(
+            client, "player_ec4@test.com", "P@ssw0rd123!", "Player", "EdgeFour"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        enroll_response = await inscrito_por_invitacion(
+            client, creator["cookies"], comp["id"], player
+        )
+        enrollment_id = enroll_response["enrollment_id"]
+
+        # Jugador intenta cambiar su propio handicap (no permitido)
+        set_auth_cookies(client, player["cookies"])
+        response = await client.put(
+            f"/api/v1/enrollments/{enrollment_id}/handicap",
+            json={"enrollment_id": enrollment_id, "custom_handicap": 10.0},
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_enrollment_not_found_returns_404(self, client: AsyncClient):
+        """Operación en enrollment inexistente retorna 404."""
+        user = await create_authenticated_user(
+            client, "notfound@test.com", "P@ssw0rd123!", "Not", "Found"
+        )
+
+        fake_id = "00000000-0000-0000-0000-000000000000"
+        response = await client.post(
+            f"/api/v1/enrollments/{fake_id}/approve", cookies=user["cookies"]
+        )
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_list_enrollments_filter_by_status(self, client: AsyncClient):
+        """Filtrar inscripciones por estado."""
+        creator = await create_authenticated_user(
+            client, "creator_ec5@test.com", "P@ssw0rd123!", "Creator", "EdgeFive"
+        )
+        player1 = await create_authenticated_user(
+            client, "player_ec5a@test.com", "P@ssw0rd123!", "Player", "EdgeFiveA"
+        )
+        player2 = await create_authenticated_user(
+            client, "player_ec5b@test.com", "P@ssw0rd123!", "Player", "EdgeFiveB"
+        )
+
+        comp = await create_competition(client, creator["cookies"])
+        await activate_competition(client, creator["cookies"], comp["id"])
+
+        # Crear 2 inscripciones, aprobar solo 1
+        set_auth_cookies(client, player1["cookies"])
+        enroll1 = await solicitud_pendiente(client, comp["id"])
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/enrollments/{enroll1['id']}/approve")
+
+        set_auth_cookies(client, player2["cookies"])
+        await solicitud_pendiente(client, comp["id"])
+
+        # Filtrar solo APPROVED
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.get(
+            f"/api/v1/competitions/{comp['id']}/enrollments?status=APPROVED",
+            cookies=creator["cookies"],
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 2  # Creator auto-enrolled APPROVED + player1 APPROVED
+        assert all(d["status"] == "APPROVED" for d in data)

@@ -1,0 +1,795 @@
+"""
+Enrollment Routes - API REST Layer (Infrastructure).
+
+Endpoints FastAPI para gestión de inscripciones siguiendo Clean Architecture.
+"""
+
+import logging
+from collections.abc import Mapping, Sequence
+from decimal import Decimal
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from src.config.dependencies import (
+    get_cancel_enrollment_use_case,
+    get_change_enrollment_course_tee_use_case,
+    get_change_enrollment_tee_use_case,
+    get_current_user,
+    get_enrollment_tees_use_case,
+    get_handle_enrollment_use_case,
+    get_list_enrollments_use_case,
+    get_remove_custom_handicap_use_case,
+    get_remove_enrolled_player_use_case,
+    get_request_enrollment_use_case,
+    get_set_custom_handicap_use_case,
+    get_set_name_preference_use_case,
+    get_uow,  # User Unit of Work para obtener datos del usuario
+    get_withdraw_enrollment_use_case,
+)
+from src.modules.competition.application.dto.enrollment_dto import (
+    TEE_COLOR_DESCRIPTION,
+    TEE_COLOR_PATTERN,
+    CancelEnrollmentRequestDTO,
+    CancelEnrollmentResponseDTO,
+    ChangeEnrollmentCourseTeeRequestDTO,
+    ChangeEnrollmentTeeRequestDTO,
+    ChangeEnrollmentTeeResponseDTO,
+    EnrolledUserDTO,
+    EnrollmentCourseTeeResponseDTO,
+    EnrollmentResponseDTO,
+    EnrollmentTeesResponseDTO,
+    HandleEnrollmentRequestDTO,
+    HandleEnrollmentResponseDTO,
+    RemoveCustomHandicapResponseDTO,
+    RemoveEnrolledPlayerRequestDTO,
+    RequestEnrollmentRequestDTO,
+    RequestEnrollmentResponseDTO,
+    SetCustomHandicapRequestDTO,
+    SetCustomHandicapResponseDTO,
+    SetNamePreferenceRequestDTO,
+    SetNamePreferenceResponseDTO,
+    WithdrawEnrollmentRequestDTO,
+    WithdrawEnrollmentResponseDTO,
+)
+from src.modules.competition.application.exceptions import TeeNotSelectableError
+from src.modules.competition.application.services.equipos_formados import TeamsFormedError
+from src.modules.competition.application.use_cases.cancel_enrollment_use_case import (
+    CancelEnrollmentUseCase,
+)
+from src.modules.competition.application.use_cases.change_enrollment_course_tee_use_case import (
+    ChangeEnrollmentCourseTeeUseCase,
+)
+from src.modules.competition.application.use_cases.change_enrollment_tee_use_case import (
+    ChangeEnrollmentTeeUseCase,
+)
+from src.modules.competition.application.use_cases.get_enrollment_tees_use_case import (
+    GetEnrollmentTeesUseCase,
+)
+from src.modules.competition.application.use_cases.handle_enrollment_use_case import (
+    HandleEnrollmentUseCase,
+)
+from src.modules.competition.application.use_cases.list_enrollments_use_case import (
+    ListEnrollmentsUseCase,
+)
+from src.modules.competition.application.use_cases.remove_custom_handicap_use_case import (
+    RemoveCustomHandicapUseCase,
+)
+from src.modules.competition.application.use_cases.remove_enrolled_player_use_case import (
+    CannotRemoveOrganizerError,
+    DraftInProgressError,
+    PlayerHasMatchesError,
+    RemovalNotAllowedError,
+    RemoveEnrolledPlayerUseCase,
+)
+from src.modules.competition.application.use_cases.request_enrollment_use_case import (
+    RequestEnrollmentUseCase,
+    TeeRequiredError,
+    TeeWindowFullError,
+    TeeWindowHasRoomError,
+    TeeWindowNotFoundError,
+    TeeWindowRequiredError,
+)
+from src.modules.competition.application.use_cases.set_custom_handicap_use_case import (
+    SetCustomHandicapUseCase,
+)
+from src.modules.competition.application.use_cases.set_name_preference_use_case import (
+    SetNamePreferenceUseCase,
+)
+from src.modules.competition.application.use_cases.withdraw_enrollment_use_case import (
+    WithdrawEnrollmentUseCase,
+)
+from src.modules.competition.domain.entities.enrollment import Enrollment
+from src.modules.competition.domain.value_objects.enrollment_status import EnrollmentStatus
+from src.modules.competition.domain.value_objects.visibility import Visibility
+from src.modules.competition.infrastructure.api.v1.correo_de_quien_mira import correo_de_quien_mira
+from src.modules.competition.infrastructure.api.v1.errores_de_barras import (
+    ERRORES_DE_BARRAS,
+    respuesta_de_barras,
+)
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+from src.modules.user.application.dto.user_dto import UserResponseDTO
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+# ======================================================================================
+# REQUEST BODY MODELS (Presentation Layer)
+# ======================================================================================
+
+
+class RequestEnrollmentBody(BaseModel):
+    """Body al apuntarse: la barra (obligatoria) y, con franjas, la franja o su espera."""
+
+    tee_color: str | None = Field(
+        None,
+        pattern=TEE_COLOR_PATTERN,
+        description=(
+            f"Obligatoria: sin ella, 422 TEE_REQUIRED (H1, 22 nov 2026). {TEE_COLOR_DESCRIPTION}"
+        ),
+    )
+    round_id: UUID | None = Field(
+        None, description="La franja, obligatoria en un stroke play con franjas."
+    )
+    waiting_list: bool = Field(
+        False, description="Entrar en la lista de espera de la franja, que tiene que estar llena."
+    )
+
+
+class SetNamePreferenceBody(BaseModel):
+    """
+    Body para elegir alias o nombre real (BE #254).
+
+    Solo la preferencia: el `enrollment_id` va en la ruta y no se repite
+    aquí. Pidiéndolo también en el cuerpo, FastAPI valida ANTES de entrar al
+    endpoint y `{"use_real_name": true}` —el cuerpo natural— se comía un 422
+    sin llegar a ejecutarse nada.
+    """
+
+    use_real_name: bool = Field(
+        ...,
+        description="True: se muestra el nombre legal en esta competición. False: el alias.",
+    )
+
+
+# ======================================================================================
+# HELPER: EnrollmentDTOMapper (Presentation Layer Logic)
+# ======================================================================================
+
+
+class EnrollmentDTOMapper:
+    """
+    Mapper para convertir entidades Enrollment a DTOs de presentación.
+
+    RESPONSABILIDAD: Capa de presentación (API Layer)
+    - Convertir entidades de dominio a DTOs
+    - Calcular campos derivados para UI (user nested)
+    - Formatear datos para el frontend
+    """
+
+    @staticmethod
+    async def to_response_dtos(
+        enrollments: Sequence[Enrollment],
+        user_uow: UserUnitOfWorkInterface,
+        categorias: Mapping[UserId, int | None] | None = None,
+        *,
+        ve_todos_los_correos: bool = False,
+        viewer_id: UserId | None = None,
+        visibility: Visibility,
+    ) -> list[EnrollmentResponseDTO]:
+        """
+        Convierte inscripciones a EnrollmentResponseDTO, con los datos de cada usuario.
+
+        Los usuarios se leen en UNA consulta: el listado trae todas las filas de la
+        competición, y buscarlos uno a uno serían cientos de consultas seguidas.
+
+        Args:
+            enrollments: Entidades de dominio, en el orden en que se devuelven
+            user_uow: Unit of Work de usuarios
+            categorias: La categoría de cada jugador, si ya está fijada (#251).
+                Sin ella, ni hándicap fijado ni categoría: aún no cuentan
+            ve_todos_los_correos: Si van todos los correos (organizador o admin)
+            viewer_id: Quien pide: el suyo va siempre. Sin los dos, ningún
+                correo (BE #531)
+            visibility: La de la competición, que decide si el nombre real va
+                siempre a la vista (SB-08). Obligatoria: un valor por defecto
+                aplicaría la regla equivocada sin que nada fallara
+
+        Returns:
+            Un DTO por inscripción; `user` a None si el usuario ya no existe
+        """
+        if not enrollments:
+            return []
+
+        async with user_uow:
+            # Un id por usuario: quien se dio de alta otra vez tiene varias filas
+            usuarios = await user_uow.users.find_by_ids(list({e.user_id for e in enrollments}))
+        por_id = {u.id: u for u in usuarios}
+
+        return [
+            EnrollmentDTOMapper._to_dto(
+                e,
+                por_id.get(e.user_id),
+                categorias,
+                ve_todos_los_correos or e.user_id == viewer_id,
+                visibility,
+            )
+            for e in enrollments
+        ]
+
+    @staticmethod
+    def _to_dto(
+        enrollment: Enrollment,
+        user: User | None,
+        categorias: Mapping[UserId, int | None] | None,
+        con_correo: bool,
+        visibility: Visibility,
+    ) -> EnrollmentResponseDTO:
+        return EnrollmentResponseDTO(
+            id=enrollment.id.value,
+            competition_id=enrollment.competition_id.value,
+            user_id=enrollment.user_id.value,
+            user=EnrollmentDTOMapper._user_dto(enrollment, user, con_correo, visibility),
+            status=enrollment.status.value,
+            team_id=enrollment.team_id,
+            custom_handicap=enrollment.custom_handicap,
+            tee_color=enrollment.tee_color,
+            fixed_handicap=enrollment.fixed_handicap if categorias else None,
+            category=categorias.get(enrollment.user_id) if categorias else None,
+            use_real_name=enrollment.use_real_name,
+            created_at=enrollment.created_at,
+            updated_at=enrollment.updated_at,
+        )
+
+    @staticmethod
+    def _user_dto(
+        enrollment: Enrollment,
+        user: User | None,
+        con_correo: bool,
+        visibility: Visibility,
+    ) -> EnrolledUserDTO | None:
+        """
+        Los datos del usuario inscrito.
+
+        El nombre sigue la preferencia de SU inscripción en ESTA competición
+        (BE #254), no la del perfil, así que no se lee de `user`. Y la regla del
+        nombre real (SB-08): en una pública, el real va delante siempre; en una
+        privada, lo que eligió. Nombre, apellidos y alias van siempre: el alias es
+        un apodo, no un dato oculto (Agustín, 17 nov 2026).
+        """
+        if not user:
+            logger.warning(f"User with id {enrollment.user_id.value} not found")
+            return None
+
+        nombre_real = visibility.shows_real_name(enrollment.use_real_name)
+        return EnrolledUserDTO(
+            id=user.id.value,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            display_name=user.display_name_or_legal(nombre_real),
+            # El alias es un apodo, no un dato oculto (Agustín, 17 nov 2026): va siempre,
+            # para pintar el otro nombre pequeño debajo del que va delante
+            alias=user.alias,
+            email=str(user.email) if con_correo else "",
+            # Por su texto, como haría Pydantic con el float: 15.3 y no 15.29999...
+            handicap=Decimal(str(user.handicap.value)) if user.handicap else None,
+            country_code=user.country_code.value if user.country_code else None,
+            avatar_url=None,  # TODO: Implementar cuando tengamos sistema de avatares
+        )
+
+
+# ======================================================================================
+# ENDPOINTS
+# ======================================================================================
+
+
+@router.post(
+    "/competitions/{competition_id}/enrollments",
+    response_model=RequestEnrollmentResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Apuntarse a una competición pública",
+    description=(
+        "El usuario actual entra directamente en una competición pública (APPROVED), "
+        "con su barra general (`tee_color`), obligatoria: sin ella, 422 TEE_REQUIRED. "
+        "En un stroke play con franjas elige franja con hueco o la espera de una llena."
+    ),
+)
+async def request_enrollment(
+    competition_id: UUID,
+    body: RequestEnrollmentBody | None = None,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: RequestEnrollmentUseCase = Depends(get_request_enrollment_use_case),
+):
+    """
+    Apuntarse a una competición pública: se entra directamente (28 oct 2026).
+
+    **Returns:**
+    - 201: Inscrito (APPROVED), con su franja o en su espera
+    - 400: Inscripciones no abiertas, llena, torneo empezado, límite, perfil
+    - 403: Privada
+    - 409: Ya inscrito; o la franja: `TEE_WINDOW_FULL`, `TEE_WINDOW_HAS_ROOM`; o
+      `TEAMS_FORMED`: con los equipos formados nadie entra por su cuenta
+    - 404: `TEE_WINDOW_NOT_FOUND`: la franja no es de esta competición
+    - 422: `TEE_REQUIRED`: sin barra general (`tee_color`) no se entra (H1, 22 nov
+      2026); `TEE_WINDOW_REQUIRED`: con franjas hay que elegir una; `TEE_NOT_AVAILABLE`:
+      las barras OTHER no se eligen
+    """
+    try:
+        request_dto = RequestEnrollmentRequestDTO(
+            competition_id=competition_id,
+            user_id=current_user.id,
+            tee_color=body.tee_color if body else None,
+            round_id=body.round_id if body else None,
+            waiting_list=body.waiting_list if body else False,
+        )
+        return await use_case.execute(request_dto)
+    except (
+        TeeWindowRequiredError,
+        TeeWindowNotFoundError,
+        TeeWindowFullError,
+        TeeWindowHasRoomError,
+    ) as e:
+        # Mensaje fijo por código, no el de la excepción (CodeQL, 28 oct 2026)
+        estado, codigo, texto = _FRANJA_QUE_NO_VALE[type(e)]
+        return JSONResponse(status_code=estado, content={"detail": texto, "error_code": codigo})
+
+    except TeamsFormedError as e:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": TeamsFormedError.MENSAJE, "error_code": e.error_code},
+        )
+
+    except TeeRequiredError as e:
+        # Sin barra general no se entra (H1, 22 nov 2026): texto fijo por código
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": "Choose your tee to enroll.", "error_code": e.error_code},
+        )
+
+    except TeeNotSelectableError as e:
+        # OTHER no se elige (21 nov 2026, C): 422 TEE_NOT_AVAILABLE con el texto fijo de
+        # `TeeNotSelectableError`, el mismo que dan los cambios de barra
+        return respuesta_de_barras(e)
+
+
+@router.get(
+    "/competitions/{competition_id}/enrollments",
+    response_model=list[EnrollmentResponseDTO],
+    summary="Listar inscripciones",
+    description="Lista las inscripciones de una competición con filtros opcionales.",
+)
+async def list_enrollments(
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ListEnrollmentsUseCase = Depends(get_list_enrollments_use_case),
+    user_uow: UserUnitOfWorkInterface = Depends(get_uow),
+    # Tipado con el enum: un estado que no existe es un 422 de FastAPI
+    status_filter: EnrollmentStatus | None = Query(
+        None, alias="status", description="Filtrar por estado"
+    ),
+):
+    """
+    Lista inscripciones de una competición.
+
+    Filtros disponibles:
+    - status: REQUESTED, INVITED, APPROVED, REJECTED, CANCELLED, WITHDRAWN
+
+    Quién ve qué (BE #531 y release social 2): el organizador y los admin,
+    todo; cualquier otro, sus propias filas, solo su propio correo y, de los
+    aprobados, todos, sus amigos o ninguno según la competición.
+
+    **Returns:**
+    - Lista de enrollments con objeto `user` nested incluyendo:
+      - id, first_name, last_name, email (vacío si no lo puede ver)
+      - handicap, country_code, avatar_url
+    """
+    viewer_id = UserId(str(current_user.id))
+    try:
+        # Con la categoría de cada uno, si ya está fijada (#251)
+        lista = await use_case.execute(
+            competition_id=str(competition_id),
+            status=status_filter,
+            viewer_id=viewer_id,
+            viewer_is_admin=current_user.is_admin,
+            viewer_email=correo_de_quien_mira(current_user),
+        )
+
+        # Entidades a DTOs, con los datos de cada usuario leídos en bloque
+        return await EnrollmentDTOMapper.to_response_dtos(
+            lista.enrollments,
+            user_uow,
+            categorias=lista.categorias,
+            ve_todos_los_correos=lista.ve_todos_los_correos,
+            viewer_id=viewer_id,
+            visibility=lista.visibility,
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/approve",
+    response_model=HandleEnrollmentResponseDTO,
+    summary="Aprobar inscripción",
+    description="El creador aprueba una solicitud de inscripción.",
+)
+async def approve_enrollment(
+    enrollment_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: HandleEnrollmentUseCase = Depends(get_handle_enrollment_use_case),
+):
+    """
+    Aprueba una solicitud de inscripción.
+
+    Solo el creador de la competición puede aprobar. Con los equipos formados
+    se reinician; si ya hay partidos, no entra: 409 `TEAMS_FORMED` (30 oct 2026).
+    Con la sala de draft abierta nadie entra: 409 `DRAFT_IN_PROGRESS` (15 nov 2026).
+    """
+    try:
+        request_dto = HandleEnrollmentRequestDTO(enrollment_id=enrollment_id, action="APPROVE")
+        creator_id = UserId(str(current_user.id))
+        return await use_case.execute(request_dto, creator_id, is_admin=current_user.is_admin)
+
+    except (DraftInProgressError, TeamsFormedError) as e:
+        # Un texto fijo por código, el de las rutas de baja; no el de la excepción (CodeQL)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": _NO_SE_QUITA[e.error_code], "error_code": e.error_code},
+        )
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/reject",
+    response_model=HandleEnrollmentResponseDTO,
+    summary="Rechazar inscripción",
+    description="El creador rechaza una solicitud de inscripción.",
+)
+async def reject_enrollment(
+    enrollment_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: HandleEnrollmentUseCase = Depends(get_handle_enrollment_use_case),
+):
+    """
+    Rechaza una solicitud de inscripción.
+
+    Solo el creador de la competición puede rechazar.
+    """
+    request_dto = HandleEnrollmentRequestDTO(enrollment_id=enrollment_id, action="REJECT")
+    creator_id = UserId(str(current_user.id))
+    return await use_case.execute(request_dto, creator_id, is_admin=current_user.is_admin)
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/cancel",
+    response_model=CancelEnrollmentResponseDTO,
+    summary="Cancelar inscripción",
+    description="El usuario cancela su solicitud de inscripción o declina una invitación.",
+)
+async def cancel_enrollment(
+    enrollment_id: UUID,
+    reason: str | None = Query(None, description="Razón de la cancelación"),
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CancelEnrollmentUseCase = Depends(get_cancel_enrollment_use_case),
+):
+    """
+    Cancela una solicitud de inscripción.
+
+    Solo el dueño de la inscripción puede cancelarla.
+    Solo válido desde estados REQUESTED o INVITED.
+    """
+    request_dto = CancelEnrollmentRequestDTO(enrollment_id=enrollment_id, reason=reason)
+    user_id = UserId(str(current_user.id))
+    return await use_case.execute(request_dto, user_id)
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/withdraw",
+    response_model=WithdrawEnrollmentResponseDTO,
+    summary="Retirarse de competición",
+    description="El usuario se retira después de haber sido aprobado.",
+)
+async def withdraw_enrollment(
+    enrollment_id: UUID,
+    reason: str | None = Query(None, description="Razón del retiro"),
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: WithdrawEnrollmentUseCase = Depends(get_withdraw_enrollment_use_case),
+):
+    """
+    Retirarse de una competición.
+
+    Solo el dueño de la inscripción puede retirarse.
+    Solo válido desde estado APPROVED. 409 con `error_code` con la sala de draft
+    abierta (`DRAFT_IN_PROGRESS`) o con los equipos formados (`TEAMS_FORMED`).
+    """
+    try:
+        request_dto = WithdrawEnrollmentRequestDTO(enrollment_id=enrollment_id, reason=reason)
+        user_id = UserId(str(current_user.id))
+        return await use_case.execute(request_dto, user_id)
+
+    except (DraftInProgressError, TeamsFormedError) as e:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": _NO_SE_QUITA[e.error_code], "error_code": e.error_code},
+        )
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/remove",
+    response_model=WithdrawEnrollmentResponseDTO,
+    summary="Quitar a un inscrito",
+    description="El organizador (o un admin) quita a un inscrito antes de que empiece.",
+)
+async def remove_enrolled_player(
+    enrollment_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: RemoveEnrolledPlayerUseCase = Depends(get_remove_enrolled_player_use_case),
+):
+    """
+    Quita a un inscrito aprobado (release social 2, 27 oct 2026).
+
+    Lo mismo que si se retirara él, y se le avisa en la app. Con su código en
+    la raíz cuando no se puede, para que la pantalla lo diga en su idioma.
+    """
+    try:
+        return await use_case.execute(
+            RemoveEnrolledPlayerRequestDTO(enrollment_id=enrollment_id),
+            UserId(str(current_user.id)),
+            is_admin=current_user.is_admin,
+        )
+    except (
+        CannotRemoveOrganizerError,
+        RemovalNotAllowedError,
+        PlayerHasMatchesError,
+        DraftInProgressError,
+    ) as e:
+        # Un texto fijo por código, no el de la excepción (CodeQL)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": _NO_SE_QUITA[e.error_code], "error_code": e.error_code},
+        )
+
+
+_FRANJA_QUE_NO_VALE: dict[type[Exception], tuple[int, str, str]] = {
+    TeeWindowRequiredError: (
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "TEE_WINDOW_REQUIRED",
+        "Choose a tee window, or the waiting list of a full one.",
+    ),
+    TeeWindowNotFoundError: (
+        status.HTTP_404_NOT_FOUND,
+        "TEE_WINDOW_NOT_FOUND",
+        "That tee window is not one of this competition.",
+    ),
+    TeeWindowFullError: (
+        status.HTTP_409_CONFLICT,
+        "TEE_WINDOW_FULL",
+        "That tee window is full: join its waiting list or choose another.",
+    ),
+    TeeWindowHasRoomError: (
+        status.HTTP_409_CONFLICT,
+        "TEE_WINDOW_HAS_ROOM",
+        "That tee window has room: take a place directly.",
+    ),
+}
+
+
+_NO_SE_QUITA = {
+    CannotRemoveOrganizerError.error_code: "The organizer cannot remove themselves.",
+    RemovalNotAllowedError.error_code: "The competition has already started.",
+    PlayerHasMatchesError.error_code: "There are already generated matches.",
+    DraftInProgressError.error_code: "Wait until the draft is over.",
+    TeamsFormedError.error_code: TeamsFormedError.MENSAJE,
+}
+
+
+@router.put(
+    "/enrollments/{enrollment_id}/handicap",
+    response_model=SetCustomHandicapResponseDTO,
+    summary="Establecer hándicap personalizado",
+    description="El creador establece un hándicap personalizado para un jugador.",
+)
+async def set_custom_handicap(
+    enrollment_id: UUID,
+    request: SetCustomHandicapRequestDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: SetCustomHandicapUseCase = Depends(get_set_custom_handicap_use_case),
+):
+    """
+    Establece un hándicap personalizado.
+
+    Solo el creador de la competición puede establecer hándicaps personalizados.
+    El valor debe estar entre -10.0 y 54.0.
+    """
+    try:
+        # Asegurar que el enrollment_id del path se use
+        request_dto = SetCustomHandicapRequestDTO(
+            enrollment_id=enrollment_id, custom_handicap=request.custom_handicap
+        )
+        creator_id = UserId(str(current_user.id))
+        return await use_case.execute(request_dto, creator_id, is_admin=current_user.is_admin)
+
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.delete(
+    "/enrollments/{enrollment_id}/handicap",
+    response_model=RemoveCustomHandicapResponseDTO,
+    summary="Eliminar hándicap personalizado",
+    description=(
+        "El creador elimina el hándicap personalizado de un jugador, que vuelve a usar "
+        "su hándicap oficial."
+    ),
+)
+async def remove_custom_handicap(
+    enrollment_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: RemoveCustomHandicapUseCase = Depends(get_remove_custom_handicap_use_case),
+):
+    """
+    Elimina el hándicap personalizado de un jugador.
+
+    Solo el creador de la competición (o un admin) puede eliminarlo. Solo se permite
+    mientras la competición está en DRAFT, ACTIVE o CLOSED.
+    """
+    creator_id = UserId(str(current_user.id))
+    return await use_case.execute(str(enrollment_id), creator_id, is_admin=current_user.is_admin)
+
+
+@router.put(
+    "/enrollments/{enrollment_id}/name-preference",
+    response_model=SetNamePreferenceResponseDTO,
+    summary="Elegir alias o nombre real en esta competición",
+    description=(
+        "El propio jugador decide si esta competición le muestra por su alias "
+        "o por su nombre legal."
+    ),
+)
+async def set_name_preference(
+    enrollment_id: UUID,
+    body: SetNamePreferenceBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: SetNamePreferenceUseCase = Depends(get_set_name_preference_use_case),
+):
+    """
+    Elige cómo se muestra el nombre del jugador en esta competición.
+
+    A diferencia del hándicap personalizado, aquí decide el propio jugador
+    sobre su inscripción, no el creador. Se puede cambiar en cualquier
+    momento, torneo en marcha incluido: quien se equivocó al elegir no
+    tiene que esperar a que acabe para corregirlo.
+    """
+    request_dto = SetNamePreferenceRequestDTO(
+        enrollment_id=enrollment_id, use_real_name=body.use_real_name
+    )
+    user_id = UserId(str(current_user.id))
+    return await use_case.execute(request_dto, user_id)
+
+
+class ChangeTeeBody(BaseModel):
+    """Las barras nuevas; null vuelve a las habituales de su género (BE #912)."""
+
+    tee_color: TeeColor | None = Field(
+        ..., description="Las barras nuevas, o null para volver a las de por defecto."
+    )
+
+
+@router.put(
+    "/enrollments/{enrollment_id}/tee",
+    response_model=ChangeEnrollmentTeeResponseDTO,
+    summary="Cambiar las barras de una inscripción",
+    description=(
+        "Antes de empezar: el propio jugador, el capitán de su equipo, el organizador "
+        "o un admin; ya empezada, solo el capitán de su equipo, el organizador o un "
+        "admin (al propio jugador, 403 PLAYER_TEE_CHANGE_IN_PROGRESS). Sus partidos y "
+        "partidas generados que aún no han empezado se rehacen con las barras nuevas; "
+        "lo empezado no se toca. Null vuelve a las de por defecto. "
+        "Cualquier color salvo OTHER (422 TEE_NOT_AVAILABLE), como al inscribirse, salvo "
+        "que no valga en un campo donde le queda algo por jugar sin barra propia ni del "
+        "campo: 422 TEE_NOT_ON_PENDING_COURSE."
+    ),
+)
+async def change_enrollment_tee(
+    enrollment_id: UUID,
+    body: ChangeTeeBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ChangeEnrollmentTeeUseCase = Depends(get_change_enrollment_tee_use_case),
+):
+    """
+    Cambia las barras de una inscripción (BE #912) y rehace con ellas lo que le
+    queda por jugar.
+
+    Con su código en la raíz cuando no se puede, para que la pantalla lo diga en
+    su idioma.
+    """
+    try:
+        return await use_case.execute(
+            ChangeEnrollmentTeeRequestDTO(enrollment_id=enrollment_id, tee_color=body.tee_color),
+            UserId(str(current_user.id)),
+            is_admin=current_user.is_admin,
+        )
+    except ERRORES_DE_BARRAS as e:
+        return respuesta_de_barras(e)
+
+
+@router.get(
+    "/enrollments/{enrollment_id}/tees",
+    response_model=EnrollmentTeesResponseDTO,
+    summary="Barras de una inscripción, campo a campo",
+    description=(
+        "Por cada campo: la barra que juega, de dónde sale y las que se le pueden fijar "
+        "(las mismas que aceptarían los cambios); y su barra general y la habitual de su "
+        "género. La consultan el propio jugador, el capitán de su equipo, el organizador "
+        "o un admin, en cualquier estado de la competición. Terminada o cancelada, sin "
+        "opciones, y donde jugó la barra de su partido o su partida (PLAYED)."
+    ),
+)
+async def get_enrollment_tees(
+    enrollment_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetEnrollmentTeesUseCase = Depends(get_enrollment_tees_use_case),
+):
+    """
+    Las barras que se pueden elegir para una inscripción (BE #912): el front no
+    conoce el género de los demás, así que el selector las pide aquí.
+    """
+    try:
+        return await use_case.execute(
+            enrollment_id, UserId(str(current_user.id)), is_admin=current_user.is_admin
+        )
+    except ERRORES_DE_BARRAS as e:
+        return respuesta_de_barras(e)
+
+
+class ChangeCourseTeeBody(BaseModel):
+    """Las barras en ese campo; null quita el cambio propio (barras por campo)."""
+
+    tee_color: TeeColor | None = Field(
+        ..., description="Las barras en ese campo, o null para quitar el cambio."
+    )
+
+
+@router.put(
+    "/enrollments/{enrollment_id}/courses/{golf_course_id}/tee",
+    response_model=EnrollmentCourseTeeResponseDTO,
+    summary="Cambiar las barras de una inscripción en un campo",
+    description=(
+        "El cambio propio de un jugador en un campo de la competición: gana a la barra "
+        "del campo para su género y a su barra general. Mismos permisos y plazos que "
+        "el cambio de la barra general (en curso, al propio jugador, 403 "
+        "PLAYER_TEE_CHANGE_IN_PROGRESS). Rehace lo que le queda por jugar en ese campo. "
+        "422 TEE_NOT_AVAILABLE si es OTHER, si ese campo no tiene esa barra para él, "
+        "si al quitarlo (null) la que quedaría no vale allí y le queda algo por jugar "
+        "(texto propio), "
+        "o si la del campo para su género ya no vale allí."
+    ),
+)
+async def change_enrollment_course_tee(
+    enrollment_id: UUID,
+    golf_course_id: UUID,
+    body: ChangeCourseTeeBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ChangeEnrollmentCourseTeeUseCase = Depends(get_change_enrollment_course_tee_use_case),
+):
+    """El cambio propio de barras en un campo (barras por campo, 20 nov 2026)."""
+    try:
+        return await use_case.execute(
+            ChangeEnrollmentCourseTeeRequestDTO(
+                enrollment_id=enrollment_id,
+                golf_course_id=golf_course_id,
+                tee_color=body.tee_color,
+            ),
+            UserId(str(current_user.id)),
+            is_admin=current_user.is_admin,
+        )
+    except ERRORES_DE_BARRAS as e:
+        return respuesta_de_barras(e)

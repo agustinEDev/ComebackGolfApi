@@ -1,0 +1,105 @@
+"""Social Unit of Work - SQLAlchemy Implementation."""
+
+import contextlib
+from typing import NoReturn
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.modules.social.domain.exceptions.social_violations import (
+    DuplicateFriendshipViolation,
+)
+from src.modules.social.domain.repositories.activity_event_repository_interface import (
+    ActivityEventRepositoryInterface,
+)
+from src.modules.social.domain.repositories.friendship_repository_interface import (
+    FriendshipRepositoryInterface,
+)
+from src.modules.social.domain.repositories.profile_photo_repository_interface import (
+    ProfilePhotoRepositoryInterface,
+)
+from src.modules.social.domain.repositories.social_unit_of_work_interface import (
+    SocialUnitOfWorkInterface,
+)
+from src.modules.social.infrastructure.persistence.sqlalchemy.activity_event_repository import (
+    SQLAlchemyActivityEventRepository,
+)
+from src.modules.social.infrastructure.persistence.sqlalchemy.friendship_repository import (
+    SQLAlchemyFriendshipRepository,
+)
+from src.modules.social.infrastructure.persistence.sqlalchemy.profile_photo_repository import (
+    SQLAlchemyProfilePhotoRepository,
+)
+
+UQ_FRIENDSHIP_PAIR_CONSTRAINT = "uq_friendship_pair"
+
+
+class SQLAlchemySocialUnitOfWork(SocialUnitOfWorkInterface):
+    """Implementacion asincrona de la Unit of Work del modulo Social con SQLAlchemy."""
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+        self._friendships = SQLAlchemyFriendshipRepository(session)
+        self._activity_events = SQLAlchemyActivityEventRepository(session)
+        self._profile_photos = SQLAlchemyProfilePhotoRepository(session)
+
+    @property
+    def friendships(self) -> FriendshipRepositoryInterface:
+        return self._friendships
+
+    @property
+    def activity_events(self) -> ActivityEventRepositoryInterface:
+        return self._activity_events
+
+    @property
+    def profile_photos(self) -> ProfilePhotoRepositoryInterface:
+        return self._profile_photos
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            await self.rollback()
+            return
+        # Si el commit falla (una restricción única, la conexión), rollback: sin él la
+        # sesión quedaba inservible para lo siguiente de la misma petición (como la de
+        # usuarios, #752). Si el rollback también falla, sube el error del commit; y una
+        # cancelación (BaseException) se deshace igual
+        try:
+            await self.commit()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.rollback()
+            raise
+
+    async def commit(self) -> None:
+        # El commit vacía lo que quede pendiente: si ese INSERT choca con la pareja,
+        # el mismo error de dominio que en flush() y no un IntegrityError suelto (500)
+        try:
+            await self._session.commit()
+        except IntegrityError as e:
+            await self._traduce_la_pareja_repetida(e)
+
+    async def rollback(self) -> None:
+        await self._session.rollback()
+
+    async def flush(self) -> None:
+        try:
+            await self._session.flush()
+        except IntegrityError as e:
+            await self._traduce_la_pareja_repetida(e)
+
+    async def _traduce_la_pareja_repetida(self, error: IntegrityError) -> NoReturn:
+        """Deshace la transacción y traduce el choque con `uq_friendship_pair`."""
+        await self._session.rollback()
+        if UQ_FRIENDSHIP_PAIR_CONSTRAINT in str(error.orig):
+            # Texto neutro: no dice qué relación hay entre los dos, para no
+            # delatar un bloqueo si llegara al cliente (regla F-09)
+            raise DuplicateFriendshipViolation(
+                "Conflict with a concurrent request. Please try again."
+            ) from error
+        raise error
+
+    def is_active(self) -> bool:
+        return self._session.is_active

@@ -1,0 +1,389 @@
+"""Tests para CreateCompetitionUseCase."""
+
+from datetime import date, timedelta
+from uuid import uuid4
+
+import pytest
+
+from src.modules.competition.application.dto.competition_dto import (
+    CreateCompetitionRequestDTO,
+)
+from src.modules.competition.application.services.genero_obligatorio import GenderRequiredError
+from src.modules.competition.application.use_cases.create_competition_use_case import (
+    CompetitionAlreadyExistsError,
+    CreateCompetitionUseCase,
+)
+from src.modules.competition.domain.services.location_builder import (
+    InvalidCountryError,
+    LocationBuilder,
+)
+from src.modules.competition.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+from tests.unit.modules.competition.application.use_cases.helpers import (
+    USUARIOS_CON_GENERO,
+    UsuariosConGenero,
+)
+
+# Marcar todos los tests de este fichero para que se ejecuten con asyncio
+pytestmark = pytest.mark.asyncio
+
+
+class TestCreateCompetitionUseCase:
+    """Suite de tests para el caso de uso CreateCompetitionUseCase."""
+
+    @pytest.fixture
+    def uow(self) -> InMemoryUnitOfWork:
+        """Fixture que proporciona una Unit of Work en memoria para cada test."""
+        return InMemoryUnitOfWork()
+
+    @pytest.fixture
+    def creator_id(self) -> UserId:
+        """Fixture que proporciona un ID de usuario creador."""
+        return UserId(uuid4())
+
+    async def test_should_create_competition_successfully(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que una competición se crea correctamente con datos válidos.
+
+        Given: Datos válidos de competición con país principal España
+        When: Se ejecuta el caso de uso
+        Then: La competición se crea con las inscripciones abiertas (BE #332)
+        """
+        # Arrange
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request_dto = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+            max_players=24,
+            team_assignment="MANUAL",
+            team_1_name="Europa",
+            team_2_name="USA",
+        )
+
+        # Act
+        response = await use_case.execute(request_dto, creator_id)
+
+        # Assert
+        # 1. Verificar respuesta del DTO
+        assert response.name == "Ryder Cup 2025"
+        assert response.status == "ACTIVE"
+        assert response.creator_id == creator_id.value
+        assert response.start_date == date(2025, 6, 1)
+        assert response.end_date == date(2025, 6, 3)
+        assert response.id is not None
+        assert response.team_1_name == "Europa"
+        assert response.team_2_name == "USA"
+
+        # 2. Verificar que se guardó en la BD
+        competitions = await uow.competitions.find_all()
+        assert len(competitions) == 1
+        assert competitions[0].name.value == "Ryder Cup 2025"
+        assert competitions[0].ryder_cup.team_1_name == "Europa"
+        assert competitions[0].ryder_cup.team_2_name == "USA"
+
+    async def test_should_create_competition_with_adjacent_countries(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se puede crear una competición con países adyacentes.
+
+        Given: Datos con país principal España y adyacentes Portugal y Francia
+        When: Se ejecuta el caso de uso
+        Then: La competición se crea con los 3 países correctamente
+        """
+        # Arrange
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request_dto = CreateCompetitionRequestDTO(
+            name="Iberian Cup 2025",
+            start_date=date(2025, 7, 1),
+            end_date=date(2025, 7, 3),
+            main_country="ES",
+            adjacent_country_1="PT",
+            adjacent_country_2="FR",
+            play_mode="HANDICAP",
+        )
+
+        # Act
+        response = await use_case.execute(request_dto, creator_id)
+
+        # Assert
+        assert response.name == "Iberian Cup 2025"
+        competitions = await uow.competitions.find_all()
+        assert len(competitions) == 1
+
+        # Verificar que Location tiene los 3 países
+        competition = competitions[0]
+        assert competition.location.main_country.value == "ES"
+        assert competition.location.adjacent_country_1.value == "PT"
+        assert competition.location.adjacent_country_2.value == "FR"
+
+    async def test_should_raise_error_when_name_already_exists(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se lanza excepción si el nombre ya existe.
+
+        Given: Una competición existente con nombre "Ryder Cup 2025"
+        When: Se intenta crear otra con el mismo nombre
+        Then: Se lanza CompetitionAlreadyExistsError
+        """
+        # Arrange: Crear competición existente
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        existing_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        await use_case.execute(existing_request, creator_id)
+
+        # Act & Assert: Intentar crear otra con el mismo nombre
+        duplicate_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",  # Mismo nombre
+            start_date=date(2025, 8, 1),
+            end_date=date(2025, 8, 3),
+            main_country="FR",
+            play_mode="SCRATCH",
+        )
+
+        with pytest.raises(CompetitionAlreadyExistsError) as exc_info:
+            await use_case.execute(duplicate_request, creator_id)
+
+        assert "Ya existe una competición con el nombre 'Ryder Cup 2025'" in str(exc_info.value)
+
+    async def test_should_raise_error_when_country_does_not_exist(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se lanza excepción si el país no existe.
+
+        Given: Datos con un país inexistente "XX"
+        When: Se ejecuta el caso de uso
+        Then: Se lanza InvalidCountryError
+        """
+        # Arrange
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request_dto = CreateCompetitionRequestDTO(
+            name="Invalid Cup",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="XX",  # País inexistente
+            play_mode="SCRATCH",
+        )
+
+        # Act & Assert
+        with pytest.raises(InvalidCountryError) as exc_info:
+            await use_case.execute(request_dto, creator_id)
+
+        assert "El país con código 'XX' no existe" in str(exc_info.value)
+
+    async def test_should_raise_error_when_adjacent_country_not_adjacent(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se lanza excepción si el país adyacente no es realmente adyacente.
+
+        Given: España como principal e Italia como adyacente (no son fronterizos)
+        When: Se ejecuta el caso de uso
+        Then: Se lanza InvalidCountryError
+        """
+        # Arrange
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request_dto = CreateCompetitionRequestDTO(
+            name="Invalid Adjacency Cup",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            adjacent_country_1="IT",  # Italia no es adyacente a España
+            play_mode="SCRATCH",
+        )
+
+        # Act & Assert
+        with pytest.raises(InvalidCountryError) as exc_info:
+            await use_case.execute(request_dto, creator_id)
+
+        assert "no es adyacente" in str(exc_info.value)
+
+    async def test_should_create_with_handicap_play_mode(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se puede crear competición con play_mode HANDICAP.
+
+        Given: Datos con play_mode HANDICAP
+        When: Se ejecuta el caso de uso
+        Then: La competición se crea con play_mode configurado
+        """
+        # Arrange
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request_dto = CreateCompetitionRequestDTO(
+            name="Handicap Cup",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="FR",
+            play_mode="HANDICAP",
+        )
+
+        # Act
+        await use_case.execute(request_dto, creator_id)
+
+        # Assert
+        competitions = await uow.competitions.find_all()
+        competition = competitions[0]
+        assert competition.play_mode.value == "HANDICAP"
+
+    async def test_should_auto_enroll_creator_as_approved_player(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que el creador se auto-enrolla como jugador APPROVED.
+
+        Given: Datos válidos de competición
+        When: Se ejecuta el caso de uso
+        Then: Se crea un enrollment APPROVED para el creador
+        """
+        # Arrange
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request_dto = CreateCompetitionRequestDTO(
+            name="Auto Enroll Cup",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+
+        # Act
+        response = await use_case.execute(request_dto, creator_id)
+
+        # Assert
+        enrollments = await uow.enrollments.find_all()
+        assert len(enrollments) == 1
+        enrollment = enrollments[0]
+        assert enrollment.user_id == creator_id
+        assert enrollment.competition_id.value == response.id
+        assert enrollment.status.value == "APPROVED"
+
+    async def test_should_commit_transaction(self, uow: InMemoryUnitOfWork, creator_id: UserId):
+        """
+        Verifica que la transacción se hace commit correctamente.
+
+        Given: Una solicitud válida de creación
+        When: Se ejecuta el caso de uso
+        Then: Se llama a commit() en el UoW
+        """
+        # Arrange
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request_dto = CreateCompetitionRequestDTO(
+            name="Commit Test Cup",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+
+        # Act
+        await use_case.execute(request_dto, creator_id)
+
+        # Assert
+        assert uow.committed is True
+
+
+class TestComoNaceLaCompeticion:
+    """Sin apertura programada nace abierta; con ella, esperando (BE #332)."""
+
+    @pytest.fixture
+    def uow(self) -> InMemoryUnitOfWork:
+        return InMemoryUnitOfWork()
+
+    @pytest.fixture
+    def creator_id(self) -> UserId:
+        return UserId(uuid4())
+
+    def _peticion(self, dias: int | None = None) -> CreateCompetitionRequestDTO:
+        manana = ahora_utc_sin_zona().date() + timedelta(days=30)
+        return CreateCompetitionRequestDTO(
+            name="Ryder Cup 2026",
+            start_date=manana,
+            end_date=manana + timedelta(days=2),
+            main_country="ES",
+            play_mode="SCRATCH",
+            enrollment_opens_days_before=dias,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sin_programar_nace_con_las_inscripciones_abiertas(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """Nadie deberia pulsar un boton cuyo unico trabajo es mover un estado."""
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+
+        respuesta = await use_case.execute(self._peticion(), creator_id)
+
+        assert respuesta.status == "ACTIVE"
+
+    @pytest.mark.asyncio
+    async def test_programada_nace_esperando_su_hora(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """Con dias puestos, DRAFT significa una sola cosa: esperando."""
+        use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+
+        respuesta = await use_case.execute(self._peticion(dias=5), creator_id)
+
+        assert respuesta.status == "DRAFT"
+
+
+# ==================== El organizador juega: su género, al crear (#710, 24 sep) ====================
+# Crearla le inscribe como jugador. Sin género, bloqueaba la generación de los
+# partidos igual que cualquier otro inscrito
+
+
+async def test_sin_genero_no_se_crea_y_lo_dice():
+    uow = InMemoryUnitOfWork()
+    organizador = UserId(uuid4())
+
+    with pytest.raises(GenderRequiredError, match="Para crear una competición"):
+        await CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), UsuariosConGenero(sin_genero=[organizador])
+        ).execute(
+            CreateCompetitionRequestDTO(
+                name="Sin género",
+                start_date=date(2026, 6, 1),
+                end_date=date(2026, 6, 3),
+                main_country="ES",
+                play_mode="SCRATCH",
+            ),
+            organizador,
+        )
+
+    async with uow:
+        assert await uow.enrollments.find_by_user(organizador) == []

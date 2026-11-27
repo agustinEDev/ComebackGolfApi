@@ -1,0 +1,105 @@
+"""
+SQLAlchemy Mapper for Friendship aggregate (Social module).
+
+Tabla:
+- friendships (agregado raiz)
+"""
+
+from typing import Any
+
+import sqlalchemy.types
+from sqlalchemy import Column, DateTime, ForeignKey, String, Table, inspect
+
+from src.modules.social.domain.entities.friendship import Friendship
+from src.modules.social.domain.value_objects.friendship_id import FriendshipId
+from src.modules.social.domain.value_objects.friendship_status import FriendshipStatus
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.infrastructure.persistence.sqlalchemy.base import mapper_registry, metadata
+from src.shared.infrastructure.persistence.sqlalchemy.tipos_de_id import tipo_de_id
+
+# ============================================================================
+# TypeDecorators for Value Objects (MUST be before tables)
+# ============================================================================
+
+
+FriendshipIdType = tipo_de_id(FriendshipId)
+SocialUserIdType = tipo_de_id(UserId)
+
+
+class FriendshipStatusType(sqlalchemy.types.TypeDecorator[FriendshipStatus]):
+    """TypeDecorator para FriendshipStatus Value Object."""
+
+    impl = String(20)
+    cache_ok = True
+
+    def process_bind_param(self, value: FriendshipStatus | None, dialect: Any) -> str | None:
+        if value is None:
+            return None
+        return value.value
+
+    def process_result_value(self, value: str | None, dialect: Any) -> FriendshipStatus | None:
+        if value is None:
+            return None
+        return FriendshipStatus(value)
+
+
+# ============================================================================
+# TABLA FRIENDSHIPS
+# ============================================================================
+
+friendships_table = Table(
+    "friendships",
+    metadata,
+    Column("id", FriendshipIdType, primary_key=True),
+    Column(
+        "requester_id",
+        SocialUserIdType,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "addressee_id",
+        SocialUserIdType,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("status", FriendshipStatusType, nullable=False),
+    Column(
+        "blocked_by",
+        SocialUserIdType,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+    ),
+    Column("responded_at", DateTime, nullable=True),
+    Column("created_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
+    # Cuándo bloqueó el otro participante, si también bloqueó (SB-02)
+    Column("second_blocked_at", DateTime, nullable=True),
+)
+
+
+def start_social_mappers() -> None:
+    """
+    Inicia el mapeo entre entidades del modulo Social y tablas de BD.
+
+    Es idempotente: puede llamarse multiples veces sin efectos adversos.
+
+    Mapea:
+    - Friendship entity -> friendships table
+    """
+    if inspect(Friendship, raiseerr=False) is None:
+        mapper_registry.map_imperatively(
+            Friendship,
+            friendships_table,
+            properties={
+                "_id": friendships_table.c.id,
+                "_requester_id": friendships_table.c.requester_id,
+                "_addressee_id": friendships_table.c.addressee_id,
+                "_status": friendships_table.c.status,
+                "_blocked_by": friendships_table.c.blocked_by,
+                "_responded_at": friendships_table.c.responded_at,
+                "_created_at": friendships_table.c.created_at,
+                "_updated_at": friendships_table.c.updated_at,
+                "_second_blocked_at": friendships_table.c.second_blocked_at,
+            },
+        )

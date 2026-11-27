@@ -1,0 +1,86 @@
+# GitLeaks configuration file
+# https://github.com/gitleaks/gitleaks
+
+title = "ComebackGolfApi - GitLeaks Configuration"
+
+# Las reglas por defecto de gitleaks (claves de AWS, GitHub, Slack, claves privadas,
+# «generic-api-key» con entropía...). Sin esto el fichero no tenía NINGUNA regla y el
+# escaneo pasaba siempre (INF-01, auditoría del 16 nov 2026). Lo vigilan el paso
+# «Gitleaks self-test» del CI y tests/unit/config/test_gitleaks_con_reglas.py.
+[extend]
+useDefault = true
+
+# Lo que se salta, cuanto más estrecho mejor: cada entrada esconde un secreto real que
+# caiga ahí. Sin stopwords genéricas («test», «example»...): tapaban cualquier secreto
+# que contuviera esa palabra.
+[allowlist]
+  description = "Known false positives"
+
+  # Rutas ancladas al principio (antes `.*test.*\.py` saltaba también `latest_x.py`):
+  # - tests/: tokens, JWT y contraseñas de ejemplo de las pruebas
+  # k8s/api-secret.yaml NO se salta: solo debe llevar marcadores; los valores de verdad
+  # van en k8s/api-secret.local.yaml (en .gitignore, nunca se sube).
+  paths = [
+    '''^tests/''',
+  ]
+
+  # Valores de ejemplo conocidos, que no son secretos
+  regexes = [
+    '''your-secret-key-change-me''',  # Marcador
+    '''rydercupam_password''',        # Contraseña de ejemplo del entorno local
+    '''your-mailgun-key''',           # Marcador
+    # Los marcadores de k8s/api-secret.yaml, en base64 (el Secret de Kubernetes los
+    # lleva así; cada uno lleva al lado, en claro, el valor de ejemplo que codifica).
+    # Exactos y anclados: un valor nuevo en ese fichero vuelve a saltar.
+    '''^Y2hhbmdlbWUtbG9jYWwtb25seQ==$''',          # changeme-local-only
+    '''^eW91ci1zZWNyZXQta2V5LWNoYW5nZS1tZQ==$''',  # your-secret-key-change-me
+    '''^Y2hhbmdlbWUtZG9jcy1hZG1pbjEyMw==$''',      # changeme-docs-admin123
+    '''^eW91ci1tYWlsZ3VuLWFwaS1rZXk=$''',          # your-mailgun-api-key
+    # Ejemplos de JWT recortados con «...» en la documentación y los docstrings: el
+    # secreto que se lleva generic-api-key es la cabecera y los tres puntos
+    # (`eyJhbGciOi...`). Un token de verdad no acaba en «...» y lo caza también la regla
+    # «jwt» (auditoría del 18 nov 2026, B7)
+    '''^eyJ[A-Za-z0-9_-]+\.\.\.$''',
+  ]
+
+# URLs de base de datos con la contraseña dentro (INF-R3-03, auditoría del 18 nov 2026):
+# las reglas por defecto no las ven (se probó con dos URLs inventadas: 0 hallazgos). Las
+# de ejemplo con marcadores (`USER:PASSWORD`, `${...}`, `<clave>`) no saltan.
+[[rules]]
+  id = "database-url-with-password"
+  description = "URL de base de datos con contraseña"
+  regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?)(?:\+[a-z0-9]+)?://[^:@/\s'"`]*:([^@/\s'"`]+)@[^/\s'"`]+'''
+  secretGroup = 1
+  keywords = ["postgres", "mysql", "mariadb", "mongodb", "redis", "amqp"]
+
+  [[rules.allowlists]]
+    description = "Marcadores de ejemplo, no contraseñas"
+    regexTarget = "secret"
+    regexes = [
+      '''(?i)^(password|passwd|pass|pwd|secret|clave|contrase(ñ|n)a|changeme[\w-]*|your[-_][\w-]*|tu[-_][\w-]*|x{3,}|\*{3,}|\.{3})$''',
+      '''^\$\{[^}]+\}$''',
+      '''^\$[A-Za-z_][A-Za-z0-9_]*$''',
+      '''^\$\([A-Za-z_][A-Za-z0-9_]*\)$''',
+      '''^<[^>]+>$''',
+      '''^\{[^}]+\}$''',
+    ]
+
+  # La base local (localhost, 127.0.0.1): nunca es la de verdad, valga donde valga
+  [[rules.allowlists]]
+    description = "Base local"
+    regexTarget = "match"
+    regexes = ['''@(?:localhost|127\.0\.0\.1)(?:[:/]|$)''']
+
+  # El servicio «db» de Docker Compose y la «dummy» del CI, SOLO en sus ficheros de
+  # ejemplo: un servicio desplegado puede tener un host privado llamado así (CodeRabbit)
+  [[rules.allowlists]]
+    description = "Bases de ejemplo de Compose y del CI, en sus ficheros"
+    condition = "AND"
+    paths = [
+      '''^(?:docker/)?docker-compose\.ya?ml$''',
+      '''^\.github/workflows/[^/]+\.ya?ml$''',
+      '''^\.env\.example$''',
+      '''^DEPLOYMENT\.md$''',
+    ]
+    regexTarget = "match"
+    regexes = ['''@(?:db|dummy)(?:[:/]|$)''']

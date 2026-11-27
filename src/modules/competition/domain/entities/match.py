@@ -1,0 +1,747 @@
+"""
+Match Entity - Partido de una sesión.
+
+Representa un partido individual dentro de una sesión de competición.
+"""
+
+from collections.abc import Callable, Collection, Sequence
+from dataclasses import replace
+from datetime import datetime
+from typing import Any
+
+from src.modules.competition.domain.exceptions.competition_violations import WithdrawalViolation
+from src.modules.competition.domain.value_objects.bolas_fuera import BolasFuera
+from src.modules.competition.domain.value_objects.marker_assignment import (
+    MarkerAssignment,
+)
+from src.modules.competition.domain.value_objects.match_id import MatchId
+from src.modules.competition.domain.value_objects.match_player import MatchPlayer
+from src.modules.competition.domain.value_objects.match_status import MatchStatus
+from src.modules.competition.domain.value_objects.round_id import RoundId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+from src.shared.domain.value_objects.gender import Gender
+from src.shared.domain.value_objects.match_format import MatchFormat
+
+
+class Match:
+    """
+    Entidad que representa un partido de golf.
+
+    Un partido enfrenta a jugadores del Equipo A contra jugadores del Equipo B.
+    Según el formato:
+    - SINGLES: 1 vs 1
+    - FOURBALL: 2 vs 2 (mejor bola)
+    - FOURSOMES: 2 vs 2 (golpes alternados)
+
+    Cada jugador tiene su playing handicap calculado según su tee elegido
+    en el Enrollment y los ratings del campo de la sesión.
+
+    Características DDD:
+    - Es una Entity (tiene identidad: MatchId)
+    - Vive dentro del contexto de Round
+    - Contiene MatchPlayer como Value Objects embebidos
+    """
+
+    def __init__(
+        self,
+        id: MatchId,
+        round_id: RoundId,
+        match_number: int,
+        team_a_players: tuple[MatchPlayer, ...],
+        team_b_players: tuple[MatchPlayer, ...],
+        status: MatchStatus,
+        handicap_strokes_given: int,
+        strokes_given_to_team: str,
+        result: dict[str, Any] | None,
+        created_at: datetime,
+        updated_at: datetime,
+        marker_assignments: tuple[MarkerAssignment, ...] = (),
+        scorecard_submitted_by: tuple[UserId, ...] = (),
+        is_decided: bool = False,
+        decided_result: dict[str, Any] | None = None,
+        withdrawn_player_ids: tuple[UserId, ...] = (),
+        holes_without_ball: dict[UserId, tuple[int, ...]] | None = None,
+    ):
+        """Constructor privado (usar factory methods)."""
+        self._id = id
+        self._round_id = round_id
+        self._match_number = match_number
+        self._team_a_players = team_a_players
+        self._team_b_players = team_b_players
+        self._status = status
+        self._handicap_strokes_given = handicap_strokes_given
+        self._strokes_given_to_team = strokes_given_to_team
+        self._result = result
+        self._created_at = created_at
+        self._updated_at = updated_at
+        self._marker_assignments = marker_assignments
+        self._scorecard_submitted_by = scorecard_submitted_by
+        self._is_decided = is_decided
+        self._decided_result = decided_result
+        self._withdrawn_player_ids = withdrawn_player_ids
+        # De los que volvieron, los hoyos que se cerraron sin su bola
+        self._holes_without_ball = dict(holes_without_ball or {})
+
+    @classmethod
+    def create(
+        cls,
+        round_id: RoundId,
+        match_number: int,
+        team_a_players: list[MatchPlayer],
+        team_b_players: list[MatchPlayer],
+    ) -> "Match":
+        """
+        Factory method para crear un nuevo partido.
+
+        Calcula automáticamente los golpes de ventaja basándose en
+        los playing handicaps de los equipos.
+
+        Args:
+            round_id: ID de la sesión
+            match_number: Número de partido en la sesión (1, 2, 3...)
+            team_a_players: Jugadores del Equipo A
+            team_b_players: Jugadores del Equipo B
+
+        Returns:
+            Nueva instancia de Match con status SCHEDULED
+
+        Raises:
+            ValueError: Si los equipos no tienen el mismo número de jugadores
+        """
+        if len(team_a_players) != len(team_b_players):
+            raise ValueError(
+                f"Teams must have equal players. "
+                f"Team A: {len(team_a_players)}, Team B: {len(team_b_players)}"
+            )
+
+        if not team_a_players:
+            raise ValueError("Teams cannot be empty")
+
+        if match_number < 1:
+            raise ValueError(f"match_number must be >= 1, got {match_number}")
+
+        handicap_diff, strokes_given_to_team = cls._ventaja(team_a_players, team_b_players)
+
+        now = ahora_utc_sin_zona()
+        return cls(
+            id=MatchId.generate(),
+            round_id=round_id,
+            match_number=match_number,
+            team_a_players=tuple(team_a_players),
+            team_b_players=tuple(team_b_players),
+            status=MatchStatus.SCHEDULED,
+            handicap_strokes_given=handicap_diff,
+            strokes_given_to_team=strokes_given_to_team,
+            result=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+    @staticmethod
+    def _ventaja(
+        team_a_players: Sequence[MatchPlayer], team_b_players: Sequence[MatchPlayer]
+    ) -> tuple[int, str]:
+        """Golpes de ventaja y a qué equipo se dan ("" si a ninguno)."""
+        # Golpes de ventaja: se cuentan los que de verdad se reparten en la
+        # vuelta, no se suman los playing_handicap.
+        #
+        # Sumarlos daba el DOBLE en foursomes: los dos jugadores del equipo
+        # llevan el mismo handicap de equipo (comparten bola, ver
+        # `_build_foursomes_match_players`), asi que la suma lo contaba dos
+        # veces y la tarjeta pintaba 14 donde el equipo recibia 7. En fourball
+        # la suma de diferenciales individuales tampoco significaba nada.
+        #
+        # `strokes_received` ya lleva un hoyo por golpe recibido, asi que el
+        # maximo del equipo es la ventaja real en SINGLES (solo recibe uno) y en
+        # FOURSOMES (los dos reciben lo mismo).
+        #
+        # En FOURBALL sigue siendo una aproximacion, y no por este calculo: ahi
+        # cada jugador recibe lo suyo y no existe un "golpes de ventaja del
+        # equipo". Este numero es el del jugador que mas recibe de cada bando, y
+        # se queda como resumen; el reparto de verdad esta en el
+        # `strokes_received` de cada uno, que es lo que decide los hoyos.
+        team_a_handicap = max((len(p.strokes_received) for p in team_a_players), default=0)
+        team_b_handicap = max((len(p.strokes_received) for p in team_b_players), default=0)
+
+        handicap_diff = abs(team_a_handicap - team_b_handicap)
+        if team_a_handicap > team_b_handicap:
+            return handicap_diff, "A"
+        if team_b_handicap > team_a_handicap:
+            return handicap_diff, "B"
+        return handicap_diff, ""
+
+    @classmethod
+    def reconstruct(
+        cls,
+        id: MatchId,
+        round_id: RoundId,
+        match_number: int,
+        team_a_players: list[MatchPlayer],
+        team_b_players: list[MatchPlayer],
+        status: MatchStatus,
+        handicap_strokes_given: int,
+        strokes_given_to_team: str,
+        result: dict[str, Any] | None,
+        created_at: datetime,
+        updated_at: datetime,
+        marker_assignments: list[MarkerAssignment] | None = None,
+        scorecard_submitted_by: list[UserId] | None = None,
+        is_decided: bool = False,
+        decided_result: dict[str, Any] | None = None,
+        withdrawn_player_ids: list[UserId] | None = None,
+        holes_without_ball: dict[UserId, tuple[int, ...]] | None = None,
+    ) -> "Match":
+        """Reconstruye desde BD (sin validaciones)."""
+        return cls(
+            id=id,
+            round_id=round_id,
+            match_number=match_number,
+            team_a_players=tuple(team_a_players),
+            team_b_players=tuple(team_b_players),
+            status=status,
+            handicap_strokes_given=handicap_strokes_given,
+            strokes_given_to_team=strokes_given_to_team,
+            result=result,
+            created_at=created_at,
+            updated_at=updated_at,
+            marker_assignments=tuple(marker_assignments or []),
+            scorecard_submitted_by=tuple(scorecard_submitted_by or []),
+            is_decided=is_decided,
+            decided_result=decided_result,
+            withdrawn_player_ids=tuple(withdrawn_player_ids or []),
+            holes_without_ball=holes_without_ball,
+        )
+
+    # ==================== Business Methods ====================
+
+    def start(self) -> None:
+        """
+        Inicia el partido.
+        Transición: SCHEDULED → IN_PROGRESS
+        """
+        if not self._status.can_start():
+            raise ValueError(f"Cannot start match from status {self._status}. Expected SCHEDULED")
+        self._status = MatchStatus.IN_PROGRESS
+        self._updated_at = ahora_utc_sin_zona()
+
+    def complete(self, result: dict[str, Any]) -> None:
+        """
+        Completa el partido con un resultado.
+        Transición: IN_PROGRESS → COMPLETED
+
+        Args:
+            result: Diccionario con el resultado del partido
+                   Ejemplo: {"winner": "A", "score": "3&2"}
+                   o {"winner": "HALVED", "score": "AS"}
+        """
+        if not self._status.can_record_scores():
+            raise ValueError(
+                f"Cannot complete match from status {self._status}. Expected IN_PROGRESS"
+            )
+        self._result = result
+        self._status = MatchStatus.COMPLETED
+        self._updated_at = ahora_utc_sin_zona()
+
+    def declare_walkover(self, winning_team: str, reason: str | None = None) -> None:
+        """
+        Declara walkover (victoria por incomparecencia).
+        Transición: SCHEDULED o IN_PROGRESS → WALKOVER
+
+        Args:
+            winning_team: Equipo ganador ("A" o "B")
+            reason: Razón del walkover (opcional)
+        """
+        if self._status not in (MatchStatus.SCHEDULED, MatchStatus.IN_PROGRESS):
+            raise ValueError(
+                f"Cannot declare walkover from status {self._status}. "
+                f"Expected SCHEDULED or IN_PROGRESS"
+            )
+
+        if winning_team not in ("A", "B"):
+            raise ValueError(f"winning_team must be 'A' or 'B', got '{winning_team}'")
+
+        self._result = {
+            "winner": winning_team,
+            "score": "W/O",
+            "reason": reason,
+        }
+        self._status = MatchStatus.WALKOVER
+        self._updated_at = ahora_utc_sin_zona()
+
+    def concede(self, conceding_team: str, reason: str | None = None) -> None:
+        """
+        Concede el partido a favor del equipo contrario.
+        Transicion: IN_PROGRESS → CONCEDED
+
+        Args:
+            conceding_team: Equipo que concede ("A" o "B")
+            reason: Razon de la concesion (opcional)
+        """
+        if not self._status.can_concede():
+            raise ValueError(
+                f"Cannot concede match from status {self._status}. Expected IN_PROGRESS"
+            )
+
+        if conceding_team not in ("A", "B"):
+            raise ValueError(f"conceding_team must be 'A' or 'B', got '{conceding_team}'")
+
+        winning_team = "B" if conceding_team == "A" else "A"
+        self._result = {
+            "winner": winning_team,
+            "score": "CONCEDED",
+            "reason": reason,
+        }
+        self._status = MatchStatus.CONCEDED
+        self._updated_at = ahora_utc_sin_zona()
+
+    def set_marker_assignments(self, assignments: list[MarkerAssignment]) -> None:
+        """
+        Establece las asignaciones de marcadores.
+        Solo permitido en estado SCHEDULED.
+        """
+        if self._status != MatchStatus.SCHEDULED:
+            raise ValueError(
+                f"Cannot set marker assignments in status {self._status}. Expected SCHEDULED"
+            )
+        self._marker_assignments = tuple(assignments)
+        self._updated_at = ahora_utc_sin_zona()
+
+    def submit_scorecard(self, user_id: UserId, match_format: MatchFormat) -> None:
+        """
+        Registra que un jugador ha entregado su tarjeta.
+
+        En foursomes la tarjeta es del bando (BE #377): la de uno vale por los
+        dos, y el compañero ya no la entrega.
+
+        Args:
+            user_id: ID del jugador que entrega
+            match_format: El formato de la sesion, que decide de quien es la tarjeta
+
+        Raises:
+            ValueError: Si no es jugador del partido o ya entrego (el o su bando)
+        """
+        if self.find_player(user_id) is None:
+            raise ValueError(f"User {user_id} is not a player in this match")
+
+        if user_id in self._withdrawn_player_ids:
+            raise ValueError(f"User {user_id} is withdrawn from this match")
+
+        if self.has_submitted_scorecard(user_id, match_format):
+            raise ValueError(f"User {user_id} has already submitted their scorecard")
+
+        self._scorecard_submitted_by = (*self._scorecard_submitted_by, user_id)
+        self._updated_at = ahora_utc_sin_zona()
+
+    def mark_decided(self, result: dict[str, Any]) -> None:
+        """Marca el partido como matematicamente decidido."""
+        self._is_decided = True
+        self._decided_result = result
+        self._updated_at = ahora_utc_sin_zona()
+
+    def clear_decided(self) -> None:
+        """Deja de estar decidido: se corrigio un hoyo anterior a la decision."""
+        self._is_decided = False
+        self._decided_result = None
+        self._updated_at = ahora_utc_sin_zona()
+
+    def withdraw_player(self, user_id: UserId, match_format: MatchFormat) -> None:
+        """
+        Retira a un jugador de un fourball (Agustin, 24-25 oct 2026).
+
+        Su bola deja de contar en los hoyos que no tenia validados y su bando
+        juega con la de su pareja, que pasa a marcar tambien al rival que el
+        marcaba. Sin esto, con la regla de las cuatro bolas, un ausente dejaba
+        el partido sin avanzar.
+
+        Raises:
+            ValueError: fuera de fourball, con el partido terminado, si no
+                juega el partido, si ya esta retirado, si es el ultimo de su
+                bando o si alguien ya entrego la tarjeta
+        """
+        if match_format != MatchFormat.FOURBALL:
+            raise WithdrawalViolation("NOT_FOURBALL", "Only a fourball player can be withdrawn")
+        if self._status not in (MatchStatus.SCHEDULED, MatchStatus.IN_PROGRESS):
+            raise WithdrawalViolation(
+                "MATCH_NOT_ACTIVE",
+                f"Cannot withdraw a player from a match in status {self._status}",
+            )
+        team = self.get_player_team(user_id)
+        if team is None:
+            raise WithdrawalViolation(
+                "NOT_A_PLAYER", f"User {user_id} is not a player in this match"
+            )
+        if user_id in self._withdrawn_player_ids:
+            raise WithdrawalViolation("ALREADY_WITHDRAWN", f"User {user_id} is already withdrawn")
+        bando = self._team_a_players if team == "A" else self._team_b_players
+        if all(p.user_id == user_id or p.user_id in self._withdrawn_player_ids for p in bando):
+            # El bando se queda sin bola: para eso estan conceder y el walkover
+            raise WithdrawalViolation("LAST_OF_SIDE", "Cannot withdraw the last player of a side")
+        self._sin_tarjetas_entregadas()
+        self._withdrawn_player_ids = (*self._withdrawn_player_ids, user_id)
+        self._updated_at = ahora_utc_sin_zona()
+
+    def reinstate_player(self, user_id: UserId, hoyos_cerrados: Collection[int]) -> None:
+        """
+        Deshace la retirada. Los hoyos que se cerraron sin su bola mientras
+        estuvo fuera (`hoyos_cerrados`, los calcula `ScoringService`) se quedan
+        asi; su bola vuelve en los demas (Agustin, 25 oct 2026).
+
+        Raises:
+            WithdrawalViolation: si no esta retirado, con el partido terminado o
+                si alguien ya entrego la tarjeta
+        """
+        if user_id not in self._withdrawn_player_ids:
+            raise WithdrawalViolation("NOT_WITHDRAWN", f"User {user_id} is not withdrawn")
+        if self._status not in (MatchStatus.SCHEDULED, MatchStatus.IN_PROGRESS):
+            raise WithdrawalViolation(
+                "MATCH_NOT_ACTIVE", f"Cannot reinstate a player in a match in status {self._status}"
+            )
+        self._sin_tarjetas_entregadas()
+        sin_su_bola = set(self._holes_without_ball.get(user_id, ())) | set(hoyos_cerrados)
+        if sin_su_bola:
+            # Un diccionario nuevo, no cambiarlo en su sitio: la columna JSONB no
+            # sigue los cambios internos y SQLAlchemy no lo guardaria (CodeRabbit)
+            self._holes_without_ball = {
+                **self._holes_without_ball,
+                user_id: tuple(sorted(sin_su_bola)),
+            }
+        self._withdrawn_player_ids = tuple(
+            uid for uid in self._withdrawn_player_ids if uid != user_id
+        )
+        self._updated_at = ahora_utc_sin_zona()
+
+    def _sin_tarjetas_entregadas(self) -> None:
+        """Con una tarjeta entregada, lo validado ya no se mueve (W4)."""
+        if self._scorecard_submitted_by:
+            raise WithdrawalViolation(
+                "SCORECARD_SUBMITTED", "A scorecard has already been submitted in this match"
+            )
+
+    def recalcular_jugadores(
+        self, team_a_players: Sequence[MatchPlayer], team_b_players: Sequence[MatchPlayer]
+    ) -> None:
+        """
+        Los mismos jugadores con su foto nueva (BE #912): al cambiar unas barras, lo
+        que queda por jugar sale con ellas; lo empezado no se toca.
+
+        Rehace la ventaja con el reparto nuevo. Ni el id ni los marcadores cambian:
+        juegan los mismos.
+
+        Raises:
+            ValueError: Si ya empezó, o si cambia quién juega en algún bando
+        """
+        if self._status != MatchStatus.SCHEDULED:
+            raise ValueError("Un partido empezado no se recalcula")
+        for antes, despues in (
+            (self._team_a_players, team_a_players),
+            (self._team_b_players, team_b_players),
+        ):
+            if [p.user_id for p in antes] != [p.user_id for p in despues]:
+                raise ValueError("Recalcular no cambia quién juega")
+        self._team_a_players = tuple(team_a_players)
+        self._team_b_players = tuple(team_b_players)
+        self._handicap_strokes_given, self._strokes_given_to_team = self._ventaja(
+            team_a_players, team_b_players
+        )
+        self._updated_at = ahora_utc_sin_zona()
+
+    def completar_genero_de_las_barras(
+        self, genero_de: Callable[[MatchPlayer], Gender | None]
+    ) -> int:
+        """
+        Pone el género de su barra a quien lo tiene vacío (FE #880).
+
+        Las Ryder SCRATCH guardaban a todos sin él: veían la tarjeta de
+        referencia en vez de la de su barra, y el mapa del hoyo no sabía de qué
+        barra era cada muestra. Se rellena sin regenerar el partido: no cambia
+        nada más (color, golpes, resultados), y quien ya lo tiene se queda con
+        el suyo, así que repetirlo no hace nada. Un partido terminado no se
+        toca: se jugó con esa tarjeta (Agustín, 16 oct).
+
+        Args:
+            genero_de: El género que da su barra a ese jugador, o None si no tiene
+
+        Returns:
+            Cuántos jugadores se han completado
+        """
+        if self.is_finished():
+            return 0
+        cambiados = 0
+
+        def completar(jugador: MatchPlayer) -> MatchPlayer:
+            nonlocal cambiados
+            if jugador.tee_gender is not None:
+                return jugador
+            genero = genero_de(jugador)
+            if genero is None:
+                return jugador
+            cambiados += 1
+            return replace(jugador, tee_gender=genero)
+
+        self._team_a_players = tuple(completar(p) for p in self._team_a_players)
+        self._team_b_players = tuple(completar(p) for p in self._team_b_players)
+        if cambiados:
+            self._updated_at = ahora_utc_sin_zona()
+        return cambiados
+
+    # ==================== Query Methods ====================
+
+    def jugadores_por_completar(self, genero_de: Callable[[MatchPlayer], Gender | None]) -> int:
+        """Cuántos completaría `completar_genero_de_las_barras`, sin tocar nada."""
+        if self.is_finished():
+            return 0
+        return sum(
+            1
+            for p in (*self._team_a_players, *self._team_b_players)
+            if p.tee_gender is None and genero_de(p) is not None
+        )
+
+    def is_finished(self) -> bool:
+        """Retorna True si el partido ha terminado."""
+        return self._status.is_finished()
+
+    def get_winner(self) -> str | None:
+        """
+        Retorna el equipo ganador ('A', 'B', 'HALVED') o None si no ha terminado.
+        """
+        if not self.is_finished() or self._result is None:
+            return None
+        return self._result.get("winner")
+
+    def team_a_total_handicap(self) -> int:
+        """Retorna el handicap combinado del Equipo A."""
+        return sum(p.playing_handicap for p in self._team_a_players)
+
+    def team_b_total_handicap(self) -> int:
+        """Retorna el handicap combinado del Equipo B."""
+        return sum(p.playing_handicap for p in self._team_b_players)
+
+    def has_submitted_scorecard(self, user_id: UserId, match_format: MatchFormat) -> bool:
+        """Retorna True si la tarjeta del jugador ya esta entregada (en foursomes, la de su bando)."""
+        return user_id in self.scorecards_submitted_by(match_format)
+
+    def all_scorecards_submitted(self, match_format: MatchFormat) -> bool:
+        """Retorna True si estan todas las tarjetas: una por bando en foursomes."""
+        entregadas = self.scorecards_submitted_by(match_format)
+        # El retirado no entrega: terminan los demas (W12)
+        return all(
+            uid in entregadas
+            for uid in self.get_all_player_ids()
+            if uid not in self._withdrawn_player_ids
+        )
+
+    def scorecards_submitted_by(self, match_format: MatchFormat) -> tuple[UserId, ...]:
+        """Quienes tienen la tarjeta entregada, aplicando la regla del formato.
+
+        En foursomes, si alguien del bando entrego, estan los dos (BE #377). Lo
+        que se enseña en la pantalla sale de aqui: la regla vive en un sitio.
+        """
+        if not match_format.one_ball_per_side():
+            return self._scorecard_submitted_by
+        entregadas = set(self._scorecard_submitted_by)
+        bandos = (self._team_a_players, self._team_b_players)
+        return tuple(
+            jugador.user_id
+            for bando in bandos
+            if entregadas & {j.user_id for j in bando}
+            for jugador in bando
+        )
+
+    def get_player_team(self, user_id: UserId) -> str | None:
+        """Retorna el equipo del jugador ("A"/"B") o None si no es jugador."""
+        for p in self._team_a_players:
+            if p.user_id == user_id:
+                return "A"
+        for p in self._team_b_players:
+            if p.user_id == user_id:
+                return "B"
+        return None
+
+    def find_player(self, user_id: UserId) -> MatchPlayer | None:
+        """Busca un jugador por su user_id."""
+        for p in (*self._team_a_players, *self._team_b_players):
+            if p.user_id == user_id:
+                return p
+        return None
+
+    def may_mark(self, scorer_id: UserId, marked_id: UserId) -> bool:
+        """
+        Si `scorer_id` puede apuntarle los golpes a `marked_id` como marcador (BE #520).
+
+        Solo al jugador que le asignó el sorteo de marcadores. Así nadie se
+        marca a sí mismo —con eso uno validaba su propio hoyo, o pisaba lo que le
+        había apuntado su marcador de verdad—: `MarkerAssignment` ya prohíbe que
+        alguien se tenga asignado. Un partido sin asignaciones (datos viejos) se
+        queda con la regla de fondo del sorteo, el marcador es siempre del
+        equipo contrario, que deja fuera a uno mismo y al compañero.
+        """
+        # Ni marca ni le marcan, tambien con la regla de bandos (sin sorteo)
+        if scorer_id in self._withdrawn_player_ids or marked_id in self._withdrawn_player_ids:
+            return False
+        if self._marker_assignments:
+            return any(
+                assignment.scorer_user_id == scorer_id and assignment.marks_user_id == marked_id
+                for assignment in self.effective_marker_assignments
+            )
+        scorer_team = self.get_player_team(scorer_id)
+        marked_team = self.get_player_team(marked_id)
+        return scorer_team is not None and marked_team is not None and scorer_team != marked_team
+
+    def get_all_player_ids(self) -> list[UserId]:
+        """Retorna los IDs de todos los jugadores del partido."""
+        return [p.user_id for p in (*self._team_a_players, *self._team_b_players)]
+
+    # ==================== Properties ====================
+
+    @property
+    def id(self) -> MatchId:
+        return self._id
+
+    @property
+    def round_id(self) -> RoundId:
+        return self._round_id
+
+    @property
+    def match_number(self) -> int:
+        return self._match_number
+
+    @property
+    def team_a_players(self) -> tuple[MatchPlayer, ...]:
+        return self._team_a_players
+
+    @property
+    def team_b_players(self) -> tuple[MatchPlayer, ...]:
+        return self._team_b_players
+
+    @property
+    def status(self) -> MatchStatus:
+        return self._status
+
+    @property
+    def handicap_strokes_given(self) -> int:
+        return self._handicap_strokes_given
+
+    @property
+    def strokes_given_to_team(self) -> str:
+        return self._strokes_given_to_team
+
+    @property
+    def result(self) -> dict[str, Any] | None:
+        return self._result
+
+    @property
+    def created_at(self) -> datetime:
+        return self._created_at
+
+    @property
+    def updated_at(self) -> datetime:
+        return self._updated_at
+
+    @property
+    def marker_assignments(self) -> tuple[MarkerAssignment, ...]:
+        return self._marker_assignments
+
+    @property
+    def withdrawn_player_ids(self) -> tuple[UserId, ...]:
+        """Los jugadores retirados del fourball, en orden de retirada."""
+        return self._withdrawn_player_ids
+
+    @property
+    def holes_without_ball(self) -> dict[UserId, tuple[int, ...]]:
+        """De los que volvieron, los hoyos que se cerraron sin su bola."""
+        return dict(self._holes_without_ball)
+
+    @property
+    def bolas_fuera(self) -> BolasFuera:
+        """Las bolas que no cuentan: lo que pasa la regla del hoyo (`ScoringService`)."""
+        return BolasFuera(
+            retirados=frozenset(self._withdrawn_player_ids),
+            hoyos_sin_su_bola={
+                uid: frozenset(hoyos) for uid, hoyos in self._holes_without_ball.items() if hoyos
+            },
+        )
+
+    @property
+    def effective_marker_assignments(self) -> tuple[MarkerAssignment, ...]:
+        """
+        Quien marca a quien con los retirados fuera (W10, W11).
+
+        Al retirado no lo marca nadie, y el rival al que el marcaba lo marca su
+        pareja, que es del bando contrario como pide el match play. Sin
+        retirados, el sorteo tal cual.
+        """
+        if not self._withdrawn_player_ids:
+            return self._marker_assignments
+        retirados = set(self._withdrawn_player_ids)
+        # Primero quién anota a quién; luego, de cada anotador, quien lo marca
+        # ahora: con el sorteo de antes, `marked_by` seguía señalando al
+        # retirado (revisor sin contexto)
+        parejas: list[tuple[UserId, UserId, UserId]] = []
+        for asignacion in self._marker_assignments:
+            if asignacion.marks_user_id in retirados:
+                continue
+            anotador: UserId | None
+            anotador = asignacion.scorer_user_id
+            if anotador in retirados:
+                anotador = self._pareja_de(anotador)
+                if anotador is None or anotador in retirados:
+                    continue
+            parejas.append((anotador, asignacion.marks_user_id, asignacion.marked_by_user_id))
+        le_marca = {marcado: anotador for anotador, marcado, _ in parejas}
+        return tuple(
+            MarkerAssignment(
+                scorer_user_id=anotador,
+                marks_user_id=marcado,
+                marked_by_user_id=le_marca.get(anotador, antes),
+            )
+            for anotador, marcado, antes in parejas
+        )
+
+    def _pareja_de(self, user_id: UserId) -> UserId | None:
+        team = self.get_player_team(user_id)
+        bando = self._team_a_players if team == "A" else self._team_b_players
+        return next((p.user_id for p in bando if p.user_id != user_id), None) if team else None
+
+    @property
+    def scorecard_submitted_by(self) -> tuple[UserId, ...]:
+        return self._scorecard_submitted_by
+
+    @property
+    def is_decided(self) -> bool:
+        return self._is_decided
+
+    @property
+    def closing_result(self) -> dict[str, Any] | None:
+        """El resultado de un partido cerrado sin jugarlo hasta el final.
+
+        Concedido o ganado por walkover, ese resultado —quien gana y por que—
+        manda sobre el de los hoyos: si A iba ganando y concede, gana B (BE #384).
+        Jugado hasta el final o todavia en juego, None: manda lo de los hoyos.
+        """
+        if self._status in (MatchStatus.CONCEDED, MatchStatus.WALKOVER):
+            return self._result
+        return None
+
+    @property
+    def decided_result(self) -> dict[str, Any] | None:
+        return self._decided_result
+
+    # ==================== Equality ====================
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Match):
+            return False
+        return self._id == other._id
+
+    def __hash__(self) -> int:
+        return hash(self._id)
+
+    def __repr__(self) -> str:
+        return (
+            f"Match(id={self._id}, "
+            f"number={self._match_number}, "
+            f"team_a={len(self._team_a_players)}p, "
+            f"team_b={len(self._team_b_players)}p, "
+            f"status={self._status})"
+        )

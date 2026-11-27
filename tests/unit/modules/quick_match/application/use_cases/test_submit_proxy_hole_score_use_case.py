@@ -1,0 +1,237 @@
+"""Tests para SubmitProxyHoleScoreUseCase."""
+
+from uuid import uuid4
+
+import pytest
+
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.quick_match.application.dto.quick_match_dto import (
+    SubmitProxyHoleScoreRequestDTO,
+)
+from src.modules.quick_match.application.exceptions import (
+    NotAScorerError,
+    TargetParticipantNotFoundError,
+)
+from src.modules.quick_match.application.use_cases.submit_proxy_hole_score_use_case import (
+    SubmitProxyHoleScoreUseCase,
+)
+from src.modules.quick_match.domain.entities.quick_match import QuickMatch
+from src.modules.quick_match.domain.exceptions.quick_match_violations import (
+    InvalidHoleScoreViolation,
+    NotAssignedScorerViolation,
+)
+from src.modules.quick_match.domain.services.scoring_coverage_service import (
+    ScoringCoverageService,
+)
+from src.modules.quick_match.domain.value_objects.quick_match_id import QuickMatchId
+from src.modules.quick_match.domain.value_objects.quick_match_participant import (
+    QuickMatchParticipant,
+)
+from src.shared.domain.value_objects.match_format import MatchFormat
+from src.shared.domain.value_objects.scoring_format import ScoringFormat
+from tests.unit.modules.quick_match.conftest import create_user
+
+pytestmark = pytest.mark.asyncio
+
+
+async def _create_in_progress_match_with_guest(qm_uow, creator_id):
+    qm = QuickMatch.create(
+        id=QuickMatchId.generate(),
+        creator_id=creator_id,
+        golf_course_id=GolfCourseId(uuid4()),
+        match_format=MatchFormat.SINGLES,
+    )
+    guest = QuickMatchParticipant.for_guest(first_name="Guest", last_name="Player")
+    qm.add_participant(guest)
+    qm.start([qm.creator_participant_id])
+    async with qm_uow:
+        await qm_uow.quick_matches.add(qm)
+    return qm, guest
+
+
+class TestSubmitProxyHoleScoreUseCase:
+    async def test_scorer_can_submit_for_assigned_guest(self, qm_uow, user_uow):
+        creator = await create_user(user_uow, "creator@test.com")
+        qm, guest = await _create_in_progress_match_with_guest(qm_uow, creator.id)
+
+        use_case = SubmitProxyHoleScoreUseCase(qm_uow, ScoringCoverageService())
+        response = await use_case.execute(
+            SubmitProxyHoleScoreRequestDTO(
+                quick_match_id=qm.id.value,
+                scorer_user_id=creator.id.value,
+                target_participant_id=guest.participant_id.value,
+                hole_number=1,
+                score=5,
+            )
+        )
+
+        assert response.score == 5
+        assert response.participant_id == guest.participant_id.value
+        assert response.recorded_by_participant_id == creator.id.value
+
+    async def test_non_scorer_cannot_submit_by_proxy(self, qm_uow, user_uow):
+        creator = await create_user(user_uow, "creator2@test.com")
+        qm, guest = await _create_in_progress_match_with_guest(qm_uow, creator.id)
+
+        use_case = SubmitProxyHoleScoreUseCase(qm_uow, ScoringCoverageService())
+        with pytest.raises(NotAScorerError):
+            await use_case.execute(
+                SubmitProxyHoleScoreRequestDTO(
+                    quick_match_id=qm.id.value,
+                    scorer_user_id=uuid4(),
+                    target_participant_id=guest.participant_id.value,
+                    hole_number=1,
+                    score=5,
+                )
+            )
+
+    async def test_target_not_found_raises(self, qm_uow, user_uow):
+        creator = await create_user(user_uow, "creator3@test.com")
+        qm, _guest = await _create_in_progress_match_with_guest(qm_uow, creator.id)
+
+        use_case = SubmitProxyHoleScoreUseCase(qm_uow, ScoringCoverageService())
+        with pytest.raises(TargetParticipantNotFoundError):
+            await use_case.execute(
+                SubmitProxyHoleScoreRequestDTO(
+                    quick_match_id=qm.id.value,
+                    scorer_user_id=creator.id.value,
+                    target_participant_id=uuid4(),
+                    hole_number=1,
+                    score=5,
+                )
+            )
+
+    async def test_scorer_cannot_submit_for_participant_not_assigned_to_them(
+        self, qm_uow, user_uow
+    ):
+        creator = await create_user(user_uow, "creator4@test.com")
+        other = await create_user(user_uow, "other4@test.com")
+        qm = QuickMatch.create(
+            id=QuickMatchId.generate(),
+            creator_id=creator.id,
+            golf_course_id=GolfCourseId(uuid4()),
+            match_format=MatchFormat.FOURBALL,
+        )
+        scorer_b = QuickMatchParticipant.for_user(other.id, team="A")
+        guest_a = QuickMatchParticipant.for_guest(first_name="Guest", last_name="A", team="B")
+        guest_b = QuickMatchParticipant.for_guest(first_name="Guest", last_name="B", team="B")
+        qm.add_participant(scorer_b)
+        qm.add_participant(guest_a)
+        qm.add_participant(guest_b)
+        qm.start([qm.creator_participant_id, scorer_b.participant_id])
+        async with qm_uow:
+            await qm_uow.quick_matches.add(qm)
+
+        # Con 2 anotadores y 2 no-anotadores, el reparto es 1 y 1: cada guest
+        # queda asignado a un anotador distinto. Forzamos que "other" intente
+        # anotar al invitado que NO le corresponde.
+        use_case = SubmitProxyHoleScoreUseCase(qm_uow, ScoringCoverageService())
+        assignments = use_case._coverage_service.compute_assignments(
+            participants=qm.participants,
+            scorer_ids=qm.scorer_ids,
+            creator_participant_id=qm.creator_participant_id,
+        )
+        not_assigned_to_other = next(
+            g
+            for g in (guest_a, guest_b)
+            if g.participant_id not in assignments[scorer_b.participant_id]
+        )
+
+        with pytest.raises(NotAssignedScorerViolation):
+            await use_case.execute(
+                SubmitProxyHoleScoreRequestDTO(
+                    quick_match_id=qm.id.value,
+                    scorer_user_id=other.id.value,
+                    target_participant_id=not_assigned_to_other.participant_id.value,
+                    hole_number=1,
+                    score=5,
+                )
+            )
+
+
+class TestSubmitProxyHoleScorePickedUp:
+    async def test_scorer_can_record_a_raya_for_someone_else(self, qm_uow, user_uow):
+        """
+        Given un invitado que recoge la bola
+        When su anotador lo registra con score nulo
+        Then queda anotado como raya
+
+        Quien recoge la bola suele ser justo el invitado al que anota otro, asi
+        que el camino delegado importa tanto como el propio.
+        """
+        creator = await create_user(user_uow, "raya-proxy@test.com")
+        qm, guest = await _create_in_progress_match_with_guest(qm_uow, creator.id)
+
+        use_case = SubmitProxyHoleScoreUseCase(qm_uow, ScoringCoverageService())
+        response = await use_case.execute(
+            SubmitProxyHoleScoreRequestDTO(
+                quick_match_id=qm.id.value,
+                scorer_user_id=creator.id.value,
+                target_participant_id=guest.participant_id.value,
+                hole_number=1,
+                score=None,
+            )
+        )
+
+        assert response.score is None
+        assert response.participant_id == guest.participant_id.value
+
+
+class TestMedalRejectsPickedUpHolesByProxy:
+    async def test_a_raya_by_proxy_is_rejected_in_medal(self, qm_uow, user_uow):
+        """
+        Given una partida libre en Medal con un invitado
+        When su anotador intenta ponerle raya
+        Then se rechaza igual que si se la pusiera a si mismo
+
+        La regla es de la partida, no de quien anota: dejarla solo en el camino
+        propio la dejaria abierta justo por donde mas se usa.
+        """
+        creator = await create_user(user_uow, "medal-proxy-raya@test.com")
+        qm = QuickMatch.create(
+            id=QuickMatchId.generate(),
+            creator_id=creator.id,
+            golf_course_id=GolfCourseId(uuid4()),
+            scoring_format=ScoringFormat.MEDAL,
+        )
+        guest = QuickMatchParticipant.for_guest(first_name="Guest", last_name="Medal")
+        qm.add_participant(guest)
+        qm.start([qm.creator_participant_id])
+        async with qm_uow:
+            await qm_uow.quick_matches.add(qm)
+
+        use_case = SubmitProxyHoleScoreUseCase(qm_uow, ScoringCoverageService())
+        with pytest.raises(InvalidHoleScoreViolation):
+            await use_case.execute(
+                SubmitProxyHoleScoreRequestDTO(
+                    quick_match_id=qm.id.value,
+                    scorer_user_id=creator.id.value,
+                    target_participant_id=guest.participant_id.value,
+                    hole_number=1,
+                    score=None,
+                )
+            )
+
+
+class TestItLocksTheMatch:
+    async def test_a_proxy_stroke_reads_the_match_locked(self, qm_uow, user_uow):
+        """El cierre automático puede cancelarla «sin golpes» a la vez (23 oct 2026)."""
+        creator = await create_user(user_uow, "lock-proxy@test.com")
+        qm, guest = await _create_in_progress_match_with_guest(qm_uow, creator.id)
+
+        async def sin_bloquear(_quick_match_id):
+            raise AssertionError("se leyó la partida sin bloquearla")
+
+        qm_uow.quick_matches.find_by_id = sin_bloquear
+
+        response = await SubmitProxyHoleScoreUseCase(qm_uow, ScoringCoverageService()).execute(
+            SubmitProxyHoleScoreRequestDTO(
+                quick_match_id=qm.id.value,
+                scorer_user_id=creator.id.value,
+                target_participant_id=guest.participant_id.value,
+                hole_number=1,
+                score=5,
+            )
+        )
+
+        assert response.score == 5

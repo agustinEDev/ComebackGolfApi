@@ -1,0 +1,456 @@
+"""
+HTTP Context Validator - Shared Infrastructure Layer
+
+Utilidades para validar y extraer información segura del contexto HTTP.
+
+Funcionalidades:
+- Validación de direcciones IP (rechaza sentinels, valida formato)
+- Validación de User-Agent (rechaza sentinels, valida longitud)
+- Extracción segura de IP del cliente con validación de proxy confiable
+
+Security:
+- Previene IP spoofing validando headers de proxy contra whitelist
+- Rechaza valores sentinel que pueden causar errores ("unknown", "", "0.0.0.0")
+- Graceful degradation: retorna None en lugar de lanzar excepciones
+
+Casos de uso:
+- Device Fingerprinting (v1.13.0)
+- Security Logging (v1.8.0)
+- Rate Limiting por IP
+- Audit Trail
+
+Patrones: Defensive Programming + Fail-Safe Defaults
+"""
+
+import hmac
+import ipaddress
+import logging
+import os
+
+from fastapi import Request
+
+from src.config.arranque_seguro import en_desarrollo_declarado
+
+logger = logging.getLogger(__name__)
+
+# Constantes de validación
+MIN_USER_AGENT_LENGTH = 10
+MAX_USER_AGENT_LENGTH = 500
+
+# Valores sentinel conocidos que deben ser rechazados
+IP_SENTINEL_VALUES = {"unknown", "0.0.0.0", "127.0.0.1", "::1", "localhost"}  # nosec B104
+USER_AGENT_SENTINEL_VALUES = {"unknown", ""}
+
+
+def validate_ip_address(ip: str | None) -> str | None:
+    """
+    Valida que una dirección IP sea válida y no sea un valor sentinel.
+
+    Esta función es crítica para Device Fingerprinting y Security Logging.
+    Previene que valores malformados o sentinel lleguen a DeviceFingerprint.create().
+
+    Args:
+        ip: Dirección IP a validar (puede ser None)
+
+    Returns:
+        str: IP válida si pasa todas las validaciones
+        None: Si IP es inválida, sentinel, o None
+
+    Validaciones aplicadas:
+        1. Rechazar None o strings vacíos/whitespace
+        2. Rechazar valores sentinel conocidos (unknown, 0.0.0.0, 127.0.0.1, localhost)
+        3. Validar formato IP (IPv4 o IPv6) con ipaddress.ip_address()
+        4. Rechazar IPs privadas/loopback (opcional - comentado por defecto)
+
+    Examples:
+        >>> validate_ip_address("192.168.1.100")
+        '192.168.1.100'
+
+        >>> validate_ip_address("unknown")
+        None
+
+        >>> validate_ip_address("0.0.0.0")
+        None
+
+        >>> validate_ip_address("   ")
+        None
+
+        >>> validate_ip_address("not-an-ip")
+        None
+
+    Security Notes:
+        - NO lanza excepciones (graceful degradation)
+        - Logs de advertencia para valores sospechosos
+        - Safe para usar en production con datos no confiables
+    """
+    # 1. Validación básica: None, vacío, whitespace
+    if not ip or not ip.strip():
+        logger.debug("IP validation failed: empty or None")
+        return None
+
+    ip_clean = ip.strip()
+
+    # 2. Rechazar valores sentinel conocidos
+    if ip_clean.lower() in IP_SENTINEL_VALUES:
+        logger.debug(f"IP validation failed: sentinel value '{ip_clean}'")
+        return None
+
+    # 3. Validar formato IP con ipaddress module (IPv4 o IPv6)
+    try:
+        ip_obj = ipaddress.ip_address(ip_clean)
+
+        # 4. (Opcional) Rechazar IPs privadas/loopback
+        # Deshabilitado porque en desarrollo local usamos 192.168.x.x
+
+        # 5. Ni una IPv6 con zona (fe80::1%eth0): no es la de un cliente de Internet y
+        # su zona mide lo que quiera, más que los 45 caracteres de columnas y DTOs de IP;
+        # tumbaba el refresco y el desvincular (revisiones de #765, 8 nov 2026)
+        if getattr(ip_obj, "scope_id", None):
+            logger.warning("IP validation failed: scoped IPv6")
+            return None
+
+        return str(ip_obj)  # Normalizado por ipaddress
+
+    except ValueError as e:
+        logger.warning(f"IP validation failed: invalid format '{ip_clean}' - {e}")
+        return None
+
+
+def validate_user_agent(user_agent: str | None) -> str | None:
+    """
+    Valida que un User-Agent sea válido y no sea un valor sentinel.
+
+    Esta función es crítica para Device Fingerprinting.
+    Previene que valores malformados lleguen a DeviceFingerprint.create().
+
+    Args:
+        user_agent: String del User-Agent HTTP header (puede ser None)
+
+    Returns:
+        str: User-Agent válido si pasa todas las validaciones
+        None: Si User-Agent es inválido, sentinel, o None
+
+    Validaciones aplicadas:
+        1. Rechazar None o strings vacíos/whitespace
+        2. Rechazar valores sentinel conocidos ("unknown")
+        3. Validar longitud razonable (10-500 caracteres)
+
+    Examples:
+        >>> validate_user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...")
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...'
+
+        >>> validate_user_agent("unknown")
+        None
+
+        >>> validate_user_agent("   ")
+        None
+
+        >>> validate_user_agent("x")  # Muy corto
+        None
+
+        >>> validate_user_agent("a" * 1000)  # Muy largo
+        None
+
+    Security Notes:
+        - NO lanza excepciones (graceful degradation)
+        - Límites de longitud previenen ataques de buffer/memoria
+        - Safe para usar en production con datos no confiables
+    """
+    # 1. Validación básica: None, vacío, whitespace
+    if not user_agent or not user_agent.strip():
+        logger.debug("User-Agent validation failed: empty or None")
+        return None
+
+    ua_clean = user_agent.strip()
+
+    # 2. Rechazar valores sentinel conocidos
+    if ua_clean.lower() in USER_AGENT_SENTINEL_VALUES:
+        logger.debug(f"User-Agent validation failed: sentinel value '{ua_clean}'")
+        return None
+
+    # 3. Validar longitud razonable
+    if len(ua_clean) < MIN_USER_AGENT_LENGTH:
+        logger.debug(
+            f"User-Agent validation failed: too short ({len(ua_clean)} < {MIN_USER_AGENT_LENGTH})"
+        )
+        return None
+
+    if len(ua_clean) > MAX_USER_AGENT_LENGTH:
+        logger.warning(
+            f"User-Agent validation failed: too long ({len(ua_clean)} > {MAX_USER_AGENT_LENGTH})"
+        )
+        return None
+
+    return ua_clean
+
+
+def _is_trusted_proxy(proxy_ip: str, trusted_proxies: list[str]) -> bool:
+    """
+    Verifica si una IP pertenece a la lista de proxies confiables.
+
+    Soporta tanto IPs exactas como notación CIDR (ej: "10.0.0.0/8").
+    Entradas inválidas en trusted_proxies se ignoran silenciosamente.
+
+    Args:
+        proxy_ip: IP del proxy a verificar
+        trusted_proxies: Lista de IPs exactas o rangos CIDR confiables
+
+    Returns:
+        True si proxy_ip está en la lista de confianza, False en caso contrario
+    """
+    try:
+        addr = ipaddress.ip_address(proxy_ip)
+    except ValueError:
+        return False
+
+    for trusted in trusted_proxies:
+        try:
+            network = ipaddress.ip_network(trusted, strict=False)
+            if addr in network:
+                return True
+        except ValueError:
+            logger.warning("Invalid trusted proxy entry ignored from trusted_proxies configuration")
+            continue
+
+    return False
+
+
+ORIGIN_VERIFY_HEADER = "X-Origin-Verify"
+"""La cabecera con el secreto que añade la regla de Cloudflare (BE #466)."""
+
+ORIGIN_SECRET_ENV = "CLOUDFLARE_ORIGIN_SECRET"  # nosec B105 - env var name, not a secret
+
+
+def _viene_de_cloudflare(request: Request) -> bool:
+    """
+    Si la petición trae el secreto que solo conocen Cloudflare y la API.
+
+    Sin secreto configurado, nunca: uno vacío no puede coincidir con una cabecera
+    vacía. Se compara en bytes y en tiempo constante; la cabecera llega como
+    latin-1, así que cualquier byte se puede codificar sin lanzar.
+    """
+    secreto = os.getenv(ORIGIN_SECRET_ENV, "")
+    recibido = request.headers.get(ORIGIN_VERIFY_HEADER)
+    if not secreto or recibido is None:
+        return False
+    return hmac.compare_digest(recibido.encode("latin-1"), secreto.encode("utf-8"))
+
+
+def cloudflare_client_ip(request: Request) -> str | None:
+    """
+    La IP del cliente que da Cloudflare, solo si la petición viene de Cloudflare.
+
+    Sin el secreto, `CF-Connecting-IP` la puede escribir cualquiera que llame
+    directo al origen de Render, y no se cree (ADR-041). Una IPv4 mapeada en IPv6
+    se devuelve como IPv4. La IP sirve para límites y auditoría, nunca para
+    autorizar.
+    """
+    if not _viene_de_cloudflare(request):
+        return None
+    try:
+        ip = ipaddress.ip_address(request.headers.get("CF-Connecting-IP", "").strip())
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    # Ni sin especificar (0.0.0.0, ::), ni bucle local (todo 127/8 y ::1), ni con
+    # zona IPv6 (%eth0): validate_ip_address deja pasar ::, 127.0.0.2 y las zonas
+    if ip.is_unspecified or ip.is_loopback or getattr(ip, "scope_id", None):
+        return None
+    return str(ip)
+
+
+LONGITUD_DE_UN_PAIS = 2  # ISO 3166 alfa-2
+
+
+def cloudflare_client_country(request: Request) -> str | None:
+    """
+    El país del cliente que da Cloudflare (CF-IPCountry), solo con su secreto (BE #737).
+
+    Sin el secreto, la cabecera la puede escribir cualquiera que llame al origen.
+    «XX» (sin país) y «T1» (Tor) no son un país.
+    """
+    if not _viene_de_cloudflare(request):
+        return None
+    pais = request.headers.get("CF-IPCountry", "").strip().upper()
+    if len(pais) != LONGITUD_DE_UN_PAIS or not pais.isalpha() or pais in {"XX", "T1"}:
+        return None
+    return pais
+
+
+def informa_del_secreto_de_origen() -> None:
+    """
+    Dice al arrancar si la cabecera de origen de Cloudflare está configurada (ADR-041).
+
+    Nunca el valor ni nada calculado con él (CodeQL py/clear-text-logging-sensitive-data):
+    solo si está, y si alguien lo pegó con espacios o saltos de línea de más. Así no
+    coincidiría nunca, y todo caería en silencio al contador compartido. En
+    producción, sin configurar, es un aviso: los límites anónimos son de toda la app.
+    """
+    valor = os.getenv(ORIGIN_SECRET_ENV, "")
+    configurada = valor != ""
+    con_espacios = valor != valor.strip()
+    if con_espacios:
+        logger.warning(
+            "Cabecera de origen de Cloudflare configurada con espacios o saltos de línea "
+            "al principio o al final: no coincidirá con la de Cloudflare (ADR-041)"
+        )
+    elif configurada:
+        logger.info("Cabecera de origen de Cloudflare configurada (ADR-041)")
+    elif not en_desarrollo_declarado():
+        logger.warning(
+            "Cabecera de origen de Cloudflare sin configurar: la IP real no se usa (ADR-041)"
+        )
+    else:
+        logger.info("Cabecera de origen de Cloudflare sin configurar")
+
+
+def get_trusted_client_ip(
+    request: Request,
+    trusted_proxies: list[str] | None = None,
+    trust_cloudflare_headers: bool = False,
+) -> str | None:
+    """
+    Extrae la IP del cliente de forma segura validando headers de proxy.
+
+    Esta función previene IP spoofing validando que el request viene de un
+    proxy confiable antes de usar headers X-Forwarded-For o X-Real-IP.
+
+    Args:
+        request: Request de FastAPI
+        trusted_proxies: Lista de IPs de proxies confiables (opcional)
+                        Si None, solo usa request.client.host (no confía en headers)
+        trust_cloudflare_headers: Si True, confía en CF-Connecting-IP y True-Client-IP
+                                 headers. Solo activar si la app está detrás de Cloudflare.
+                                 Default: False (seguro por defecto)
+
+    Returns:
+        str: IP del cliente validada
+        None: Si no se puede determinar una IP válida
+
+    Lógica de extracción (con Cloudflare support):
+        1. **Prioridad MÁXIMA:** CF-Connecting-IP (solo si trust_cloudflare_headers=True)
+        2. **Prioridad 2:** True-Client-IP (solo si trust_cloudflare_headers=True)
+        3. **Prioridad 3:** Si proxy confiable: X-Forwarded-For o X-Real-IP
+        4. **Fallback:** request.client.host
+        5. Aplicar validate_ip_address() al resultado
+
+    Examples:
+        # Caso 1: Request directo (sin proxy)
+        >>> get_trusted_client_ip(request, trusted_proxies=None)
+        '203.0.113.45'  # request.client.host
+
+        # Caso 2: Request de proxy confiable
+        >>> # request viene de 10.0.0.1 (proxy confiable)
+        >>> # X-Forwarded-For: "203.0.113.45, 10.0.0.1"
+        >>> get_trusted_client_ip(request, trusted_proxies=["10.0.0.1"])
+        '203.0.113.45'  # Primera IP del header
+
+        # Caso 3: Request de proxy NO confiable (IP spoofing attempt)
+        >>> # request viene de 192.168.1.100 (NO confiable)
+        >>> # X-Forwarded-For: "1.2.3.4" (falso)
+        >>> get_trusted_client_ip(request, trusted_proxies=["10.0.0.1"])
+        '192.168.1.100'  # Ignora header, usa request.client.host
+
+        # Caso 4: App detrás de Cloudflare
+        >>> get_trusted_client_ip(request, trust_cloudflare_headers=True)
+        '203.0.113.45'  # Usa CF-Connecting-IP
+
+    Security Notes:
+        - Previene IP spoofing: NO confía en headers sin validar proxy
+        - Cloudflare headers solo se usan si trust_cloudflare_headers=True
+        - Usa primera IP de X-Forwarded-For (la del cliente real)
+        - Fallback seguro a request.client.host si hay duda
+        - Aplica validate_ip_address() al final (rechaza sentinel)
+    """
+    # Viene de Cloudflare con su secreto: su IP es la buena (BE #466). Sin el
+    # secreto, lo de siempre, para que las huellas de los dispositivos no cambien
+    return cloudflare_client_ip(request) or _ip_tras_los_proxies(
+        request, trusted_proxies, trust_cloudflare_headers
+    )
+
+
+def _ip_tras_los_proxies(
+    request: Request,
+    trusted_proxies: list[str] | None,
+    trust_cloudflare_headers: bool,
+) -> str | None:
+    """La IP de las cabeceras de proxy, como antes de BE #466 (ver get_trusted_client_ip)."""
+    # 1. Determinar IP del proxy (quien envió el request directamente)
+    proxy_ip = request.client.host if request.client else None
+
+    # 2. PRIORIDAD MÁXIMA: Headers de Cloudflare (solo si trust_cloudflare_headers=True)
+    # SECURITY: Solo confiar en estos headers si la app está configurada para Cloudflare
+    if trust_cloudflare_headers:
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            validated_cf_ip = validate_ip_address(cf_ip.strip())
+            if validated_cf_ip:
+                logger.debug(f"Using CF-Connecting-IP from Cloudflare: {validated_cf_ip}")
+                return validated_cf_ip
+            logger.warning(f"Invalid CF-Connecting-IP header ignored: {cf_ip.strip()}")
+
+        true_client_ip = request.headers.get("True-Client-IP")
+        if true_client_ip:
+            validated_true_ip = validate_ip_address(true_client_ip.strip())
+            if validated_true_ip:
+                logger.debug(f"Using True-Client-IP from Cloudflare: {validated_true_ip}")
+                return validated_true_ip
+            logger.warning(f"Invalid True-Client-IP header ignored: {true_client_ip.strip()}")
+
+    # 3. Headers de proxy (solo si proxy es confiable)
+    is_trusted_proxy = trusted_proxies and proxy_ip and _is_trusted_proxy(proxy_ip, trusted_proxies)
+
+    if is_trusted_proxy:
+        forwarded_for = request.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+            logger.debug(f"Using X-Forwarded-For from trusted proxy: {client_ip}")
+            return validate_ip_address(client_ip)
+
+        real_ip = request.headers.get("X-Real-IP")
+        if real_ip:
+            logger.debug(f"Using X-Real-IP from trusted proxy: {real_ip.strip()}")
+            return validate_ip_address(real_ip.strip())
+
+        logger.debug(f"No proxy headers, using proxy IP: {proxy_ip}")
+        return validate_ip_address(proxy_ip)
+
+    # 4. Proxy NO confiable - usar IP directa
+    if trusted_proxies and proxy_ip:
+        logger.warning(f"Untrusted proxy {proxy_ip} sent request, ignoring forwarded headers")
+    else:
+        logger.debug(f"Using direct client IP: {proxy_ip}")
+
+    return validate_ip_address(proxy_ip)
+
+
+def get_user_agent(request: Request) -> str | None:
+    """
+    Extrae el User-Agent del request de forma segura.
+
+    Wrapper conveniente sobre validate_user_agent() que extrae el header
+    User-Agent del request y lo valida automáticamente.
+
+    Args:
+        request: Request de FastAPI
+
+    Returns:
+        str: User-Agent válido
+        None: Si User-Agent es inválido, sentinel, o ausente
+
+    Examples:
+        >>> get_user_agent(request)
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...'
+
+        >>> # Request sin User-Agent header
+        >>> get_user_agent(request)
+        None
+
+    Security Notes:
+        - Aplica validate_user_agent() automáticamente
+        - Safe para usar en production
+        - Graceful degradation (retorna None, no lanza excepciones)
+    """
+    user_agent = request.headers.get("User-Agent")
+    return validate_user_agent(user_agent)

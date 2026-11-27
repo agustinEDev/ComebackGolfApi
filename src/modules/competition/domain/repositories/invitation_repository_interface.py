@@ -1,0 +1,167 @@
+"""
+Invitation Repository Interface - Domain Layer.
+
+Define el contrato para la persistencia de invitaciones siguiendo Clean Architecture.
+"""
+
+from abc import ABC, abstractmethod
+from datetime import datetime
+
+from src.modules.competition.domain.value_objects.invitacion_pendiente import (
+    InvitacionPendiente,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+
+from ..entities.invitation import Invitation
+from ..value_objects.competition_id import CompetitionId
+from ..value_objects.invitation_id import InvitationId
+from ..value_objects.invitation_status import InvitationStatus
+
+
+class InvitationRepositoryInterface(ABC):
+    """
+    Interfaz para el repositorio de invitaciones.
+
+    Define las operaciones CRUD y consultas especificas del dominio de invitations.
+    """
+
+    @abstractmethod
+    async def add(self, invitation: Invitation) -> None:
+        """Agrega una nueva invitacion al repositorio."""
+        pass
+
+    @abstractmethod
+    async def update(self, invitation: Invitation) -> None:
+        """Actualiza una invitacion existente en el repositorio."""
+        pass
+
+    @abstractmethod
+    async def find_by_id(self, invitation_id: InvitationId) -> Invitation | None:
+        """Busca una invitacion por su ID unico."""
+        pass
+
+    @abstractmethod
+    async def find_by_id_for_update(self, invitation_id: InvitationId) -> Invitation | None:
+        """La invitacion con su fila bloqueada y releida de la base de datos.
+
+        Para decidir sobre su estado sin que otra transaccion lo cambie entre
+        medias: retirar y aceptar a la vez (BE #359). Quien la use bloquea antes
+        la competicion, siempre en ese orden, para no interbloquearse.
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_competition(
+        self,
+        competition_id: CompetitionId,
+        status: InvitationStatus | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[Invitation]:
+        """Busca invitaciones de una competicion con filtro opcional de status."""
+        pass
+
+    @abstractmethod
+    async def find_by_invitee_email(
+        self,
+        email: str,
+        status: InvitationStatus | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[Invitation]:
+        """Busca invitaciones para un email de invitado."""
+        pass
+
+    @abstractmethod
+    async def find_by_invitee_user_id(
+        self,
+        user_id: UserId,
+        status: InvitationStatus | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[Invitation]:
+        """Busca invitaciones para un user_id de invitado."""
+        pass
+
+    @abstractmethod
+    async def find_acceptable_ids(
+        self, invitation_ids: list[InvitationId], now: datetime
+    ) -> set[InvitationId]:
+        """
+        De esas, las que aun se pueden aceptar: PENDING y sin caducar en `now`
+        (la misma regla que `Invitation.is_expired`). Una sola lectura ligera,
+        sin cargar las invitaciones: lo usa el feed para no enseñar avisos de
+        invitaciones que ya no valen (22 oct 2026).
+        """
+        pass
+
+    @abstractmethod
+    async def competiciones_con_invitacion_pendiente(
+        self, user_id: UserId, email: str | None, now: datetime
+    ) -> set[CompetitionId]:
+        """
+        Las competiciones en las que tiene una invitación viva —PENDING sin
+        caducar en `now`, o en espera (ON_HOLD) de que se reabra, que no caduca
+        (15 nov 2026)—, por
+        su usuario o por su correo. Con ella, una privada se le enseña (release
+        social 2, 27 oct 2026): en espera la sigue viendo.
+        """
+        pass
+
+    @abstractmethod
+    async def pendiente_de(
+        self, user_id: UserId, email: str | None, competition_id: CompetitionId, now: datetime
+    ) -> InvitacionPendiente | None:
+        """
+        Su invitación a esa competición que aún puede aceptar (PENDING y sin
+        caducar en `now`), por su usuario o por su correo; la más reciente: su
+        id y su caducidad. Con ella acepta o rechaza desde la ficha (tabla del
+        27 oct 2026, fila 13).
+        """
+        pass
+
+    @abstractmethod
+    async def find_pending_by_competition(self, competition_id: CompetitionId) -> list[Invitation]:
+        """TODAS las invitaciones PENDING de una competicion, sin paginar (#710)."""
+        pass
+
+    @abstractmethod
+    async def find_by_competition_and_status_for_update(
+        self, competition_id: CompetitionId, status: InvitationStatus
+    ) -> list[Invitation]:
+        """
+        TODAS las de una competicion en ese estado, sin paginar y con sus filas
+        bloqueadas: rechazar una a la vez no se pisa con el cierre, la reapertura o
+        el empiece que las cambia de estado (15 nov 2026).
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_email_competition_and_status(
+        self, email: str, competition_id: CompetitionId, status: InvitationStatus
+    ) -> Invitation | None:
+        """Una invitacion a ese correo (sin mayusculas ni espacios), competicion y estado,
+        sin bloquear: para saber si ya tiene una en espera (15 nov 2026)."""
+        pass
+
+    @abstractmethod
+    async def find_pending_by_email_and_competition(
+        self, email: str, competition_id: CompetitionId
+    ) -> Invitation | None:
+        """Busca una invitacion PENDING para un email+competition especificos."""
+        pass
+
+    @abstractmethod
+    async def count_by_inviter(self, inviter_id: UserId, since: datetime) -> int:
+        """Las invitaciones que ha mandado alguien desde `since`, en cualquier competición."""
+        pass
+
+    @abstractmethod
+    async def count_by_competition(
+        self,
+        competition_id: CompetitionId,
+        status: InvitationStatus | None = None,
+        since: datetime | None = None,
+    ) -> int:
+        """Cuenta invitaciones de una competicion con filtro opcional de status y fecha."""
+        pass

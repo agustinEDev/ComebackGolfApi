@@ -1,0 +1,1261 @@
+# tests/conftest.py
+import contextlib
+import os
+import sys
+import uuid
+from collections.abc import AsyncGenerator
+from pathlib import Path
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+
+# Constants
+POSTGRESQL_PREFIX = "postgresql://"
+POSTGRESQL_ASYNC_PREFIX = "postgresql+asyncpg://"
+
+# --- Configuración Inicial del Entorno de Test ---
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+# IMPORTANTE: Configurar variables de entorno ANTES de importar la aplicación
+# para que settings.py las cargue correctamente
+os.environ["TESTING"] = "true"
+
+# Los tests NUNCA hablan con el Sentry de verdad: vacía antes de que load_dotenv lea el
+# .env local (que lleva la de producción y no pisa una variable ya puesta). El 18 nov 2026
+# un test que apagaba Sentry con init(dsn=None) le mandó los errores de prueba de los demás
+os.environ["SENTRY_DSN"] = ""
+
+# bcrypt con 4 rondas en los tests (~5 ms por hash frente a ~200 ms con las 12 de
+# producción). Lo lee src/config/contrasenas.py al instalar el hasher; antes lo
+# decidía el dominio mirando TESTING (auditoría de arquitectura del 9 nov 2026, B2)
+os.environ["BCRYPT_ROUNDS"] = "4"
+# Un coste bajo solo se admite en un desarrollo declarado; sin ENVIRONMENT, el
+# resto del código ya toma desarrollo por defecto (cookies, CORS, logging)
+os.environ.setdefault("ENVIRONMENT", "development")
+
+# Configuración de seguridad para Device Fingerprinting (v1.13.1)
+# En testing, configuramos una IP "mágica" como proxy confiable
+# que el AsyncClient simulará como su origen. Esto permite que
+# get_trusted_client_ip() confíe en headers X-Forwarded-For del testing.
+# IP ficticia: 127.0.0.1 (localhost)
+os.environ["TRUSTED_PROXIES"] = "127.0.0.1,testclient"
+
+# --- Importaciones de la Aplicación ---
+from main import app as fastapi_app
+from src.config.aviso_en_segundo_plano import espera_los_avisos_pendientes
+from src.config.database import (
+    DATABASE_URL as APP_DATABASE_URL,  # Renombramos para evitar conflicto
+    async_session_maker,
+)
+from src.config.dependencies import get_db_session, get_fabrica_de_sesiones, get_handicap_service
+from src.config.mappers import start_all_mappers
+from src.modules.user.infrastructure.persistence.sqlalchemy.mappers import (
+    metadata,
+)
+
+# Usamos la URL de la app como base, pero la sobreescribimos si es necesario
+DATABASE_URL = APP_DATABASE_URL
+if not DATABASE_URL:
+    user = os.getenv("POSTGRES_USER")
+    password = os.getenv("POSTGRES_PASSWORD")
+    db = os.getenv("POSTGRES_DB")
+    port = os.getenv("DATABASE_PORT")
+    host = "localhost"
+    DATABASE_URL = f"{POSTGRESQL_PREFIX}{user}:{password}@{host}:{port}/{db}"
+
+# ======================================================================================
+# HELPER FUNCTIONS
+# ======================================================================================
+
+
+async def seed_countries_and_adjacencies(conn) -> None:
+    """
+    Inserta países y adyacencias básicas para tests de integración.
+
+    Args:
+        conn: Conexión de SQLAlchemy (dentro de un bloque begin())
+    """
+    # Insertar países esenciales para tests
+    await conn.execute(
+        text(
+            """
+        INSERT INTO countries (code, name_en, name_es, active) VALUES
+        ('ES', 'Spain', 'España', true),
+        ('PT', 'Portugal', 'Portugal', true),
+        ('FR', 'France', 'Francia', true),
+        ('IT', 'Italy', 'Italia', true),
+        ('DE', 'Germany', 'Alemania', true),
+        ('GB', 'United Kingdom', 'Reino Unido', true),
+        ('US', 'United States', 'Estados Unidos', true),
+        ('AD', 'Andorra', 'Andorra', true),
+        ('JP', 'Japan', 'Japón', true)
+        ON CONFLICT (code) DO NOTHING;
+    """
+        )
+    )
+
+    # Insertar adyacencias básicas
+    await conn.execute(
+        text(
+            """
+        INSERT INTO country_adjacencies (country_code_1, country_code_2) VALUES
+        ('ES', 'PT'), ('PT', 'ES'),
+        ('ES', 'FR'), ('FR', 'ES'),
+        ('ES', 'AD'), ('AD', 'ES'),
+        ('FR', 'IT'), ('IT', 'FR'),
+        ('FR', 'DE'), ('DE', 'FR'),
+        ('FR', 'AD'), ('AD', 'FR')
+        ON CONFLICT (country_code_1, country_code_2) DO NOTHING;
+    """
+        )
+    )
+
+
+# ======================================================================================
+# HOOKS DE CONFIGURACIÓN GLOBAL DE PYTEST
+# ======================================================================================
+
+
+def pytest_configure(config):
+    """
+    Se ejecuta una vez por cada proceso trabajador al inicio.
+    Utilizamos un truco para asegurar que los mappers se inicien solo una vez
+    en el proceso principal cuando se usa pytest-xdist.
+    """
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+
+    # Solo el proceso maestro (master) o una ejecución sin xdist inicializará los mappers
+    if worker_id is None or worker_id == "master":
+        print(
+            f"\n🧪 Iniciando tests del Comeback Golf - {ahora_utc_sin_zona().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        print("🚀 Inicializando mappers de SQLAlchemy...")
+        start_all_mappers()  # Los mismos que la aplicación y Alembic (#565)
+        # Marcamos que los mappers ya fueron iniciados para evitar reinicialización
+        config.mappers_initialized = True
+
+    # Si los mappers ya fueron iniciados por el maestro, no hacemos nada en los workers
+    elif hasattr(config, "mappers_initialized") and config.mappers_initialized:
+        # Mappers already initialized by master process, skip initialization
+        return
+
+    # Fallback por si un worker arranca sin que el maestro haya terminado
+    else:
+        # Son idempotentes: un fallo aquí es un error de mapeo de verdad (#565)
+        start_all_mappers()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Se ejecuta al final de la sesión de tests."""
+    if exitstatus == 0:
+        print("✅ Todos los tests pasaron correctamente!")
+    else:
+        print(f"❌ Algunos tests fallaron. Código de salida: {exitstatus}")
+
+
+# ======================================================================================
+# FIXTURE PARA TESTS UNITARIOS (SIN BASE DE DATOS)
+# ======================================================================================
+
+
+@pytest_asyncio.fixture(scope="function")
+async def unit_client() -> AsyncGenerator[AsyncClient, None]:
+    """
+    Fixture para tests unitarios que NO requieren base de datos.
+
+    Crea un cliente HTTP para probar middlewares, handlers y lógica
+    que no depende de persistencia. Ideal para tests unitarios puros.
+
+    Uso:
+        async def test_middleware(unit_client: AsyncClient):
+            response = await unit_client.get("/health")
+            assert response.status_code == 200
+    """
+    from fastapi import FastAPI
+
+    from src.shared.infrastructure.http.correlation_middleware import (
+        CorrelationMiddleware,
+    )
+
+    # Crear una app mínima solo con middlewares (sin BD)
+    minimal_app = FastAPI()
+    minimal_app.add_middleware(CorrelationMiddleware)
+
+    # Endpoint simple para testing
+    @minimal_app.get("/test")
+    async def test_endpoint():
+        return {"status": "ok"}
+
+    async with AsyncClient(transport=ASGITransport(app=minimal_app), base_url="http://test") as ac:
+        yield ac
+
+
+# ======================================================================================
+# FIXTURE PRINCIPAL PARA TESTS DE INTEGRACIÓN
+# ======================================================================================
+
+
+def _sin_la_rfeg_de_verdad() -> None:
+    """
+    La RFEG de la app de prueba es el mock, salvo que el test ya ponga el suyo.
+
+    La real falla al azar (429 si se le pregunta mucho, 500 a ratos), y la consultan
+    el registro de un jugador de España, generar los partidos y poner el hándicap
+    con `/handicaps/update`; el último lo convierte en un 503 que tumba el test (CI
+    de develop del 17 oct 2026). Con `setdefault`, los tests que ponen su propio mock
+    antes de pedir el cliente lo conservan.
+    """
+    from tests.fakes.mock_handicap_service import (
+        MockHandicapService,
+    )
+
+    fastapi_app.dependency_overrides.setdefault(
+        get_handicap_service, lambda: MockHandicapService(default=None)
+    )
+
+
+# Lo más que se espera al trabajo en segundo plano de un test antes de soltar su BD
+_ESPERA_MAXIMA_DEL_SEGUNDO_PLANO_S = 30
+
+
+async def _suelta_la_bd_de_test(admin_engine, test_engine, db_name: str) -> None:
+    """
+    La limpieza de la BD de un test: espera a los avisos en segundo plano, cierra los
+    motores, borra la BD y quita las sustituciones de la app.
+
+    Los avisos (el de nuevo inicio de sesión y el de intentos fallidos, BE #737 y #732)
+    no los espera el login y abren su propia sesión con la fábrica que el fixture
+    sustituye: si el test acababa antes que ellos, `DROP DATABASE` encontraba su
+    conexión abierta y fallaba con ObjectInUseError, a ratos en el CI (BE #781).
+    Esperar es lo limpio: terminar sus conexiones o `DROP ... WITH (FORCE)` escondería
+    un aviso colgado y lo dejaría fallar contra una BD que ya no existe.
+
+    Si la espera agota su tope, la limpieza se intenta igual (el motor, la BD y las
+    sustituciones no se quedan para el test siguiente) y sale el TimeoutError con los
+    avisos pendientes, no el error del DROP que provocan.
+    """
+    from src.config.aviso_en_segundo_plano import espera_los_avisos_pendientes
+
+    agotada: TimeoutError | None = None
+    try:
+        await espera_los_avisos_pendientes(tope_s=_ESPERA_MAXIMA_DEL_SEGUNDO_PLANO_S)
+    except TimeoutError as error:
+        agotada = error
+    try:
+        try:
+            await test_engine.dispose()
+        finally:
+            try:
+                async with admin_engine.connect() as conn:
+                    await conn.execute(text(f"DROP DATABASE {db_name}"))
+            finally:
+                await admin_engine.dispose()
+                fastapi_app.dependency_overrides.clear()
+    except Exception as error:
+        if agotada is not None:
+            raise agotada from error
+        raise
+    if agotada is not None:
+        raise agotada
+
+
+@pytest_asyncio.fixture(scope="function")
+async def client() -> AsyncGenerator[AsyncClient, None]:
+    """
+    Fixture principal para tests de integración. Garantiza una base de datos
+    limpia y aislada para CADA test, incluso en ejecuciones paralelas.
+    """
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    # Usar UUID único para cada test para evitar colisiones
+    unique_id = str(uuid.uuid4())[:8]
+    db_name = f"test_db_{worker_id}_{unique_id}"
+
+    # URL base para conectarse a PostgreSQL (sin la base de datos específica)
+    db_url_base = DATABASE_URL.rsplit("/", 1)[0]
+    if db_url_base.startswith(POSTGRESQL_PREFIX):
+        db_url_base = db_url_base.replace(POSTGRESQL_PREFIX, POSTGRESQL_ASYNC_PREFIX, 1)
+
+    # URL para la base de datos de test específica
+    test_db_url = f"{db_url_base}/{db_name}"
+
+    # Motor para crear/eliminar la base de datos
+    engine = create_async_engine(f"{db_url_base}/postgres", isolation_level="AUTOCOMMIT")
+    async with engine.connect() as conn:
+        await conn.execute(text(f"DROP DATABASE IF EXISTS {db_name}"))
+        await conn.execute(text(f"CREATE DATABASE {db_name}"))
+    await engine.dispose()
+
+    # Motor conectado a la base de datos de test
+    test_engine = create_async_engine(test_db_url)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+        await seed_countries_and_adjacencies(conn)
+
+    test_session_local = async_sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    async def override_get_db_session() -> AsyncGenerator[AsyncSession, None]:
+        async with test_session_local() as session:
+            yield session
+
+    fastapi_app.dependency_overrides[get_db_session] = override_get_db_session
+    # Lo que corre fuera de la petición (el aviso de nuevo inicio, BE #737), también
+    fastapi_app.dependency_overrides[get_fabrica_de_sesiones] = lambda: test_session_local
+    _sin_la_rfeg_de_verdad()
+
+    # Publicada para los tests que necesitan comprobar que algo se PERSISTIO:
+    # cualquier ruta que lea la competicion puede abrirla ella misma, asi que un
+    # assert contra la API no distingue «se guardo» de «se acaba de abrir otra
+    # vez en memoria» (BE #331)
+    _URL_DE_LA_BD_DE_TEST["url"] = test_db_url
+
+    # Generar ID único para este test (evita colisiones con rate limiter)
+    test_client_id = f"test-{uuid.uuid4()}"
+
+    transport = ASGITransport(app=fastapi_app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers={"X-Test-Client-ID": test_client_id},  # IP simulada única por test
+    ) as ac:
+        yield ac
+
+    await _suelta_la_bd_de_test(engine, test_engine, db_name)
+
+
+# ======================================================================================
+# FIXTURES DE DATOS PARA TESTS
+# ======================================================================================
+
+
+@pytest.fixture(scope="session")
+def sample_user_data() -> dict:
+    """Fixture con datos de ejemplo para un usuario."""
+    return {
+        "name": "Agustín",
+        "surname": "Estévez",
+        "email": "agustin.estevez@example.com",
+    }
+
+
+@pytest.fixture(scope="session")
+def multiple_users_data() -> list[dict]:
+    """Fixture con datos para múltiples usuarios."""
+    return [
+        {"name": "Carlos", "surname": "García", "email": "carlos.garcia@test.com"},
+        {"name": "Ana", "surname": "Martínez", "email": "ana.martinez@test.com"},
+        {"name": "Luis", "surname": "Rodríguez", "email": "luis.rodriguez@test.com"},
+    ]
+
+
+@pytest.fixture(scope="session")
+def invalid_user_data() -> dict:
+    """Fixture con datos de un usuario inválido (email incorrecto)."""
+    return {
+        "name": "Usuario",
+        "surname": "Inválido",
+        "email": "email-invalido",
+    }
+
+
+@pytest_asyncio.fixture(scope="function")
+async def db_session() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Fixture que proporciona una sesión de BD asíncrona y aislada para cada test,
+    usando una base de datos temporal específica para tests.
+    """
+    # Crear una base de datos temporal para este test específico
+    import uuid
+
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    test_id = str(uuid.uuid4())[:8]
+    db_name = f"test_db_session_{worker_id}_{test_id}"
+
+    # URL base para conectarse a PostgreSQL (sin la base de datos específica)
+    db_url_base = DATABASE_URL.rsplit("/", 1)[0]
+    if db_url_base.startswith(POSTGRESQL_PREFIX):
+        db_url_base = db_url_base.replace(POSTGRESQL_PREFIX, POSTGRESQL_ASYNC_PREFIX, 1)
+
+    # URL para la base de datos de test específica
+    test_db_url = f"{db_url_base}/{db_name}"
+
+    # Motor para crear/eliminar la base de datos temporal
+    admin_engine = create_async_engine(f"{db_url_base}/postgres", isolation_level="AUTOCOMMIT")
+    async with admin_engine.connect() as conn:
+        await conn.execute(text(f"CREATE DATABASE {db_name}"))
+    await admin_engine.dispose()
+
+    # Motor conectado a la base de datos de test
+    engine = create_async_engine(test_db_url)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+        await seed_countries_and_adjacencies(conn)
+
+    test_session_local = async_sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    async with test_session_local() as session:
+        yield session
+
+    # Limpieza: eliminar la base de datos temporal completa
+    await engine.dispose()
+
+    admin_engine = create_async_engine(f"{db_url_base}/postgres", isolation_level="AUTOCOMMIT")
+    async with admin_engine.connect() as conn:
+        await conn.execute(text(f"DROP DATABASE {db_name}"))
+    await admin_engine.dispose()
+
+
+# ======================================================================================
+# AUTHENTICATION HELPERS FOR INTEGRATION TESTS
+# ======================================================================================
+
+
+@pytest_asyncio.fixture
+async def authenticated_client(client: AsyncClient) -> tuple[AsyncClient, dict]:
+    """
+    Fixture que proporciona un cliente autenticado con un token JWT válido.
+
+    Returns:
+        Tuple con (client, user_data) donde user_data incluye el token de acceso
+    """
+    # Configurar headers HTTP válidos para Device Fingerprinting (v1.13.1)
+    # Sin estos headers, la validación de IP/User-Agent rechazará los valores sentinel
+    client.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TestClient/1.0",
+            "X-Forwarded-For": "203.0.113.100",  # IP pública válida (TEST-NET-3 RFC 5737)
+        }
+    )
+
+    # Registrar un usuario. Con género: sin él no puede crear ni apuntarse a
+    # ninguna competición (#710)
+    user_data = {
+        "email": "testuser@example.com",
+        "password": "TestPass123!",
+        "first_name": "Test",
+        "last_name": "User",
+        "gender": "MALE",
+        # Sin aceptar los Términos no hay alta (y sin ellos, 403 en todo)
+        "accept_terms": True,
+    }
+
+    register_response = await client.post("/api/v1/auth/register", json=user_data)
+    assert register_response.status_code == 201
+    # Verificado, como un usuario normal: sin eso no crea competiciones ni invita (B-17)
+    await sql_en_la_bd_de_test(
+        "update users set email_verified = true where email = :e", e=user_data["email"]
+    )
+
+    # Hacer login para obtener el token
+    login_data = {"email": user_data["email"], "password": user_data["password"]}
+
+    login_response = await client.post("/api/v1/auth/login", json=login_data)
+    assert login_response.status_code == 200
+    # Verificado, su login lanza el aviso de nuevo inicio en segundo plano: se espera
+    # aquí, para que sus lecturas no caigan dentro de lo que mida el test (B-17)
+    await espera_los_avisos_pendientes()
+
+    # El token llega solo en la cookie (2.58.0), y el cliente ya la guarda
+    access_token = login_response.cookies["access_token"]
+    user_info = login_response.json()["user"]
+
+    return client, {"token": access_token, "user": user_info, "credentials": user_data}
+
+
+async def create_authenticated_user(
+    client: AsyncClient,
+    email: str,
+    password: str,
+    first_name: str,
+    last_name: str,
+    gender: str | None = "MALE",
+    *,
+    verificar: bool = True,
+) -> dict:
+    """
+    Helper para crear un usuario y obtener sus cookies de autenticación.
+
+    Simula el flujo real de producción donde el frontend usa HTTPOnly cookies
+    en lugar de headers Authorization.
+
+    Args:
+        client: Cliente HTTP de testing
+        email: Email del usuario
+        password: Contraseña del usuario
+        first_name: Nombre
+        last_name: Apellido
+        gender: Con género por defecto: sin él no se puede apuntar a ninguna
+            competición (#710). None para probar a quien no lo tiene
+        verificar: Con el correo verificado por defecto: sin él no puede crear
+            competiciones, pedir amistad ni invitar (B-17). False para probar a
+            quien no lo ha verificado
+
+    Returns:
+        Dict con 'cookies', 'token' (legacy), 'user'
+    """
+    # Registrar usuario (con client ID único para evitar rate limit 3/hour)
+    user_data = {
+        "email": email,
+        "password": password,
+        "first_name": first_name,
+        "last_name": last_name,
+        # Sin aceptar los Términos no hay alta (y sin ellos, 403 en todo)
+        "accept_terms": True,
+    }
+    if gender is not None:
+        user_data["gender"] = gender
+
+    register_response = await client.post(
+        "/api/v1/auth/register",
+        json=user_data,
+        headers={"X-Test-Client-ID": f"register-{uuid.uuid4()}"},
+    )
+    assert register_response.status_code == 201
+    if verificar:
+        await sql_en_la_bd_de_test(
+            "update users set email_verified = true where email = :e", e=email
+        )
+
+    # Login (con client ID único para evitar rate limit 5/minute)
+    login_response = await client.post(
+        "/api/v1/auth/login",
+        json={"email": email, "password": password},
+        headers={"X-Test-Client-ID": f"login-{uuid.uuid4()}"},
+    )
+    assert login_response.status_code == 200
+    # Verificado, su login lanza el aviso de nuevo inicio en segundo plano: se espera
+    # aquí, para que sus lecturas no caigan dentro de lo que mida el test (B-17)
+    await espera_los_avisos_pendientes()
+
+    # El access token, de su cookie: ya no viene en el cuerpo (2.58.0)
+    token = login_response.cookies["access_token"]
+    user_info = login_response.json()["user"]
+
+    # Capturar cookies HTTPOnly del response (como lo haría el navegador)
+    cookies = dict(login_response.cookies)
+
+    # Limpiar cookies del cliente para evitar conflictos entre usuarios
+    client.cookies.clear()
+
+    return {
+        "cookies": cookies,
+        "token": token,  # Mantener por compatibilidad
+        "user": user_info,
+    }
+
+
+def set_auth_cookies(client: AsyncClient, cookies: dict) -> None:
+    """
+    Helper para establecer cookies de autenticación en el cliente.
+
+    Evita el DeprecationWarning de httpx al usar cookies= en cada request.
+    Usar antes de requests autenticadas en tests.
+
+    Args:
+        client: Cliente HTTP de testing
+        cookies: Dict de cookies de autenticación
+
+    Example:
+        set_auth_cookies(client, user["cookies"])
+        response = await client.get("/api/v1/protected")
+    """
+    client.cookies.clear()
+    client.cookies.update(cookies)
+
+
+async def get_user_by_email(client: AsyncClient, email: str):
+    """
+    Helper para obtener un usuario desde la base de datos por email.
+    Útil para tests que necesitan acceder al usuario completo con su estado interno.
+
+    Args:
+        client: Cliente HTTP de testing
+        email: Email del usuario a buscar
+
+    Returns:
+        User: Entidad de usuario encontrada
+
+    Raises:
+        AssertionError: Si el usuario no existe
+    """
+    from src.config.dependencies import (
+        get_db_session,
+    )
+    from src.modules.user.domain.value_objects.email import Email
+    from src.modules.user.infrastructure.persistence.sqlalchemy.user_repository import (
+        SQLAlchemyUserRepository,
+    )
+
+    # Obtener la sesión DB desde el override del cliente
+    # El override está configurado en el fixture client()
+    db_session_override = fastapi_app.dependency_overrides.get(get_db_session)
+    if db_session_override is None:
+        raise RuntimeError(
+            "get_db_session no tiene override - el test debe usar el fixture client()"
+        )
+
+    # Usar la sesión overrideada
+    # IMPORTANTE: Usar async with para asegurar que la sesión se cierra correctamente
+    async for session in db_session_override():
+        try:
+            repo = SQLAlchemyUserRepository(session)
+            email_vo = Email(email)
+            user = await repo.find_by_email(email_vo)
+            assert user is not None, f"Usuario con email {email} no encontrado"
+            return user
+        finally:
+            # Cerrar la sesión explícitamente para liberar la conexión
+            await session.close()
+
+    # Este punto nunca debería alcanzarse
+    raise RuntimeError("No se pudo obtener sesión DB")
+
+
+# ======================================================================================
+# MOCK AUTOMÁTICO DE SERVICIOS EXTERNOS (EMAIL Y TOKEN)
+# ======================================================================================
+# Para tests de integración, mockeamos los servicios en src.config.dependencies para evitar
+# llamadas reales a Mailgun y mantener los tests rápidos y sin límites de API.
+
+
+@pytest.fixture(autouse=True)
+def mock_external_services():
+    """
+    Mock automático de servicios externos para todos los tests.
+
+    Mockea:
+    - EmailService: Para evitar envíos reales a Mailgun
+    - Los tests unitarios usan sus propios mocks
+    - Los tests de integración usan estos mocks via src.config.dependencies
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    # Mock para EmailService
+    mock_email = MagicMock()
+    # Asíncrono desde BE #148 (7 nov 2026), como los demás
+    mock_email.send_verification_email = AsyncMock(return_value=True)
+    # El aviso de nuevo inicio de sesión se espera con await (BE #737)
+    mock_email.send_new_login_notification = AsyncMock(return_value=True)
+    # Y el de intentos fallidos (BE #732)
+    mock_email.send_failed_logins_notification = AsyncMock(return_value=True)
+    # Y los del restablecimiento, que también se esperan (#749: el primer test de
+    # integración que completa uno)
+    mock_email.send_password_reset_email = AsyncMock(return_value=True)
+    mock_email.send_password_changed_notification = AsyncMock(return_value=True)
+    # Y los del cambio de correo pendiente (#749)
+    mock_email.send_email_change_confirmation = AsyncMock(return_value=True)
+    mock_email.send_email_change_requested_notice = AsyncMock(return_value=True)
+    # Y los avisos de BE #753: sin esto el await fallaba y el aviso lo tragaba en silencio
+    mock_email.send_email_changed_notice = AsyncMock(return_value=True)
+    mock_email.send_account_secured_notice = AsyncMock(return_value=True)
+    mock_email.send_google_account_notice = AsyncMock(return_value=True)
+    # Y el aviso al dueño de un intento de registro con su correo (fase 3, B2)
+    mock_email.send_register_attempt_notice = AsyncMock(return_value=True)
+    # Y el de la sesión cerrada por seguridad (F-02, robo de un refresh token)
+    mock_email.send_session_closed_for_security_notice = AsyncMock(return_value=True)
+
+    # Patchear la clase donde la crean los proveedores de correo (src.config.dependencies.comun)
+    _CORREO_DEL_TEST["mock"] = mock_email
+    with patch(RUTA_DEL_SERVICIO_DE_CORREO, return_value=mock_email):
+        yield mock_email
+    _CORREO_DEL_TEST.pop("mock", None)
+
+
+# Dónde se parchea el correo: los tres servicios de correo y el lanzador de actualizaciones lo
+# crean en `comun` (src.config.dependencies es un paquete desde la fase 5)
+RUTA_DEL_SERVICIO_DE_CORREO = "src.config.dependencies.comun.EmailService"
+
+# El mock de correo del test en curso: de él salen los tokens en claro de los enlaces,
+# que la BD ya no guarda (fase 3, solo su SHA-256)
+_CORREO_DEL_TEST: dict = {}
+
+
+async def token_de_verificacion_enviado(email: str) -> str:
+    """El token del último correo de verificación enviado a `email` (en claro).
+
+    Espera antes a los correos en segundo plano: el del registro sale así (fase 3).
+    """
+    from src.config.aviso_en_segundo_plano import espera_los_avisos_pendientes
+
+    await espera_los_avisos_pendientes(tope_s=10)
+    llamadas = [
+        c
+        for c in _CORREO_DEL_TEST["mock"].send_verification_email.await_args_list
+        if c.kwargs.get("to_email", c.args[0] if c.args else None) == email
+    ]
+    assert llamadas, f"No se envió ningún correo de verificación a {email}"
+    ultima = llamadas[-1]
+    return ultima.kwargs.get("verification_token") or ultima.args[2]
+
+
+async def token_de_reset_enviado(email: str) -> str:
+    """El token del último enlace de restablecer enviado a `email` (en claro).
+
+    Espera antes a los correos en segundo plano: el de restablecer sale así (fase 3).
+    """
+    from src.config.aviso_en_segundo_plano import espera_los_avisos_pendientes
+
+    await espera_los_avisos_pendientes(tope_s=10)
+    llamadas = [
+        c
+        for c in _CORREO_DEL_TEST["mock"].send_password_reset_email.await_args_list
+        if c.kwargs.get("to_email") == email
+    ]
+    assert llamadas, f"No se envió ningún enlace de restablecer a {email}"
+    return llamadas[-1].kwargs["reset_link"].rsplit("/", 1)[1]
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limits():
+    """
+    Cada test empieza con los contadores del rate limit a cero.
+
+    Los contadores por red los separa el X-Test-Client-ID único de cada test, pero
+    los de email (login, forgot-password) y los de usuario no (BE #273): dos
+    tests con el mismo email se pisarían dentro del mismo minuto.
+    """
+    from src.config.cupo_de_avisos import cupo_de_avisos
+    from src.config.cupo_de_contacto import cupo_de_contacto
+    from src.config.freno_del_login import freno_del_login
+    from src.config.rate_limit import limiter
+
+    # Y el freno del login por correo + red (BE #732), que vive aparte
+    limiter.reset()
+    freno_del_login.reinicia()
+    cupo_de_avisos.reinicia()
+    cupo_de_contacto.reinicia()
+    yield
+    limiter.reset()
+    freno_del_login.reinicia()
+    cupo_de_avisos.reinicia()
+    cupo_de_contacto.reinicia()
+
+
+# ======================================================================================
+# COMPETITION MODULE FIXTURES
+# ======================================================================================
+
+
+@pytest.fixture(scope="session")
+def sample_competition_data() -> dict:
+    """Fixture con datos de ejemplo para una competición."""
+    from datetime import timedelta
+
+    start = ahora_utc_sin_zona().date() + timedelta(days=30)
+    end = start + timedelta(days=3)
+
+    return {
+        "name": "Ryder Cup Test 2025",
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "main_country": "ES",
+        "adjacent_country_1": None,
+        "adjacent_country_2": None,
+        "play_mode": "HANDICAP",
+        "max_players": 24,
+        "team_assignment": "MANUAL",
+        "visibility": "PUBLIC",
+    }
+
+
+async def create_competition(
+    client: AsyncClient, cookies: dict, competition_data: dict | None = None
+) -> dict:
+    """
+    Helper para crear una competición.
+
+    Args:
+        client: Cliente HTTP de testing
+        cookies: Cookies HTTPOnly de autenticación
+        competition_data: Datos de la competición (opcional)
+
+    Returns:
+        Dict con los datos de la competición creada
+    """
+    import uuid
+    from datetime import timedelta
+
+    if competition_data is None:
+        start = ahora_utc_sin_zona().date() + timedelta(days=30)
+        end = start + timedelta(days=3)
+        competition_data = {
+            "name": f"Test Competition {uuid.uuid4().hex[:8]}",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "main_country": "ES",
+            "play_mode": "HANDICAP",
+            "max_players": 24,
+            "team_assignment": "MANUAL",
+            # Publica a proposito: la mayoria de los tests que usan este helper
+            # van de otra cosa —inscribirse, anotar, listar— y con el valor por
+            # defecto de produccion (PRIVATE, BE #318) un desconocido no podria
+            # ni pedir plaza. Que nace privada lo cubren los tests de #318
+            "visibility": "PUBLIC",
+        }
+
+    # Establecer cookies en el cliente (evita DeprecationWarning de httpx)
+    client.cookies.clear()
+    client.cookies.update(cookies)
+
+    response = await client.post("/api/v1/competitions", json=competition_data)
+    assert response.status_code == 201, f"Failed to create competition: {response.text}"
+    return response.json()
+
+
+async def create_draft_competition(client: AsyncClient, cookies: dict) -> dict:
+    """Helper para crear una competición que todavía espera su hora.
+
+    Desde BE #332 una competición nace con las inscripciones abiertas, y la
+    única que sigue en DRAFT es la que tiene apertura programada. Los tests de
+    transiciones necesitan esa, porque son las que todavía pueden activarse.
+    """
+    import uuid
+    from datetime import timedelta
+
+    start = ahora_utc_sin_zona().date() + timedelta(days=30)
+    return await create_competition(
+        client,
+        cookies,
+        {
+            "name": f"Torneo programado {uuid.uuid4().hex[:8]}",
+            "start_date": start.isoformat(),
+            "end_date": (start + timedelta(days=3)).isoformat(),
+            "main_country": "ES",
+            "play_mode": "SCRATCH",
+            "enrollment_opens_days_before": 5,
+        },
+    )
+
+
+# Lo rellena la fixture `client` con la base de datos de ESTE test, que lleva el
+# id del worker de xdist: no hay una URL fija que se pueda leer del entorno
+_URL_DE_LA_BD_DE_TEST: dict[str, str] = {}
+
+
+async def sql_en_la_bd_de_test(sentencia: str, **parametros):
+    """Ejecuta SQL (con commit) en la BD del test, con la sesión que usa la app."""
+    override = fastapi_app.dependency_overrides[get_db_session]
+    # Cerrado al salir, no cuando lo recoja el GC: la sesión no se queda abierta
+    async with contextlib.aclosing(override()) as sesiones:
+        async for sesion in sesiones:
+            resultado = await sesion.execute(text(sentencia), parametros)
+            await sesion.commit()
+            return resultado
+    return None
+
+
+@pytest_asyncio.fixture
+async def sesion_como_en_produccion(client: AsyncClient) -> AsyncGenerator[None, None]:
+    """
+    Las peticiones con una sesión configurada como la de producción.
+
+    La de `client` va con `autoflush=False` y la de producción con el autoflush
+    por defecto: lo que dependa del orden en que el autoflush manda las
+    sentencias (los choques con un índice único que solo crea la migración) no
+    se ve sin esto.
+    """
+    motor = create_async_engine(_URL_DE_LA_BD_DE_TEST["url"])
+    fabrica = async_sessionmaker(**{**async_session_maker.kw, "bind": motor})
+
+    async def sesion() -> AsyncGenerator[AsyncSession, None]:
+        async with fabrica() as abierta:
+            yield abierta
+
+    anterior = fastapi_app.dependency_overrides[get_db_session]
+    fastapi_app.dependency_overrides[get_db_session] = sesion
+    try:
+        yield
+    finally:
+        fastapi_app.dependency_overrides[get_db_session] = anterior
+        await motor.dispose()
+
+
+async def estado_en_bd(competition_id: str) -> str | None:
+    """Lee el estado de una competición directamente de la base de datos."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(_URL_DE_LA_BD_DE_TEST["url"])
+    try:
+        async with engine.connect() as conn:
+            fila = await conn.execute(
+                text("SELECT status FROM competitions WHERE id = :id"),
+                {"id": competition_id},
+            )
+            encontrada = fila.first()
+            return encontrada[0] if encontrada else None
+    finally:
+        await engine.dispose()
+
+
+async def solicitud_pendiente(client: AsyncClient, competition_id: str, **cuerpo) -> dict:
+    """Una solicitud pendiente (REQUESTED) de quien tiene la sesión en el cliente.
+
+    Desde la release social 3 (28 oct 2026) en una pública se entra directamente
+    y la API ya no crea solicitudes. Aprobar, rechazar y cancelar siguen
+    existiendo para las que quedaran: aquí se entra y se devuelve a REQUESTED
+    en la base de datos, como una de antes.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    respuesta = await client.post(
+        f"/api/v1/competitions/{competition_id}/enrollments",
+        # Sin barra general no se entra (H1, 22 nov 2026)
+        json={"tee_color": "YELLOW", **cuerpo},
+    )
+    assert respuesta.status_code == 201, respuesta.text
+    inscripcion = respuesta.json()
+    engine = create_async_engine(_URL_DE_LA_BD_DE_TEST["url"])
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE enrollments SET status = 'REQUESTED' WHERE id = :id"),
+                {"id": inscripcion["id"]},
+            )
+    finally:
+        await engine.dispose()
+    return {**inscripcion, "status": "REQUESTED"}
+
+
+async def inscrito_por_invitacion(
+    client: AsyncClient, organizador_cookies: dict, competition_id: str, jugador: dict
+) -> dict:
+    """El organizador invita a `jugador` y él acepta: queda inscrito (APPROVED).
+
+    Desde el 15 nov 2026 (B-02) el organizador ya no inscribe a nadie directamente:
+    solo invita. Es lo que usan los montajes que antes llamaban a
+    `/enrollments/direct`. Devuelve la respuesta de aceptar (con `enrollment_id`)
+    y deja en el cliente la sesión del organizador, como estaba.
+    """
+    set_auth_cookies(client, organizador_cookies)
+    enviada = await client.post(
+        f"/api/v1/competitions/{competition_id}/invitations",
+        json={"invitee_user_id": jugador["user"]["id"]},
+    )
+    assert enviada.status_code == 201, enviada.text
+    set_auth_cookies(client, jugador["cookies"])
+    aceptada = await client.post(
+        f"/api/v1/invitations/{enviada.json()['id']}/respond", json={"action": "ACCEPT"}
+    )
+    assert aceptada.status_code == 200, aceptada.text
+    set_auth_cookies(client, organizador_cookies)
+    return aceptada.json()
+
+
+async def activate_competition(client: AsyncClient, cookies: dict, competition_id: str) -> dict:
+    """Helper para dejar una competición con las inscripciones abiertas.
+
+    Desde BE #332 una competición nace ya ACTIVE salvo que se le den días de
+    apertura, así que activar solo hace falta cuando todavía está esperando su
+    hora. Se comprueba el estado en vez de activar a ciegas: llamar a `/activate`
+    sobre una ya abierta es un 400, y los tests que solo quieren una competición
+    abierta no deberían tener que saber cómo nació.
+    """
+    # Establecer cookies en el cliente (evita DeprecationWarning de httpx)
+    client.cookies.clear()
+    client.cookies.update(cookies)
+
+    actual = await client.get(f"/api/v1/competitions/{competition_id}")
+    assert actual.status_code == 200, f"Failed to read competition: {actual.text}"
+    if actual.json()["status"] != "DRAFT":
+        return actual.json()
+
+    response = await client.post(f"/api/v1/competitions/{competition_id}/activate")
+    assert response.status_code == 200, f"Failed to activate competition: {response.text}"
+    return response.json()
+
+
+# ======================================================================================
+# GOLF COURSE MODULE FIXTURES
+# ======================================================================================
+
+
+@pytest.fixture(scope="session")
+def sample_golf_course_data() -> dict:
+    """Fixture con datos de ejemplo para un campo de golf."""
+    return {
+        "name": "Real Club de Golf El Prat",
+        "country_code": "ES",
+        "course_type": "STANDARD_18",
+        "tees": [
+            {
+                "identifier": "Blanco",
+                "color": "WHITE",
+                "tee_gender": "MALE",
+                "course_rating": 72.5,
+                "slope_rating": 135,
+                "par": 72,
+            },
+            {
+                "identifier": "Amarillo",
+                "color": "YELLOW",
+                "tee_gender": "MALE",
+                "course_rating": 70.8,
+                "slope_rating": 130,
+                "par": 72,
+            },
+        ],
+        "holes": [
+            {"hole_number": 1, "par": 4, "stroke_index": 5},
+            {"hole_number": 2, "par": 3, "stroke_index": 17},
+            {"hole_number": 3, "par": 5, "stroke_index": 1},
+            {"hole_number": 4, "par": 4, "stroke_index": 9},
+            {"hole_number": 5, "par": 4, "stroke_index": 7},
+            {"hole_number": 6, "par": 4, "stroke_index": 3},
+            {"hole_number": 7, "par": 3, "stroke_index": 15},
+            {"hole_number": 8, "par": 5, "stroke_index": 11},
+            {"hole_number": 9, "par": 4, "stroke_index": 13},
+            {"hole_number": 10, "par": 4, "stroke_index": 6},
+            {"hole_number": 11, "par": 3, "stroke_index": 18},
+            {"hole_number": 12, "par": 5, "stroke_index": 2},
+            {"hole_number": 13, "par": 4, "stroke_index": 10},
+            {"hole_number": 14, "par": 4, "stroke_index": 8},
+            {"hole_number": 15, "par": 4, "stroke_index": 4},
+            {"hole_number": 16, "par": 3, "stroke_index": 16},
+            {"hole_number": 17, "par": 5, "stroke_index": 12},
+            {"hole_number": 18, "par": 4, "stroke_index": 14},
+        ],
+    }
+
+
+async def create_golf_course(
+    client: AsyncClient, cookies: dict, golf_course_data: dict | None = None
+) -> dict:
+    """
+    Helper para crear (solicitar) un campo de golf.
+
+    Args:
+        client: Cliente HTTP de testing
+        cookies: Cookies HTTPOnly de autenticación
+        golf_course_data: Datos del campo (opcional)
+
+    Returns:
+        Dict con los datos del campo creado (estado PENDING_APPROVAL)
+    """
+    import uuid
+
+    if golf_course_data is None:
+        golf_course_data = {
+            "name": f"Test Golf Course {uuid.uuid4().hex[:8]}",
+            "country_code": "ES",
+            "course_type": "STANDARD_18",
+            "tees": [
+                {
+                    "identifier": "Blanco",
+                    "color": "WHITE",
+                    "tee_gender": "MALE",
+                    "course_rating": 72.5,
+                    "slope_rating": 135,
+                    "par": 72,
+                },
+                {
+                    "identifier": "Amarillo",
+                    "color": "YELLOW",
+                    "tee_gender": "MALE",
+                    "course_rating": 70.2,
+                    "slope_rating": 128,
+                    "par": 72,
+                },
+            ],
+            "holes": [{"hole_number": i, "par": 4, "stroke_index": i} for i in range(1, 19)],
+        }
+
+    # Establecer cookies en el cliente (evita DeprecationWarning de httpx)
+    client.cookies.clear()
+    client.cookies.update(cookies)
+
+    response = await client.post("/api/v1/golf-courses/request", json=golf_course_data)
+    assert response.status_code == 201, f"Failed to create golf course: {response.text}"
+    return response.json()
+
+
+async def approve_golf_course(
+    client: AsyncClient, admin_cookies: dict, golf_course_id: str
+) -> dict:
+    """Helper para aprobar un campo de golf (Admin only)."""
+    client.cookies.clear()
+    client.cookies.update(admin_cookies)
+
+    response = await client.put(f"/api/v1/golf-courses/admin/{golf_course_id}/approve")
+    assert response.status_code == 200, f"Failed to approve golf course: {response.text}"
+    return response.json()
+
+
+async def reject_golf_course(
+    client: AsyncClient, admin_cookies: dict, golf_course_id: str, reason: str
+) -> dict:
+    """Helper para rechazar un campo de golf (Admin only)."""
+    client.cookies.clear()
+    client.cookies.update(admin_cookies)
+
+    response = await client.put(
+        f"/api/v1/golf-courses/admin/{golf_course_id}/reject", params={"reason": reason}
+    )
+    assert response.status_code == 200, f"Failed to reject golf course: {response.text}"
+    return response.json()
+
+
+async def create_admin_user(
+    client: AsyncClient, email: str, password: str, first_name: str, last_name: str
+) -> dict:
+    """
+    Helper para crear un usuario administrador para tests de integración.
+
+    Args:
+        client: Cliente HTTP de testing
+        email: Email del admin
+        password: Contraseña del admin
+        first_name: Nombre
+        last_name: Apellido
+
+    Returns:
+        Dict con 'cookies', 'token', 'user' del administrador
+    """
+    from sqlalchemy import text
+
+    # 1. Crear usuario normalmente
+    admin_data = await create_authenticated_user(client, email, password, first_name, last_name)
+
+    # 2. Marcar usuario como admin directamente en BD (usando la sesión del test client)
+    # IMPORTANTE: Usamos app.dependency_overrides para obtener la misma sesión DB
+    # que usa el test client (worker-isolated database en pytest-xdist)
+    from main import app
+    from src.config.dependencies import get_db_session
+
+    db_session_override = app.dependency_overrides.get(get_db_session)
+
+    # Validar que el override existe (requiere client fixture con database_override)
+    if db_session_override is None:
+        raise RuntimeError(
+            "Database session override not found. "
+            "Ensure the 'client' fixture with database_override is set up before calling create_admin_user."
+        )
+
+    async for session in db_session_override():
+        try:
+            await session.execute(
+                text("UPDATE users SET is_admin = TRUE WHERE id = :user_id"),
+                {"user_id": admin_data["user"]["id"]},
+            )
+            await session.commit()
+        except Exception:
+            # Rollback on any error before re-raising
+            await session.rollback()
+            raise
+        finally:
+            # Always close the session
+            await session.close()
+
+    # 3. Re-autenticar para obtener nuevo token JWT con is_admin=True
+    login_response = await client.post(
+        "/api/v1/auth/login",
+        json={"email": email, "password": password},
+        headers={"X-Test-Client-ID": f"admin-login-{uuid.uuid4()}"},
+    )
+    assert login_response.status_code == 200
+
+    # Actualizar con el nuevo token y cookies que incluyen is_admin=True
+    admin_data["token"] = login_response.cookies["access_token"]
+    admin_data["user"] = login_response.json()["user"]
+    admin_data["cookies"] = dict(login_response.cookies)
+
+    return admin_data
+
+
+async def add_one_session(client: AsyncClient, cookies: dict, competition: dict) -> dict:
+    """Una sesión en la competición: sin ninguna no se puede iniciar (#710, 25 sep).
+
+    Un campo aprobado, añadido a la competición, y una sesión el día de inicio
+    (en un stroke play, una franja de 9:00 a 11:00).
+    Devuelve la sesión creada.
+    """
+    admin = await create_admin_user(
+        client, f"admin-{uuid.uuid4()}@test.com", "P@ssw0rd123!", "Admin", "Sesion"
+    )
+    campo = await create_golf_course(client, cookies)
+    await approve_golf_course(client, admin["cookies"], campo["id"])
+    set_auth_cookies(client, cookies)
+    anadido = await client.post(
+        f"/api/v1/competitions/{competition['id']}/golf-courses",
+        json={"golf_course_id": campo["id"]},
+    )
+    assert anadido.status_code == 201, anadido.text
+    datos = {
+        "golf_course_id": campo["id"],
+        "round_date": competition["start_date"],
+        "session_type": "MORNING",
+    }
+    # En un Stableford o un Medal, una franja con su hoja de salidas (#251)
+    if competition.get("tournament_type", "RYDER_CUP") != "RYDER_CUP":
+        datos["tee_sheet"] = {
+            "first_tee_time": "09:00",
+            "last_tee_time": "11:00",
+            "interval_minutes": 10,
+            "group_size": 4,
+        }
+    else:
+        datos["match_format"] = "SINGLES"
+    sesion = await client.post(f"/api/v1/competitions/{competition['id']}/rounds", json=datos)
+    assert sesion.status_code == 201, sesion.text
+    return sesion.json()
+
+
+async def plaza_para_todos(client: AsyncClient, cookies: dict, competition: dict) -> None:
+    """Coloca, como organizador, a cada aprobado sin franja en la primera franja (#251).
+
+    Sin franja no se cierran las inscripciones de un Stableford o un Medal. Si la
+    competición no tiene franjas, añade una con `add_one_session`. En una Ryder, nada.
+    """
+    if competition.get("tournament_type", "RYDER_CUP") == "RYDER_CUP":
+        return
+    set_auth_cookies(client, cookies)
+    calendario = (await client.get(f"/api/v1/competitions/{competition['id']}/schedule")).json()
+    franjas = [r for d in calendario.get("days", []) for r in d["rounds"] if r.get("tee_sheet")]
+    if not franjas:
+        await add_one_session(client, cookies, competition)
+        set_auth_cookies(client, cookies)
+        calendario = (await client.get(f"/api/v1/competitions/{competition['id']}/schedule")).json()
+        franjas = [r for d in calendario["days"] for r in d["rounds"] if r.get("tee_sheet")]
+    con_plaza = {u for f in franjas for u in f["tee_sheet"]["player_ids"]}
+    inscritos = (
+        await client.get(f"/api/v1/competitions/{competition['id']}/enrollments?status=APPROVED")
+    ).json()
+    for inscrito in inscritos:
+        if inscrito["user_id"] in con_plaza:
+            continue
+        respuesta = await client.post(
+            f"/api/v1/competitions/rounds/{franjas[0]['id']}/places",
+            json={"user_id": inscrito["user_id"]},
+        )
+        assert respuesta.status_code == 201, respuesta.text
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _log_de_seguridad_propio(tmp_path_factory):
+    """Cada proceso de pytest escribe el log de seguridad en su propio fichero, vacío al
+    empezar: ningún otro worker lo rota ni escribe en él (BE #529)."""
+    from src.shared.infrastructure.logging import security_logger as modulo
+
+    modulo._security_logger_instance = modulo.SecurityLogger(
+        log_dir=tmp_path_factory.mktemp("security_log")
+    )
+    yield modulo._security_logger_instance.log_dir

@@ -1,0 +1,185 @@
+"""
+El cableado de los avisos de horario (G): cada caso de uso que mueve salidas
+recibe el publicador de Actividad, y los que no avisan no lo reciben.
+
+Sin esto, un proveedor que se olvide el publicador deja el aviso mudo sin que
+ningun test de caso de uso lo note: ellos montan el suyo a mano.
+"""
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from src.config import dependencies as d
+from src.modules.competition.application.use_cases.partidas_use_case import VerPartidasUseCase
+
+PUBLICADOR = object()
+
+
+def _uows():
+    uow = MagicMock()
+    gc_uow = MagicMock()
+    user_uow = MagicMock()
+    return {"uow": uow, "gc_uow": gc_uow, "user_uow": user_uow}
+
+
+def _publicador_de(caso_de_uso):
+    return caso_de_uso._actividad._publisher
+
+
+@pytest.mark.parametrize(
+    ("proveedor", "extra"),
+    [
+        (d.get_generar_partidas_use_case, {"jugadores": MagicMock()}),
+        (d.get_mover_jugador_de_partida_use_case, {"jugadores": MagicMock()}),
+        (d.get_reordenar_partidas_use_case, {}),
+        (d.get_borrar_partidas_use_case, {}),
+    ],
+)
+def test_stroke_play_groups_get_the_publisher(proveedor, extra):
+    caso = proveedor(**_uows(), **extra, actividad=PUBLICADOR)
+
+    assert _publicador_de(caso) is PUBLICADOR
+
+
+def test_viewing_the_groups_does_not_need_it():
+    caso = d.get_ver_partidas_use_case(**_uows(), amigos=MagicMock(), eventos=MagicMock())
+
+    assert isinstance(caso, VerPartidasUseCase)
+
+
+def test_viewing_the_groups_knows_the_viewer_s_friends():
+    """Release social 2: los que aún no tienen partida, según los amigos de quien mira."""
+    amigos = MagicMock()
+
+    caso = d.get_ver_partidas_use_case(**_uows(), amigos=amigos, eventos=MagicMock())
+
+    assert caso._amigos is amigos
+
+
+def test_viewing_groups_and_schedule_know_the_viewer_s_key():
+    """Tabla del 27 oct 2026: de una privada, la partida de un amigo con evento."""
+    eventos = MagicMock()
+
+    partidas = d.get_ver_partidas_use_case(**_uows(), amigos=MagicMock(), eventos=eventos)
+    agenda = d.get_get_schedule_use_case(
+        **_uows(),
+        scoring_service=MagicMock(),
+        actividad=MagicMock(),
+        amigos=MagicMock(),
+        eventos=eventos,
+    )
+
+    assert partidas._eventos is eventos
+    assert agenda._eventos is eventos
+
+
+def test_the_key_comes_from_the_social_activity():
+    from src.modules.social.infrastructure.adapters.eventos_de_amigos_adapter import (
+        EventosDeAmigosAdapter,
+    )
+
+    social_uow, user_uow = MagicMock(), MagicMock()
+
+    eventos = d.get_eventos_de_amigos(social_uow=social_uow, user_uow=user_uow)
+
+    assert isinstance(eventos, EventosDeAmigosAdapter)
+    assert eventos._social_uow is social_uow
+    assert eventos._user_uow is user_uow
+
+
+@pytest.mark.parametrize(
+    ("proveedor", "extra"),
+    [
+        (d.get_ver_anotacion_de_partida_use_case, {"gc_uow": MagicMock(), "user_uow": MagicMock()}),
+        (d.get_clasificacion_de_la_franja_use_case, {"user_uow": MagicMock()}),
+        (d.get_clasificacion_general_use_case, {"user_uow": MagicMock()}),
+        (d.get_clasificacion_scratch_use_case, {"user_uow": MagicMock()}),
+        (d.get_get_match_detail_use_case, {}),
+        (
+            d.get_get_scoring_view_use_case,
+            {"gc_uow": MagicMock(), "user_uow": MagicMock(), "scoring_service": MagicMock()},
+        ),
+        (d.get_get_leaderboard_use_case, {"user_uow": MagicMock(), "scoring_service": MagicMock()}),
+    ],
+)
+def test_what_was_played_is_gated_with_the_key(proveedor, extra):
+    """PR 2 (27 oct 2026): la puerta de lo jugado va en cada caso de uso, con su llave."""
+    eventos = MagicMock()
+
+    caso = proveedor(uow=MagicMock(), eventos=eventos, **extra)
+
+    assert caso._eventos is eventos
+
+
+def test_update_round_reopen_and_take_a_place():
+    uows = _uows()
+    ronda = d.get_update_round_use_case(
+        uow=uows["uow"],
+        gc_uow=uows["gc_uow"],
+        jugadores=MagicMock(),
+        reloj=lambda: None,
+        actividad=PUBLICADOR,
+    )
+    reabrir = d.get_reopen_enrollments_use_case(
+        uow=uows["uow"], gc_uow=uows["gc_uow"], actividad=PUBLICADOR
+    )
+    plaza = d.get_coger_plaza_use_case(uow=uows["uow"], gc_uow=uows["gc_uow"], actividad=PUBLICADOR)
+
+    assert _publicador_de(ronda) is PUBLICADOR
+    assert _publicador_de(reabrir) is PUBLICADOR
+    assert _publicador_de(plaza) is PUBLICADOR
+
+
+def test_ryder_matches_by_hand_reassigning_and_resetting():
+    uows = _uows()
+    generar = d.get_generate_matches_use_case(
+        **uows,
+        scoring_service=MagicMock(),
+        handicap_service=MagicMock(),
+        actividad=PUBLICADOR,
+    )
+    reasignar = d.get_reassign_match_players_use_case(
+        **uows, scoring_service=MagicMock(), actividad=PUBLICADOR
+    )
+    rehacer = d.get_reset_envelopes_use_case(
+        uow=uows["uow"], user_uow=uows["user_uow"], actividad=PUBLICADOR
+    )
+
+    assert _publicador_de(generar) is PUBLICADOR
+    assert _publicador_de(reasignar) is PUBLICADOR
+    assert _publicador_de(rehacer) is PUBLICADOR
+
+
+@pytest.mark.parametrize(
+    "proveedor",
+    [
+        d.get_submit_envelope_use_case,
+        d.get_envelopes_use_case,
+        d.get_reveal_envelopes_use_case,
+    ],
+)
+def test_opening_the_envelopes_generates_with_the_publisher(proveedor):
+    caso = proveedor(**_uows(), scoring_service=MagicMock(), actividad=PUBLICADOR)
+
+    assert _publicador_de(caso._desk._generador) is PUBLICADOR
+
+
+def test_the_schedule_opens_them_with_the_publisher_too():
+    caso = d.get_get_schedule_use_case(**_uows(), scoring_service=MagicMock(), actividad=PUBLICADOR)
+
+    assert _publicador_de(caso._sobres._generador) is PUBLICADOR
+
+
+def test_no_show_and_withdrawal_tell_who_is_moved():
+    """G3, 22 oct: quien se recoloca por un no presentado o una baja recibe su aviso."""
+    uows = _uows()
+    no_presentado = d.get_marcar_no_presentado_use_case(
+        uow=uows["uow"], gc_uow=uows["gc_uow"], reloj=lambda: None, actividad=PUBLICADOR
+    )
+    baja = d.get_withdraw_enrollment_use_case(
+        uow=uows["uow"], gc_uow=uows["gc_uow"], actividad=PUBLICADOR
+    )
+
+    assert _publicador_de(no_presentado) is PUBLICADOR
+    assert _publicador_de(baja) is PUBLICADOR

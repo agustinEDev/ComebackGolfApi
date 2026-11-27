@@ -1,0 +1,552 @@
+"""
+Competition Repository - SQLAlchemy Implementation.
+
+Implementación concreta del repositorio de competiciones usando SQLAlchemy async.
+"""
+
+from collections.abc import Sequence
+from datetime import date, datetime
+
+from sqlalchemy import DateTime, and_, cast, func, inspect, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import class_mapper, selectinload
+
+from src.modules.competition.domain.entities.competition import Competition
+from src.modules.competition.domain.entities.competition_golf_course import (
+    CompetitionGolfCourse,
+)
+from src.modules.competition.domain.repositories.competition_repository_interface import (
+    CompetitionRepositoryInterface,
+)
+from src.modules.competition.domain.value_objects.campo_de_la_competicion import (
+    CampoDeLaCompeticion,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.competition_name import (
+    CompetitionName,
+)
+from src.modules.competition.domain.value_objects.competition_status import (
+    CompetitionStatus,
+)
+from src.modules.competition.domain.value_objects.visibility import Visibility
+from src.modules.competition.infrastructure.persistence.sqlalchemy.mappers import (
+    competition_golf_courses_table,
+    competitions_table,
+)
+from src.modules.golf_course.domain.entities.golf_course import GolfCourse
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.infrastructure.persistence.leidos_en_la_sesion import (
+    recordar,
+    sin_cargar,
+    ya_leido,
+)
+
+# Fuera del rango de cualquier orden real, como la fase 1 de reordenar en el dominio
+_DESPLAZAMIENTO_DEL_ORDEN = 10000
+
+
+class SQLAlchemyCompetitionRepository(CompetitionRepositoryInterface):
+    """
+    Implementación asíncrona del repositorio de competiciones con SQLAlchemy.
+
+    Sigue el patrón Repository establecido en el módulo User.
+    Maneja la persistencia de la entidad Competition usando async/await.
+    """
+
+    def __init__(self, session: AsyncSession):
+        """
+        Constructor del repositorio.
+
+        Args:
+            session: Sesión asíncrona de SQLAlchemy
+        """
+        self._session = session
+
+    async def add(self, competition: Competition) -> None:
+        """
+        Agrega una nueva competición al repositorio.
+
+        SQLAlchemy marcará el objeto para INSERT en el próximo flush/commit.
+
+        Args:
+            competition: Entidad Competition a guardar
+
+        Note:
+            El commit se maneja en el Unit of Work, no aquí.
+        """
+        self._session.add(competition)
+
+    async def update(self, competition: Competition) -> None:
+        """
+        Actualiza una competición existente.
+
+        SQLAlchemy detecta automáticamente los cambios en objetos trackeados.
+        Si el objeto no está en la sesión, lo mergeamos.
+
+        Args:
+            competition: Entidad Competition con datos actualizados
+        """
+        await self._aparta_el_orden_de_los_que_cambian(competition)
+        self._session.add(competition)
+
+    async def _aparta_el_orden_de_los_que_cambian(self, competition: Competition) -> None:
+        """
+        Al quitar un campo, aparta en BD el orden del quitado y de los que se renumeran.
+
+        Quitar un campo que no es el último renumera los que quedan (1..n sin
+        huecos), y SQLAlchemy manda esos UPDATE antes que el DELETE del huérfano:
+        el índice único (competition_id, display_order), que solo crea la
+        migración, los rechazaba (500). Entre los renumerados también se
+        pisarían, según en qué orden salgan sus UPDATE. Así que antes del flush
+        se desplazan todos ellos a valores altos, que no chocan con nada; el
+        flush deja luego a cada uno en su número final y borra el quitado.
+        Sin autoflush: si no, el propio execute mandaría antes los UPDATE.
+        """
+        estado = inspect(competition)
+        if estado is None or not estado.persistent:
+            return
+        retirados = list(estado.attrs._golf_courses.history.deleted)
+        if not retirados:
+            return
+        movidos = [
+            campo.id
+            for campo in competition._golf_courses
+            if inspect(campo).persistent
+            and inspect(campo).attrs._display_order.history.has_changes()
+        ]
+        tabla = competition_golf_courses_table
+        with self._session.no_autoflush:
+            await self._session.execute(
+                update(tabla)
+                .where(tabla.c.id.in_([campo.id for campo in retirados] + movidos))
+                .values(display_order=tabla.c.display_order + _DESPLAZAMIENTO_DEL_ORDEN)
+            )
+
+    async def delete(self, competition_id: CompetitionId) -> bool:
+        """
+        Elimina una competición físicamente del repositorio.
+
+        Args:
+            competition_id: ID de la competición a eliminar
+
+        Returns:
+            bool: True si se eliminó, False si no existía
+        """
+        competition = await self.find_by_id(competition_id)
+        if competition:
+            await self._session.delete(competition)
+            return True
+        return False
+
+    async def find_by_id(self, competition_id: CompetitionId) -> Competition | None:
+        """
+        Busca una competición por su ID único.
+
+        Eager loads the golf_courses relationship and nested golf_course entities.
+
+        Args:
+            competition_id: ID de la competición
+
+        Returns:
+            Optional[Competition]: La competición encontrada o None
+        """
+        # Ya entera en la sesión: la consulta devolvería este mismo objeto, con
+        # el estado que tiene (BE #375), y costaba cuatro sentencias (PR 2)
+        if (ya := self._entera_en_la_sesion(competition_id)) is not None:
+            return ya
+        stmt = (
+            select(Competition)
+            .where(Competition._id == competition_id)
+            .options(*self._agregado_completo())
+        )
+        result = await self._session.execute(stmt)
+        competition = result.scalar_one_or_none()
+        if competition is not None:
+            recordar(self._session, Competition, competition_id, competition)
+        return competition
+
+    def _entera_en_la_sesion(self, competition_id: CompetitionId) -> Competition | None:
+        """
+        La competición si la sesión ya la tiene con su agregado entero (sus
+        campos y sus salidas). A medias —de un listado— no: tocar los campos
+        dispararía una carga perezosa en asíncrono (`MissingGreenlet`).
+        """
+        ya = ya_leido(self._session, Competition, competition_id, ("_golf_courses",))
+        if ya is None:
+            return None
+        for enlace in ya.golf_courses:
+            if "golf_course" in sin_cargar(enlace):
+                return None
+            campo = enlace.golf_course
+            if campo is not None and "_tees" in sin_cargar(campo):
+                return None
+        return ya
+
+    async def find_by_id_for_update(self, competition_id: CompetitionId) -> Competition | None:
+        """
+        Busca una competición por su ID con bloqueo de fila (SELECT ... FOR UPDATE).
+
+        Trae el agregado entero, igual que `find_by_id` (BE #370). Sin los campos,
+        preguntarle a la competición por ellos disparaba una carga perezosa dentro
+        de código asíncrono (`MissingGreenlet`): pasó en crear, configurar y
+        cambiar sesiones. El bloqueo es solo de la fila de la competición; los
+        campos llegan en consultas aparte (`selectinload`).
+
+        Args:
+            competition_id: ID de la competición
+
+        Returns:
+            Optional[Competition]: La competición encontrada o None
+        """
+        # `populate_existing` no es un adorno: sin el, SQLAlchemy devuelve el
+        # objeto que la sesion ya tenia, con el estado de ANTES del bloqueo, y
+        # quien comprueba tras bloquear decide con datos viejos (revision de la
+        # BE #375: un golpe pisaba una reapertura). Mismo patron que los partidos
+        stmt = (
+            select(Competition)
+            .where(Competition._id == competition_id)
+            .options(*self._agregado_completo())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def _agregado_completo():
+        """Los campos de la competición y sus salidas (los hoyos cuelgan de ellas)."""
+        return (
+            selectinload(Competition._golf_courses)
+            .selectinload(CompetitionGolfCourse.golf_course)
+            .options(selectinload(GolfCourse._tees)),
+        )
+
+    async def campos_de(
+        self, competition_ids: Sequence[CompetitionId]
+    ) -> dict[CompetitionId, list[CampoDeLaCompeticion]]:
+        """Una consulta para todas, solo con las columnas: sin hidratar los campos
+        (sus salidas y sus hoyos se cargan con ellos)."""
+        if not competition_ids:
+            return {}
+        enlaces = competition_golf_courses_table
+        # La tabla del campo, sacada de su mapeo: sin importar la infraestructura
+        # de otro módulo. Sus columnas convierten a los VOs como las entidades
+        campos_t = class_mapper(GolfCourse).local_table
+        stmt = (
+            select(
+                enlaces.c.competition_id,
+                campos_t.c.id,
+                campos_t.c.name,
+                campos_t.c.country_code,
+                campos_t.c.timezone,
+            )
+            .join(campos_t, campos_t.c.id == enlaces.c.golf_course_id)
+            .where(enlaces.c.competition_id.in_(list(competition_ids)))
+            .order_by(enlaces.c.competition_id, enlaces.c.display_order)
+        )
+        result = await self._session.execute(stmt)
+        campos: dict[CompetitionId, list[CampoDeLaCompeticion]] = {}
+        for competition_id, golf_course_id, nombre, pais, zona in result.all():
+            campos.setdefault(competition_id, []).append(
+                CampoDeLaCompeticion(golf_course_id, nombre, pais, zona)
+            )
+        return campos
+
+    async def find_by_creator(
+        self, creator_id: UserId, limit: int = 100, offset: int = 0
+    ) -> list[Competition]:
+        """
+        Busca todas las competiciones creadas por un usuario.
+
+        Args:
+            creator_id: ID del usuario creador
+            limit: Número máximo de resultados (paginación)
+            offset: Número de resultados a saltar (paginación)
+
+        Returns:
+            List[Competition]: Lista de competiciones del creador
+        """
+        statement = (
+            select(Competition)
+            .where(Competition._creator_id == creator_id)
+            .order_by(Competition._created_at.desc())  # Más recientes primero
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_status(
+        self, status: CompetitionStatus, limit: int = 100, offset: int = 0
+    ) -> list[Competition]:
+        """
+        Busca todas las competiciones con un estado específico.
+
+        Args:
+            status: Estado de la competición (enum)
+            limit: Número máximo de resultados
+            offset: Número de resultados a saltar
+
+        Returns:
+            List[Competition]: Lista de competiciones con el estado especificado
+
+        Note:
+            Usamos el atributo privado _status_value porque status es un composite.
+        """
+        statement = (
+            select(Competition)
+            .where(Competition._status_value == status.value)
+            .order_by(Competition._created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_active_starting_by(self, first_day: date, last_day: date) -> list[Competition]:
+        """Las ACTIVE que empiezan entre esos dias, para el cierre por el plazo."""
+        tabla = competitions_table.c
+        statement = select(Competition).where(
+            Competition._status_value == CompetitionStatus.ACTIVE.value,
+            tabla.start_date >= first_day,
+            tabla.start_date <= last_day,
+            or_(
+                tabla.enrollment_opened_at.is_(None),
+                tabla.enrollment_opened_at < cast(tabla.start_date, DateTime),
+            ),
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_active_without_opening_time(self) -> list[Competition]:
+        """Las ACTIVE sin fecha de apertura (de la release anterior), para apuntarla."""
+        statement = select(Competition).where(
+            Competition._status_value == CompetitionStatus.ACTIVE.value,
+            competitions_table.c.enrollment_opened_at.is_(None),
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def exists_with_name(
+        self,
+        name: CompetitionName,
+        creator_id: UserId,
+        except_id: CompetitionId | None = None,
+    ) -> bool:
+        """
+        Verifica si existe una competición con el nombre especificado para un creador.
+
+        Previene duplicados del mismo creador con el mismo nombre.
+
+        Args:
+            name: Nombre de la competición (Value Object)
+            creator_id: ID del usuario creador
+
+        Returns:
+            bool: True si existe, False si no existe
+
+        Note:
+            Usamos _name_value (atributo privado) porque name es un composite.
+        """
+        statement = (
+            select(func.count())
+            .select_from(Competition)
+            .where(
+                and_(
+                    # Sin distinguir mayúsculas: el nombre se guarda tal cual (#540).
+                    # Las dos minúsculas las hace Postgres: no depende de su ctype
+                    func.lower(Competition._name_value) == func.lower(name.value),
+                    Competition._creator_id == creator_id,
+                )
+            )
+        )
+        if except_id is not None:
+            statement = statement.where(Competition._id != except_id)
+        result = await self._session.execute(statement)
+        return result.scalar_one() > 0
+
+    async def find_all(self, limit: int = 100, offset: int = 0) -> list[Competition]:
+        """
+        Obtiene todas las competiciones con paginación.
+
+        Args:
+            limit: Número máximo de resultados (paginación)
+            offset: Número de resultados a saltar (paginación)
+
+        Returns:
+            List[Competition]: Lista de todas las competiciones
+        """
+        statement = (
+            select(Competition)
+            .order_by(Competition._created_at.desc())  # Más recientes primero
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def count_all(self) -> int:
+        """Cuenta el total de competiciones en el sistema."""
+        statement = select(func.count()).select_from(Competition)
+        result = await self._session.execute(statement)
+        return result.scalar_one()
+
+    async def count_by_creator(self, creator_id: UserId) -> int:
+        """
+        Cuenta el total de competiciones creadas por un usuario.
+
+        Args:
+            creator_id: ID del usuario creador
+
+        Returns:
+            int: Número total de competiciones
+        """
+        statement = (
+            select(func.count())
+            .select_from(Competition)
+            .where(Competition._creator_id == creator_id)
+        )
+        result = await self._session.execute(statement)
+        return result.scalar_one()
+
+    async def find_by_filters(
+        self,
+        search_name: str | None = None,
+        search_creator: str | None = None,
+        status: CompetitionStatus | None = None,
+        creator_id: UserId | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Competition]:
+        """
+        Busca competiciones aplicando múltiples filtros opcionales.
+
+        Implementa búsqueda case-insensitive con ILIKE, escapando `%` y `_` para
+        que se busquen como letras:
+        - search_name: Busca en competition.name
+        - search_creator: Busca en creator.first_name OR creator.last_name OR creator.alias
+
+        Args:
+            search_name: Texto a buscar en nombre de competición
+            search_creator: Texto a buscar en nombre del creador
+            status: Filtrar por estado
+            creator_id: Filtrar por creador específico
+            limit: Máximo de resultados
+            offset: Saltar N resultados
+
+        Returns:
+            List[Competition]: Competiciones que cumplen los criterios
+        """
+        # Import here to avoid circular dependency with User module
+        from src.modules.user.domain.entities.user import User  # noqa: PLC0415
+
+        # Construir query base
+        query = select(Competition)
+
+        # Si hay búsqueda por creador, necesitamos hacer JOIN con User
+        if search_creator:
+            query = query.join(User, Competition._creator_id == User._id)
+
+        # Lista de condiciones WHERE
+        conditions = []
+
+        # Filtro: search_name (búsqueda parcial case-insensitive). Con
+        # `icontains(..., autoescape=True)`, como las ramas del creador de abajo, y
+        # no `ilike(f"%{x}%")`: un `%` o un `_` tecleados se buscan como letras en
+        # vez de casar con todo (F-16). Las mayúsculas las compara PostgreSQL (ILIKE)
+        # a los dos lados, no Python en uno y LOWER en el otro (/code-review)
+        if search_name:
+            conditions.append(Competition._name_value.icontains(search_name, autoescape=True))
+
+        # Filtro: search_creator (búsqueda en first_name OR last_name OR alias)
+        #
+        # El texto va SIN `strip()` a propósito: con `search_creator="  "` la
+        # condición de arriba es cierta —no es cadena vacía— y recortarlo
+        # dejaría un `contains("")`, que casa con TODO. Es decir, buscar dos
+        # espacios devolvería la lista entera en vez de nada. Tal cual llega,
+        # se busca «  » y no casa nada, que es lo que hacía antes.
+        #
+        # Las tres ramas usan `icontains(..., autoescape=True)` y no
+        # `ilike(f"%{x}%")`: aquel interpolaba el texto tecleado dentro del
+        # patrón, así que un `%` devolvía todas las competiciones y un `_`
+        # casaba con cualquier carácter. Las dos primeras venían ya así y se
+        # arreglan aquí en vez de añadir una tercera con el mismo fallo.
+        #
+        # Para las cuentas sin alias, NULL ILIKE ... es NULL: no casan por esa
+        # rama, pero siguen entrando por las otras dos.
+        if search_creator:
+            conditions.append(
+                or_(
+                    User._first_name.icontains(search_creator, autoescape=True),
+                    User._last_name.icontains(search_creator, autoescape=True),
+                    User._alias.icontains(search_creator, autoescape=True),  # type: ignore[union-attr]
+                )
+            )
+
+        # Apply filter: competition status
+        if status:
+            conditions.append(Competition._status_value == status.value)
+
+        # Apply filter: creator user ID
+        if creator_id:
+            conditions.append(Competition._creator_id == creator_id)
+
+        # Aplicar condiciones si existen
+        if conditions:
+            query = query.where(and_(*conditions))
+
+        # Ordenar y paginar
+        query = query.order_by(Competition._created_at.desc()).limit(limit).offset(offset)
+
+        # Ejecutar query
+        result = await self._session.execute(query)
+        return list(result.scalars().all())
+
+    async def find_status_mark(
+        self, competition_id: CompetitionId
+    ) -> tuple[CompetitionStatus, datetime] | None:
+        """Dos columnas leidas ahora: la cache de la sesion no puede dar un estado viejo."""
+        tabla = competitions_table.c
+        fila = (
+            await self._session.execute(
+                select(tabla.status, tabla.updated_at).where(tabla.id == competition_id)
+            )
+        ).first()
+        return None if fila is None else (CompetitionStatus(fila[0]), fila[1])
+
+    async def find_visibilities(
+        self, competition_ids: list[CompetitionId]
+    ) -> dict[CompetitionId, Visibility]:
+        """Solo el id y la visibilidad: sin el agregado ni sus `selectinload`."""
+        if not competition_ids:
+            return {}
+        tabla = competitions_table.c
+        stmt = select(tabla.id, tabla.visibility).where(tabla.id.in_(competition_ids))
+        result = await self._session.execute(stmt)
+        return {fila[0]: fila[1] for fila in result.all()}
+
+    async def find_by_ids(self, competition_ids: list[CompetitionId]) -> list[Competition]:
+        """Esas competiciones enteras, como `find_by_id`, en una sola consulta."""
+        if not competition_ids:
+            return []
+        stmt = (
+            select(Competition)
+            .where(Competition._id.in_(competition_ids))
+            .options(*self._agregado_completo())
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def find_ids_with_status(
+        self, competition_ids: list[CompetitionId], status: CompetitionStatus
+    ) -> list[CompetitionId]:
+        """Solo los ids, filtrados por estado en la base, en orden de id (R1)."""
+        if not competition_ids:
+            return []
+        tabla = competitions_table.c
+        result = await self._session.execute(
+            select(tabla.id)
+            .where(tabla.id.in_(competition_ids), tabla.status == status.value)
+            .order_by(tabla.id)
+        )
+        return list(result.scalars().all())

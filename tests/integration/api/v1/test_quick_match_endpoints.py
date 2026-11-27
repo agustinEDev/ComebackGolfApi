@@ -1,0 +1,1434 @@
+"""
+Tests E2E para Quick Match Endpoints.
+
+Tests de integración que verifican el flujo completo de partidas rapidas
+incluyendo autenticación, validaciones y persistencia.
+"""
+
+import pytest
+from httpx import AsyncClient
+
+from tests.conftest import (
+    approve_golf_course,
+    create_admin_user,
+    create_authenticated_user,
+    create_golf_course,
+    set_auth_cookies,
+)
+
+
+async def _make_friends(client: AsyncClient, a: dict, b: dict) -> None:
+    """Helper: crea una amistad ACCEPTED entre dos usuarios via la API."""
+    set_auth_cookies(client, a["cookies"])
+    send_response = await client.post(
+        "/api/v1/friends/requests", json={"addressee_id": b["user"]["id"]}
+    )
+    assert send_response.status_code == 201, send_response.text
+    friendship_id = send_response.json()["id"]
+
+    set_auth_cookies(client, b["cookies"])
+    respond_response = await client.post(
+        f"/api/v1/friends/requests/{friendship_id}/respond", json={"action": "ACCEPT"}
+    )
+    assert respond_response.status_code == 200, respond_response.text
+
+
+async def _create_approved_golf_course(client: AsyncClient, admin: dict, creator: dict) -> str:
+    course = await create_golf_course(client, creator["cookies"])
+    await approve_golf_course(client, admin["cookies"], course["id"])
+    return course["id"]
+
+
+class TestCreateQuickMatch:
+    """Tests para POST /api/v1/quick-matches"""
+
+    @pytest.mark.asyncio
+    async def test_create_success(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin1@test.com", "P@ssw0rd123!", "Admin", "One"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator1@test.com", "P@ssw0rd123!", "Creator", "One"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "PENDING"
+        assert len(data["participants"]) == 1
+        assert data["scorer_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_create_with_name_round_trips(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_name@test.com", "P@ssw0rd123!", "Admin", "Name"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_name@test.com", "P@ssw0rd123!", "Creator", "Name"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={
+                "golf_course_id": golf_course_id,
+                "match_format": "SINGLES",
+                "name": "  Viernes con Rafa  ",
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["name"] == "Viernes con Rafa"
+
+        quick_match_id = response.json()["id"]
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        assert detail_response.status_code == 200
+        assert detail_response.json()["name"] == "Viernes con Rafa"
+
+    @pytest.mark.asyncio
+    async def test_create_without_name_returns_null(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_noname@test.com", "P@ssw0rd123!", "Admin", "NoName"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_noname@test.com", "P@ssw0rd123!", "Creator", "NoName"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["name"] is None
+
+    @pytest.mark.asyncio
+    async def test_create_with_name_over_max_length_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_long@test.com", "P@ssw0rd123!", "Admin", "Long"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_long@test.com", "P@ssw0rd123!", "Creator", "Long"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={
+                "golf_course_id": golf_course_id,
+                "match_format": "SINGLES",
+                "name": "a" * 101,
+            },
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_create_with_unapproved_course_returns_422(self, client: AsyncClient):
+        creator = await create_authenticated_user(
+            client, "qm_creator2@test.com", "P@ssw0rd123!", "Creator", "Two"
+        )
+        course = await create_golf_course(client, creator["cookies"])
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": course["id"], "match_format": "SINGLES"},
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_create_without_any_format_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_noformat@test.com", "P@ssw0rd123!", "Admin", "NoFormat"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_noformat@test.com", "P@ssw0rd123!", "Creator", "NoFormat"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches", json={"golf_course_id": golf_course_id}
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_create_with_both_formats_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_bothformat@test.com", "P@ssw0rd123!", "Admin", "BothFormat"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_bothformat@test.com", "P@ssw0rd123!", "Creator", "BothFormat"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={
+                "golf_course_id": golf_course_id,
+                "match_format": "SINGLES",
+                "scoring_format": "MEDAL",
+            },
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_create_free_play_success(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_freeplay@test.com", "P@ssw0rd123!", "Admin", "FreePlay"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_freeplay@test.com", "P@ssw0rd123!", "Creator", "FreePlay"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "scoring_format": "STABLEFORD"},
+        )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["match_format"] is None
+        assert data["scoring_format"] == "STABLEFORD"
+        assert data["participants"][0]["team"] is None
+
+
+class TestQuickMatchTeeAndAllowance:
+    """Playing Handicap: tee por participante + allowance % personalizable por el creador."""
+
+    @pytest.mark.asyncio
+    async def test_default_effective_allowance_by_format(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_allowance@test.com", "P@ssw0rd123!", "Admin", "Allowance"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_allowance@test.com", "P@ssw0rd123!", "Creator", "Allowance"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "FOURBALL"},
+        )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["allowance_percentage"] is None
+        assert data["effective_allowance"] == 90  # WHS default para FOURBALL
+
+    @pytest.mark.asyncio
+    async def test_custom_allowance_overrides_default(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_customallow@test.com", "P@ssw0rd123!", "Admin", "CustomAllow"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_customallow@test.com", "P@ssw0rd123!", "Creator", "CustomAllow"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={
+                "golf_course_id": golf_course_id,
+                "match_format": "SINGLES",
+                "allowance_percentage": 80,
+            },
+        )
+
+        assert response.status_code == 201
+        data = response.json()
+        assert data["allowance_percentage"] == 80
+        assert data["effective_allowance"] == 80
+
+    @pytest.mark.asyncio
+    async def test_allowance_not_multiple_of_five_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_badallow@test.com", "P@ssw0rd123!", "Admin", "BadAllow"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_badallow@test.com", "P@ssw0rd123!", "Creator", "BadAllow"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={
+                "golf_course_id": golf_course_id,
+                "match_format": "SINGLES",
+                "allowance_percentage": 77,
+            },
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_creator_and_friend_tee_selection_round_trips(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_tee@test.com", "P@ssw0rd123!", "Admin", "Tee"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_tee@test.com", "P@ssw0rd123!", "Creator", "Tee"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend_tee@test.com", "P@ssw0rd123!", "Friend", "Tee"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={
+                "golf_course_id": golf_course_id,
+                "match_format": "SINGLES",
+                "creator_tee_color": "YELLOW",
+                "creator_tee_gender": "MALE",
+            },
+        )
+        assert create_response.status_code == 201
+        quick_match_id = create_response.json()["id"]
+        creator_dto = create_response.json()["participants"][0]
+        assert creator_dto["tee_color"] == "YELLOW"
+        assert creator_dto["tee_gender"] == "MALE"
+
+        add_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={
+                "friend_user_id": friend["user"]["id"],
+                "tee_color": "WHITE",
+                "tee_gender": "MALE",
+            },
+        )
+        assert add_response.status_code == 201
+        friend_dto = next(
+            p for p in add_response.json()["participants"] if p["user_id"] == friend["user"]["id"]
+        )
+        assert friend_dto["tee_color"] == "WHITE"
+        assert friend_dto["tee_gender"] == "MALE"
+
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        assert detail_response.status_code == 200
+        detail_creator_dto = next(
+            p
+            for p in detail_response.json()["participants"]
+            if p["user_id"] == creator["user"]["id"]
+        )
+        assert detail_creator_dto["tee_color"] == "YELLOW"
+
+    @pytest.mark.asyncio
+    async def test_create_with_tee_not_on_course_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_badtee@test.com", "P@ssw0rd123!", "Admin", "BadTee"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_badtee@test.com", "P@ssw0rd123!", "Creator", "BadTee"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches",
+            json={
+                "golf_course_id": golf_course_id,
+                "match_format": "SINGLES",
+                # the test golf course fixture only has CHAMPIONSHIP/MALE and AMATEUR/MALE tees
+                "creator_tee_color": "RED",
+                "creator_tee_gender": "FEMALE",
+            },
+        )
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_add_friend_with_tee_not_on_course_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_badtee2@test.com", "P@ssw0rd123!", "Admin", "BadTeeFriend"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_badtee2@test.com", "P@ssw0rd123!", "Creator", "BadTeeFriend"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend_badtee2@test.com", "P@ssw0rd123!", "Friend", "BadTeeFriend"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+
+        add_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={
+                "friend_user_id": friend["user"]["id"],
+                "tee_color": "RED",
+                "tee_gender": "FEMALE",
+            },
+        )
+
+        assert add_response.status_code == 422
+
+
+class TestQuickMatchFreePlayFlow:
+    """Partido libre: 1 a 4 jugadores, sin equipos, se puede jugar en solitario."""
+
+    @pytest.mark.asyncio
+    async def test_solo_free_play_start_and_score(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_solo@test.com", "P@ssw0rd123!", "Admin", "Solo"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_solo@test.com", "P@ssw0rd123!", "Creator", "Solo"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "scoring_format": "MEDAL"},
+        )
+        assert create_response.status_code == 201
+        quick_match_id = create_response.json()["id"]
+        creator_participant_id = create_response.json()["participants"][0]["participant_id"]
+
+        start_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator_participant_id]},
+        )
+        assert start_response.status_code == 200, start_response.text
+        assert start_response.json()["status"] == "IN_PROGRESS"
+
+        score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={"score": 4}
+        )
+        assert score_response.status_code == 200, score_response.text
+
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert detail["standing"] is None
+        assert len(detail["hole_scores"]) == 1
+
+
+class TestQuickMatchPickedUpHole:
+    """
+    La raya de punta a punta: el frontend manda `score: null` y el endpoint la
+    acepta en Stableford y la rechaza en Medal.
+
+    Nace de un defecto de produccion: la columna era NOT NULL y el body exigia
+    un entero, asi que el boton "Raya" —el mismo que ya funcionaba en
+    competicion— devolvia un 422 que la pantalla ensenaba como "Ese resultado
+    no es valido".
+    """
+
+    async def _start_free_play(self, client: AsyncClient, prefix: str, scoring_format: str):
+        admin = await create_admin_user(
+            client, f"qm_admin_{prefix}@test.com", "P@ssw0rd123!", "Admin", "Raya"
+        )
+        creator = await create_authenticated_user(
+            client, f"qm_creator_{prefix}@test.com", "P@ssw0rd123!", "Creator", "Raya"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "scoring_format": scoring_format},
+        )
+        assert create_response.status_code == 201, create_response.text
+        quick_match_id = create_response.json()["id"]
+        creator_participant_id = create_response.json()["participants"][0]["participant_id"]
+
+        start_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator_participant_id]},
+        )
+        assert start_response.status_code == 200, start_response.text
+        return quick_match_id
+
+    @pytest.mark.asyncio
+    async def test_stableford_accepts_a_null_score(self, client: AsyncClient):
+        quick_match_id = await self._start_free_play(client, "raya_ok", "STABLEFORD")
+
+        score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={"score": None}
+        )
+
+        assert score_response.status_code == 200, score_response.text
+        assert score_response.json()["score"] is None
+
+        detail = (await client.get(f"/api/v1/quick-matches/{quick_match_id}")).json()
+        assert len(detail["hole_scores"]) == 1
+        assert detail["hole_scores"][0]["score"] is None
+
+    @pytest.mark.asyncio
+    async def test_medal_rejects_a_null_score(self, client: AsyncClient):
+        quick_match_id = await self._start_free_play(client, "raya_medal", "MEDAL")
+
+        score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={"score": None}
+        )
+
+        assert score_response.status_code == 400, score_response.text
+
+    @pytest.mark.asyncio
+    async def test_the_score_field_is_still_required(self, client: AsyncClient):
+        """Mandar la raya es explicito; omitir el campo sigue siendo un error."""
+        quick_match_id = await self._start_free_play(client, "raya_missing", "STABLEFORD")
+
+        score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={}
+        )
+
+        assert score_response.status_code == 422, score_response.text
+
+
+class TestQuickMatchFullFlow:
+    """Flujo completo: crear, añadir amigo, iniciar, registrar scores, ver detalle."""
+
+    @pytest.mark.asyncio
+    async def test_full_flow_singles(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin2@test.com", "P@ssw0rd123!", "Admin", "Two"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator3@test.com", "P@ssw0rd123!", "Creator", "Three"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend3@test.com", "P@ssw0rd123!", "Friend", "Three"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+
+        add_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        assert add_response.status_code == 201
+        assert len(add_response.json()["participants"]) == 2
+
+        start_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator["user"]["id"], friend["user"]["id"]]},
+        )
+        assert start_response.status_code == 200, start_response.text
+        assert start_response.json()["status"] == "IN_PROGRESS"
+
+        score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={"score": 4}
+        )
+        assert score_response.status_code == 200
+        assert score_response.json()["score"] == 4
+
+        set_auth_cookies(client, friend["cookies"])
+        friend_score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={"score": 5}
+        )
+        assert friend_score_response.status_code == 200
+
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert len(detail["hole_scores"]) == 2
+        assert detail["standing"]["holes_played"] == 1
+
+        set_auth_cookies(client, creator["cookies"])
+        complete_response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/complete")
+        assert complete_response.status_code == 200
+        assert complete_response.json()["status"] == "COMPLETED"
+
+    @pytest.mark.asyncio
+    async def test_add_non_friend_returns_403(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin3@test.com", "P@ssw0rd123!", "Admin", "Three"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator4@test.com", "P@ssw0rd123!", "Creator", "Four"
+        )
+        stranger = await create_authenticated_user(
+            client, "qm_stranger4@test.com", "P@ssw0rd123!", "Stranger", "Four"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+
+        response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": stranger["user"]["id"]},
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_list_my_quick_matches(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin4@test.com", "P@ssw0rd123!", "Admin", "Four"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator5@test.com", "P@ssw0rd123!", "Creator", "Five"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+
+        response = await client.get("/api/v1/quick-matches/me")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_count"] == 1
+
+
+class TestListMyQuickMatchesByCourse:
+    """
+    GET /quick-matches/me?golf_course_id= (4 nov 2026): el asistente pide solo
+    tus ultimas partidas en un campo, para preelegir la barra, en vez de
+    descargar las 50 ultimas.
+
+      F1  sin golf_course_id           | igual que antes
+      F2  golf_course_id=X             | solo las tuyas en ese campo
+      F3  un id que no es un UUID      | 422
+      F4  un campo donde no has jugado | vacia
+    """
+
+    async def _dos_campos_y_una_partida_en_cada(self, client: AsyncClient, sufijo: str):
+        admin = await create_admin_user(
+            client, f"qm_admin_c{sufijo}@test.com", "P@ssw0rd123!", "Admin", "Campo"
+        )
+        creator = await create_authenticated_user(
+            client, f"qm_creator_c{sufijo}@test.com", "P@ssw0rd123!", "Creator", "Campo"
+        )
+        uno = await _create_approved_golf_course(client, admin, creator)
+        otro = await _create_approved_golf_course(client, admin, creator)
+        set_auth_cookies(client, creator["cookies"])
+        ids = {}
+        for campo in (uno, otro):
+            r = await client.post(
+                "/api/v1/quick-matches", json={"golf_course_id": campo, "match_format": "SINGLES"}
+            )
+            assert r.status_code == 201, r.text
+            ids[campo] = r.json()["id"]
+        return uno, otro, ids
+
+    @pytest.mark.asyncio
+    async def test_f1_without_course_lists_all(self, client: AsyncClient):
+        await self._dos_campos_y_una_partida_en_cada(client, "1")
+
+        response = await client.get("/api/v1/quick-matches/me")
+
+        assert response.status_code == 200
+        assert response.json()["total_count"] == 2
+        assert len(response.json()["quick_matches"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_f2_with_course_lists_only_that_course(self, client: AsyncClient):
+        uno, _otro, ids = await self._dos_campos_y_una_partida_en_cada(client, "2")
+
+        response = await client.get(f"/api/v1/quick-matches/me?golf_course_id={uno}&limit=5")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [m["id"] for m in data["quick_matches"]] == [ids[uno]]
+        assert data["total_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_f3_invalid_course_id_is_rejected(self, client: AsyncClient):
+        await self._dos_campos_y_una_partida_en_cada(client, "3")
+
+        response = await client.get("/api/v1/quick-matches/me?golf_course_id=no-es-un-uuid")
+
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_f4_course_without_matches_is_empty(self, client: AsyncClient):
+        await self._dos_campos_y_una_partida_en_cada(client, "4")
+
+        response = await client.get(
+            "/api/v1/quick-matches/me?golf_course_id=00000000-0000-4000-8000-000000000000"
+        )
+
+        assert response.status_code == 200
+        assert response.json()["quick_matches"] == []
+        assert response.json()["total_count"] == 0
+
+
+class TestQuickMatchGuestsAndScoringAssignment:
+    """Flujo con jugador invitado (sin cuenta) y anotacion por delegacion."""
+
+    @pytest.mark.asyncio
+    async def test_add_guest_and_proxy_score(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin5@test.com", "P@ssw0rd123!", "Admin", "Five"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator6@test.com", "P@ssw0rd123!", "Creator", "Six"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+
+        guest_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/guest",
+            json={"first_name": "Jane", "last_name": "Doe", "handicap": 18.4},
+        )
+        assert guest_response.status_code == 201, guest_response.text
+        guest_dto = next(p for p in guest_response.json()["participants"] if p["is_guest"])
+        assert guest_dto["name"] == "Jane Doe"
+        assert guest_dto["handicap"] == 18.4
+        guest_participant_id = guest_dto["participant_id"]
+
+        # Solo el creador anota (1 anotador): debe cubrir tambien al invitado.
+        start_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator["user"]["id"]]},
+        )
+        assert start_response.status_code == 200, start_response.text
+
+        own_score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={"score": 4}
+        )
+        assert own_score_response.status_code == 200
+
+        proxy_score_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{guest_participant_id}"
+            "/holes/1/score",
+            json={"score": 6},
+        )
+        assert proxy_score_response.status_code == 200, proxy_score_response.text
+        proxy_data = proxy_score_response.json()
+        assert proxy_data["participant_id"] == guest_participant_id
+        assert proxy_data["recorded_by_participant_id"] == creator["user"]["id"]
+
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        assert detail_response.status_code == 200
+        detail = detail_response.json()
+        assert len(detail["hole_scores"]) == 2
+        assert len(detail["scoring_assignments"]) == 1
+        assert set(detail["scoring_assignments"][0]["covered_participant_ids"]) == {
+            creator["user"]["id"],
+            guest_participant_id,
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_scorer_cannot_self_submit(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin6@test.com", "P@ssw0rd123!", "Admin", "Six"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator7@test.com", "P@ssw0rd123!", "Creator", "Seven"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend7@test.com", "P@ssw0rd123!", "Friend", "Seven"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        # Solo el creador anota; `friend` es participante pero no anotador.
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator["user"]["id"]]},
+        )
+
+        set_auth_cookies(client, friend["cookies"])
+        response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/holes/1/score", json={"score": 5}
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_start_without_creator_as_scorer_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin7@test.com", "P@ssw0rd123!", "Admin", "Seven"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator8@test.com", "P@ssw0rd123!", "Creator", "Eight"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend8@test.com", "P@ssw0rd123!", "Friend", "Eight"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+
+        response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [friend["user"]["id"]]},
+        )
+
+        assert response.status_code == 422
+
+
+class TestQuickMatchSetParticipantHandicap:
+    """Tests para PATCH /api/v1/quick-matches/{id}/participants/{participant_id}/handicap"""
+
+    @pytest.mark.asyncio
+    async def test_creator_overrides_registered_participant_without_profile_handicap(
+        self, client: AsyncClient
+    ):
+        admin = await create_admin_user(
+            client, "qm_admin_hc1@test.com", "P@ssw0rd123!", "Admin", "HcOne"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_hc1@test.com", "P@ssw0rd123!", "Creator", "HcOne"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend_hc1@test.com", "P@ssw0rd123!", "Friend", "HcOne"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        add_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        friend_dto = next(
+            p for p in add_response.json()["participants"] if p["user_id"] == friend["user"]["id"]
+        )
+        assert friend_dto["handicap"] is None
+
+        response = await client.patch(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{friend_dto['participant_id']}"
+            "/handicap",
+            json={"handicap": 16.4},
+        )
+
+        assert response.status_code == 200, response.text
+        updated_dto = next(
+            p
+            for p in response.json()["participants"]
+            if p["participant_id"] == friend_dto["participant_id"]
+        )
+        assert updated_dto["handicap"] == 16.4
+
+        # Re-fetch on a fresh request/DB session — the PATCH response alone reflects
+        # the in-memory entity and doesn't prove the write actually reached Postgres.
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        persisted_dto = next(
+            p
+            for p in detail_response.json()["participants"]
+            if p["participant_id"] == friend_dto["participant_id"]
+        )
+        assert persisted_dto["handicap"] == 16.4
+
+    @pytest.mark.asyncio
+    async def test_editing_two_participants_handicaps_both_persist(self, client: AsyncClient):
+        """
+        Regression test: QuickMatchParticipant.__eq__ only compares participant_id
+        (by domain design), so SQLAlchemy's default dirty-check on the `participants`
+        JSONB column — which compares old vs new Python list via `==` — couldn't see
+        a same-length list where only one entry's handicap changed, and silently
+        skipped writing it. Editing a second participant would then persist only
+        that one, discarding the first one's already-"saved" (but never actually
+        written) override. Fixed by force-flagging the column as modified in
+        SQLAlchemyQuickMatchRepository.update().
+        """
+        admin = await create_admin_user(
+            client, "qm_admin_hc6@test.com", "P@ssw0rd123!", "Admin", "HcSix"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_hc6@test.com", "P@ssw0rd123!", "Creator", "HcSix"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend_hc6@test.com", "P@ssw0rd123!", "Friend", "HcSix"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        add_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        friend_participant_id = next(
+            p["participant_id"]
+            for p in add_response.json()["participants"]
+            if p["user_id"] == friend["user"]["id"]
+        )
+        creator_participant_id = creator["user"]["id"]
+
+        first_patch = await client.patch(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{creator_participant_id}"
+            "/handicap",
+            json={"handicap": 15.0},
+        )
+        assert first_patch.status_code == 200, first_patch.text
+
+        second_patch = await client.patch(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{friend_participant_id}/handicap",
+            json={"handicap": 20.0},
+        )
+        assert second_patch.status_code == 200, second_patch.text
+
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        participants_by_id = {
+            p["participant_id"]: p["handicap"] for p in detail_response.json()["participants"]
+        }
+        assert participants_by_id[creator_participant_id] == 15.0
+        assert participants_by_id[friend_participant_id] == 20.0
+
+    @pytest.mark.asyncio
+    async def test_creator_edits_guest_handicap(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_hc2@test.com", "P@ssw0rd123!", "Admin", "HcTwo"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_hc2@test.com", "P@ssw0rd123!", "Creator", "HcTwo"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        guest_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/guest",
+            json={"first_name": "Jane", "last_name": "Doe", "handicap": 18.4},
+        )
+        guest_participant_id = next(
+            p for p in guest_response.json()["participants"] if p["is_guest"]
+        )["participant_id"]
+
+        response = await client.patch(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{guest_participant_id}/handicap",
+            json={"handicap": 20.1},
+        )
+
+        assert response.status_code == 200, response.text
+        updated_dto = next(
+            p
+            for p in response.json()["participants"]
+            if p["participant_id"] == guest_participant_id
+        )
+        assert updated_dto["handicap"] == 20.1
+
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        persisted_dto = next(
+            p
+            for p in detail_response.json()["participants"]
+            if p["participant_id"] == guest_participant_id
+        )
+        assert persisted_dto["handicap"] == 20.1
+
+    @pytest.mark.asyncio
+    async def test_non_creator_cannot_edit_handicap_returns_403(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_hc3@test.com", "P@ssw0rd123!", "Admin", "HcThree"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_hc3@test.com", "P@ssw0rd123!", "Creator", "HcThree"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend_hc3@test.com", "P@ssw0rd123!", "Friend", "HcThree"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        add_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        friend_participant_id = next(
+            p["participant_id"]
+            for p in add_response.json()["participants"]
+            if p["user_id"] == friend["user"]["id"]
+        )
+
+        set_auth_cookies(client, friend["cookies"])
+        response = await client.patch(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{friend_participant_id}/handicap",
+            json={"handicap": 10.0},
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_edit_handicap_after_start_returns_409(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_hc4@test.com", "P@ssw0rd123!", "Admin", "HcFour"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_hc4@test.com", "P@ssw0rd123!", "Creator", "HcFour"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        guest_response = await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/guest",
+            json={"first_name": "Jane", "last_name": "Doe"},
+        )
+        guest_participant_id = next(
+            p for p in guest_response.json()["participants"] if p["is_guest"]
+        )["participant_id"]
+
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator["user"]["id"]]},
+        )
+
+        response = await client.patch(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{guest_participant_id}/handicap",
+            json={"handicap": 10.0},
+        )
+
+        assert response.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_edit_handicap_out_of_range_returns_422(self, client: AsyncClient):
+        admin = await create_admin_user(
+            client, "qm_admin_hc5@test.com", "P@ssw0rd123!", "Admin", "HcFive"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_hc5@test.com", "P@ssw0rd123!", "Creator", "HcFive"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+
+        response = await client.patch(
+            f"/api/v1/quick-matches/{quick_match_id}/participants/{creator['user']['id']}/handicap",
+            json={"handicap": 99},
+        )
+
+        assert response.status_code == 422
+
+
+class TestQuickMatchHideFromHistory:
+    """
+    POST /api/v1/quick-matches/{id}/hide: la papelera, que borra de verdad la
+    partida cuando la han tirado todos (BE #127; 26 nov 2026).
+
+      #   caso                                       | resultado
+      ----|-------------------------------------------|-----------------------------
+      I1  la tira uno de dos                         | 200, `deleted` false; sale de
+                                                     | su lista y a el le da 404; el
+                                                     | otro la sigue viendo
+      I2  la tira quien no la creo                   | 200: cualquiera, para si
+      I3  tirarla dos veces                          | 200 las dos
+      I4  sin empezar, o en juego                    | 409: no se tira una partida viva
+      I5  la tira el ultimo                          | 200, `deleted` true; desde
+                                                     | entonces 404 para todos y en
+                                                     | todas sus rutas, nunca 500
+      I6  ya no se puede sacar de la papelera        | DELETE .../hide no existe: 405
+      I7  quien no es de la partida, y una que no    | 404
+          existe                                     |
+    """
+
+    async def _create_match_with_two_participants(
+        self, client: AsyncClient, *, hasta: str = "COMPLETED"
+    ) -> tuple[dict, dict, dict, str]:
+        """Una partida de dos, llevada hasta ese estado: PENDING, IN_PROGRESS o COMPLETED."""
+        admin = await create_admin_user(
+            client, "qm_admin_hide1@test.com", "P@ssw0rd123!", "Admin", "HideOne"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_hide1@test.com", "P@ssw0rd123!", "Creator", "HideOne"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend_hide1@test.com", "P@ssw0rd123!", "Friend", "HideOne"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        if hasta in ("IN_PROGRESS", "COMPLETED"):
+            started = await client.post(
+                f"/api/v1/quick-matches/{quick_match_id}/start",
+                json={"scorer_ids": [creator["user"]["id"]]},
+            )
+            assert started.status_code == 200, started.text
+        if hasta == "COMPLETED":
+            completed = await client.post(f"/api/v1/quick-matches/{quick_match_id}/complete")
+            assert completed.status_code == 200, completed.text
+
+        return admin, creator, friend, quick_match_id
+
+    @pytest.mark.asyncio
+    async def test_i1_hide_removes_it_for_me_but_not_for_the_other_participant(
+        self, client: AsyncClient
+    ):
+        _admin, creator, friend, quick_match_id = await self._create_match_with_two_participants(
+            client
+        )
+
+        set_auth_cookies(client, creator["cookies"])
+        hide_response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+        assert hide_response.status_code == 200, hide_response.text
+        assert hide_response.json()["deleted"] is False
+        assert hide_response.json()["id"] == quick_match_id
+
+        my_matches = await client.get("/api/v1/quick-matches/me")
+        assert quick_match_id not in [m["id"] for m in my_matches.json()["quick_matches"]]
+        # Para quien la tiro, ya no existe: tampoco por su enlace directo
+        assert (await client.get(f"/api/v1/quick-matches/{quick_match_id}")).status_code == 404
+        assert (
+            await client.get(f"/api/v1/quick-matches/{quick_match_id}/shared")
+        ).status_code == 404
+
+        # El otro participante, que no la ha tirado, la sigue viendo entera
+        set_auth_cookies(client, friend["cookies"])
+        friend_matches = await client.get("/api/v1/quick-matches/me")
+        assert quick_match_id in [m["id"] for m in friend_matches.json()["quick_matches"]]
+        detail_response = await client.get(f"/api/v1/quick-matches/{quick_match_id}")
+        assert detail_response.status_code == 200
+        assert len(detail_response.json()["participants"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_i2_non_creator_participant_can_hide_it_too(self, client: AsyncClient):
+        _admin, _creator, friend, quick_match_id = await self._create_match_with_two_participants(
+            client
+        )
+
+        set_auth_cookies(client, friend["cookies"])
+        response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        assert response.status_code == 200, response.text
+        my_matches = await client.get("/api/v1/quick-matches/me")
+        assert quick_match_id not in [m["id"] for m in my_matches.json()["quick_matches"]]
+
+    @pytest.mark.asyncio
+    async def test_i3_hide_is_idempotent(self, client: AsyncClient):
+        _admin, creator, _friend, quick_match_id = await self._create_match_with_two_participants(
+            client
+        )
+
+        set_auth_cookies(client, creator["cookies"])
+        first = await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+        second = await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["deleted"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("estado", ["PENDING", "IN_PROGRESS"])
+    async def test_i4_a_match_in_play_cannot_be_trashed(self, client: AsyncClient, estado: str):
+        _admin, creator, _friend, quick_match_id = await self._create_match_with_two_participants(
+            client, hasta=estado
+        )
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        assert response.status_code == 409, response.text
+        my_matches = await client.get("/api/v1/quick-matches/me")
+        assert quick_match_id in [m["id"] for m in my_matches.json()["quick_matches"]]
+
+    @pytest.mark.asyncio
+    async def test_i5_the_last_one_deletes_it_for_real(self, client: AsyncClient):
+        _admin, creator, friend, quick_match_id = await self._create_match_with_two_participants(
+            client
+        )
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        set_auth_cookies(client, friend["cookies"])
+        last = await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        assert last.status_code == 200, last.text
+        assert last.json()["deleted"] is True
+        # La ultima foto de la partida viene en la respuesta
+        assert last.json()["id"] == quick_match_id
+        assert len(last.json()["participants"]) == 2
+
+        # Desde ahora no existe para nadie, en ninguna de sus rutas: 404, nunca 500
+        for quien in (friend, creator):
+            set_auth_cookies(client, quien["cookies"])
+            assert (await client.get(f"/api/v1/quick-matches/{quick_match_id}")).status_code == 404
+            assert (
+                await client.get(f"/api/v1/quick-matches/{quick_match_id}/shared")
+            ).status_code == 404
+            assert (
+                await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+            ).status_code == 404
+            assert (
+                await client.post(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+            ).status_code == 404
+            lista = await client.get("/api/v1/quick-matches/me")
+            assert lista.status_code == 200
+            assert quick_match_id not in [m["id"] for m in lista.json()["quick_matches"]]
+            assert (await client.get("/api/v1/users/me/stats")).status_code in (200, 404)
+
+    @pytest.mark.asyncio
+    async def test_i6_there_is_no_way_back_from_the_trash(self, client: AsyncClient):
+        _admin, creator, _friend, quick_match_id = await self._create_match_with_two_participants(
+            client
+        )
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        unhide_response = await client.delete(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        assert unhide_response.status_code == 405
+        my_matches = await client.get("/api/v1/quick-matches/me")
+        assert quick_match_id not in [m["id"] for m in my_matches.json()["quick_matches"]]
+
+    @pytest.mark.asyncio
+    async def test_i7_hide_a_non_participant_match_returns_404(self, client: AsyncClient):
+        _admin, _creator, _friend, quick_match_id = await self._create_match_with_two_participants(
+            client
+        )
+        outsider = await create_authenticated_user(
+            client, "qm_outsider_hide1@test.com", "P@ssw0rd123!", "Outsider", "HideOne"
+        )
+
+        set_auth_cookies(client, outsider["cookies"])
+        response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/hide")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_i7_hide_nonexistent_match_returns_404(self, client: AsyncClient):
+        creator = await create_authenticated_user(
+            client, "qm_creator_hide2@test.com", "P@ssw0rd123!", "Creator", "HideTwo"
+        )
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(
+            "/api/v1/quick-matches/00000000-0000-0000-0000-000000000000/hide"
+        )
+
+        assert response.status_code == 404
+
+
+class TestQuickMatchStatsExclusion:
+    """
+    Tests para POST/DELETE /api/v1/quick-matches/{id}/stats-exclusion (BE #242).
+
+    El ojo: la partida deja de contar en las estadisticas de quien lo pulsa,
+    pero SIGUE en su historial. Es la otra mitad de la separacion que hizo la
+    papelera (`/hide`) exclusivamente "quitar de mi lista".
+    """
+
+    async def _create_completed_match(
+        self, client: AsyncClient, suffix: str
+    ) -> tuple[dict, dict, str]:
+        admin = await create_admin_user(
+            client, f"qm_admin_stats{suffix}@test.com", "P@ssw0rd123!", "Admin", "Stats"
+        )
+        creator = await create_authenticated_user(
+            client, f"qm_creator_stats{suffix}@test.com", "P@ssw0rd123!", "Creator", "Stats"
+        )
+        friend = await create_authenticated_user(
+            client, f"qm_friend_stats{suffix}@test.com", "P@ssw0rd123!", "Friend", "Stats"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator["user"]["id"], friend["user"]["id"]]},
+        )
+        await client.post(f"/api/v1/quick-matches/{quick_match_id}/complete")
+
+        return creator, friend, quick_match_id
+
+    @pytest.mark.asyncio
+    async def test_excluded_match_stays_in_my_list_flagged(self, client: AsyncClient):
+        """La diferencia con la papelera: sigue estando, marcada."""
+        creator, _friend, quick_match_id = await self._create_completed_match(client, "1")
+
+        set_auth_cookies(client, creator["cookies"])
+        response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["excluded_from_stats"] is True
+
+        my_matches = await client.get("/api/v1/quick-matches/me")
+        listed = {m["id"]: m for m in my_matches.json()["quick_matches"]}
+        assert quick_match_id in listed
+        assert listed[quick_match_id]["excluded_from_stats"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_flag_belongs_to_whoever_asks(self, client: AsyncClient):
+        """El otro participante ve la misma partida sin marcar."""
+        creator, friend, quick_match_id = await self._create_completed_match(client, "2")
+
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+
+        set_auth_cookies(client, friend["cookies"])
+        friend_matches = await client.get("/api/v1/quick-matches/me")
+        listed = {m["id"]: m for m in friend_matches.json()["quick_matches"]}
+        assert listed[quick_match_id]["excluded_from_stats"] is False
+
+    @pytest.mark.asyncio
+    async def test_delete_brings_it_back_into_the_stats(self, client: AsyncClient):
+        creator, _friend, quick_match_id = await self._create_completed_match(client, "3")
+
+        set_auth_cookies(client, creator["cookies"])
+        await client.post(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+        response = await client.delete(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["excluded_from_stats"] is False
+
+    @pytest.mark.asyncio
+    async def test_excluding_a_match_in_progress_returns_409(self, client: AsyncClient):
+        """Una partida a medias todavia no cuenta en ninguna estadistica."""
+        admin = await create_admin_user(
+            client, "qm_admin_stats4@test.com", "P@ssw0rd123!", "Admin", "Stats"
+        )
+        creator = await create_authenticated_user(
+            client, "qm_creator_stats4@test.com", "P@ssw0rd123!", "Creator", "Stats"
+        )
+        friend = await create_authenticated_user(
+            client, "qm_friend_stats4@test.com", "P@ssw0rd123!", "Friend", "Stats"
+        )
+        golf_course_id = await _create_approved_golf_course(client, admin, creator)
+        await _make_friends(client, creator, friend)
+
+        set_auth_cookies(client, creator["cookies"])
+        create_response = await client.post(
+            "/api/v1/quick-matches",
+            json={"golf_course_id": golf_course_id, "match_format": "SINGLES"},
+        )
+        quick_match_id = create_response.json()["id"]
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/participants",
+            json={"friend_user_id": friend["user"]["id"]},
+        )
+        await client.post(
+            f"/api/v1/quick-matches/{quick_match_id}/start",
+            json={"scorer_ids": [creator["user"]["id"], friend["user"]["id"]]},
+        )
+
+        response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+
+        assert response.status_code == 409, response.text
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_gets_404(self, client: AsyncClient):
+        """
+        Ni toca la partida ni se entera de que existe: se responde lo mismo que
+        para un id inventado, igual que hace la papelera.
+        """
+        _creator, _friend, quick_match_id = await self._create_completed_match(client, "5")
+        outsider = await create_authenticated_user(
+            client, "qm_outsider_stats5@test.com", "P@ssw0rd123!", "Outsider", "Stats"
+        )
+
+        set_auth_cookies(client, outsider["cookies"])
+        response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_requires_authentication(self, client: AsyncClient):
+        _creator, _friend, quick_match_id = await self._create_completed_match(client, "6")
+
+        client.cookies.clear()
+        response = await client.post(f"/api/v1/quick-matches/{quick_match_id}/stats-exclusion")
+
+        assert response.status_code == 401

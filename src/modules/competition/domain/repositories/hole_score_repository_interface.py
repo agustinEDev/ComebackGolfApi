@@ -1,0 +1,86 @@
+"""HoleScore Repository Interface - Domain Layer."""
+
+from abc import ABC, abstractmethod
+
+from src.modules.user.domain.value_objects.user_id import UserId
+
+from ..entities.hole_score import HoleScore
+from ..value_objects.match_id import MatchId
+
+
+class HoleScoreRepositoryInterface(ABC):
+    """Interfaz para el repositorio de hole scores."""
+
+    @abstractmethod
+    async def add(self, hole_score: HoleScore) -> None:
+        """Agrega un nuevo hole score."""
+        pass
+
+    @abstractmethod
+    async def add_many(self, hole_scores: list[HoleScore]) -> None:
+        """Agrega multiples hole scores en batch."""
+        pass
+
+    @abstractmethod
+    async def update(self, hole_score: HoleScore) -> None:
+        """Actualiza un hole score existente."""
+        pass
+
+    @abstractmethod
+    async def find_by_match(self, match_id: MatchId) -> list[HoleScore]:
+        """Busca todos los hole scores de un partido."""
+        pass
+
+    @abstractmethod
+    async def find_by_match_for_update(self, match_id: MatchId) -> list[HoleScore]:
+        """
+        Los hole scores de un partido con sus filas bloqueadas (SELECT ... FOR UPDATE).
+
+        Lo usa el borrado de competiciones (BE #347): anotar un hoyo en un
+        partido abierto no bloquea la competición, y sin esto un golpe anotado a
+        la vez que se borra se iría en la cascada.
+        """
+        pass
+
+    @abstractmethod
+    async def find_one(
+        self, match_id: MatchId, hole_number: int, player_user_id: UserId
+    ) -> HoleScore | None:
+        """Busca un hole score especifico."""
+        pass
+
+    @abstractmethod
+    async def find_by_match_and_player(
+        self, match_id: MatchId, player_user_id: UserId
+    ) -> list[HoleScore]:
+        """Busca todos los hole scores de un jugador en un partido."""
+        pass
+
+    @abstractmethod
+    async def find_by_matches_and_player(
+        self, match_ids: list[MatchId], player_user_id: UserId
+    ) -> list[HoleScore]:
+        """
+        Los hole scores de un jugador en varios partidos, en una sola lectura y
+        no una por partido (el panel de estadísticas, tabla del 22 oct 2026, M).
+        """
+        pass
+
+    @abstractmethod
+    async def exists_by_player(self, player_user_id: UserId) -> bool:
+        """
+        True si el jugador tiene algun hole score registrado (en cualquier partido).
+
+        Util para bloquear el borrado definitivo de una cuenta: hole_scores.player_user_id
+        no tiene ON DELETE definido (RESTRICT por defecto en Postgres), asi que borrar a
+        un jugador con historial de scores fallaria con un IntegrityError si no se bloquea antes.
+        """
+        pass
+
+    @abstractmethod
+    async def played_holes(self, match_ids: list[MatchId]) -> dict[tuple[MatchId, UserId], int]:
+        """
+        Cuantos hoyos jugo cada jugador en esos partidos: los que el o su
+        marcador apuntaron (la raya tambien). Solo salen las parejas con algun
+        hoyo. En una sola lectura; sin partidos, nada.
+        """

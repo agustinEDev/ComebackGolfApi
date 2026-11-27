@@ -1,0 +1,160 @@
+# src/modules/user/application/use_cases/list_user_devices_use_case.py
+"""
+List User Devices Use Case - Application Layer
+
+Caso de uso para listar los dispositivos activos de un usuario.
+
+Responsabilidades:
+- Buscar todos los dispositivos activos del usuario
+- Mapear entidades a DTOs
+- Ordenar por last_used_at desc (más recientes primero)
+- Retornar lista + contador
+- Marcar el dispositivo actual: el `did` del token, ya comprobado (BE #737)
+
+Llamado desde:
+- GET /api/v1/users/me/devices (endpoint protegido)
+
+Identificación de dispositivo actual (v2.0.4):
+- PRIMARY: Cookie httpOnly device_id (no depende de IP)
+- FALLBACK: Ninguno (si no hay cookie, ninguno se marca como current)
+
+Patrón: Use Case Pattern + Unit of Work + DTO Mapper
+"""
+
+import logging
+
+from src.modules.user.application.dto.device_dto import (
+    ListUserDevicesRequestDTO,
+    ListUserDevicesResponseDTO,
+    UserDeviceDTO,
+)
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.services.descripcion_del_dispositivo import (
+    describe_el_dispositivo,
+    ip_tapada,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+
+logger = logging.getLogger(__name__)
+
+
+class ListUserDevicesUseCase:
+    """
+    Use Case para listar dispositivos activos de un usuario.
+
+    Características:
+    - Solo lista dispositivos con is_active=True
+    - Ordenados por last_used_at DESC (más recientes primero)
+    - Incluye total_count para paginación futura
+    - Retorna lista vacía si el usuario no tiene dispositivos
+
+    Security:
+    - Solo puede listar sus propios dispositivos (user_id del JWT)
+    - Dispositivos revocados NO se muestran
+
+    Examples:
+        >>> request = ListUserDevicesRequestDTO(user_id="550e8400-...")
+        >>> response = await use_case.execute(request)
+        >>> print(f"Total de dispositivos: {response.total_count}")
+        >>> for device in response.devices:
+        ...     print(f"{device.device_name} - Usado: {device.last_used_at}")
+        Chrome on macOS - Usado: 2026-01-09 10:30:00
+        Safari on iOS - Usado: 2026-01-08 14:20:00
+    """
+
+    def __init__(self, uow: UserUnitOfWorkInterface):
+        """
+        Inicializa el caso de uso.
+
+        Args:
+            uow: Unit of Work con acceso al user_devices repository
+        """
+        self._uow = uow
+
+    async def execute(self, request: ListUserDevicesRequestDTO) -> ListUserDevicesResponseDTO:
+        """
+        Ejecuta el caso de uso de listado de dispositivos.
+
+        Args:
+            request: DTO con user_id (extraído del JWT)
+
+        Returns:
+            ListUserDevicesResponseDTO con lista de dispositivos y contador
+
+        Raises:
+            ValueError: Si user_id no es UUID válido
+
+        Example:
+            # Usuario con 2 dispositivos
+            Response: {
+                "devices": [
+                    {
+                        "id": "7c9e6679-...",
+                        "device_name": "Chrome 120.0 on macOS",
+                        "ip_address": "192.168.1.100",
+                        "last_used_at": "2026-01-09T10:30:00Z",
+                        "created_at": "2026-01-08T14:20:00Z",
+                        "is_active": true
+                    },
+                    ...
+                ],
+                "total_count": 2
+            }
+
+            # Usuario sin dispositivos
+            Response: {
+                "devices": [],
+                "total_count": 0
+            }
+        """
+        async with self._uow:
+            # 1. Parsear user_id de string a UserId
+            user_id = UserId(request.user_id)
+
+            # 2. Los que tienen la sesión abierta de verdad (BE #737): activos, usados
+            # en las últimas 24 h y con algún refresco vivo. Antes salían todos los
+            # activos: en producción, 58 de 60 llevaban días con la sesión muerta
+            ahora = ahora_utc_sin_zona()
+            con_sesion = await self._uow.refresh_tokens.device_ids_with_live_tokens(user_id, ahora)
+            devices = [
+                device
+                for device in await self._uow.user_devices.find_active_by_user(user_id)
+                if device.id in con_sesion and not device.is_idle(ahora)
+            ]
+
+            # 3. El dispositivo actual: el `did` del token, que get_current_user ya
+            # comprobó (BE #737)
+            current_device_id = request.current_device_id
+
+            # 4. Mapear entidades a DTOs (con is_current_device por el `did`)
+            device_dtos = [
+                UserDeviceDTO(
+                    id=str(device.id.value),
+                    device_name=device.device_name,
+                    user_agent=device.user_agent,
+                    # Tapada: la completa se queda para auditoría (BE #737)
+                    ip_address=ip_tapada(device.ip_address) or "",
+                    device_type=descripcion.tipo,
+                    platform=descripcion.plataforma,
+                    browser=descripcion.navegador,
+                    installed_app=device.installed_app,
+                    country_code=device.country_code,
+                    last_used_at=device.last_used_at,
+                    created_at=device.created_at,
+                    is_active=device.is_active,
+                    is_current_device=(
+                        current_device_id is not None and str(device.id.value) == current_device_id
+                    ),
+                )
+                for device in devices
+                for descripcion in (describe_el_dispositivo(device.user_agent),)
+            ]
+
+            # 5. Retornar respuesta con lista + contador
+            return ListUserDevicesResponseDTO(
+                devices=device_dtos,
+                total_count=len(device_dtos),
+            )

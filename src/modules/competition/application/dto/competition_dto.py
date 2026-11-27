@@ -1,0 +1,1647 @@
+"""DTOs para el módulo Competition - Application Layer."""
+
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Annotated, Any, Literal
+from uuid import UUID
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
+
+from src.modules.competition.domain.entities.competition import (
+    DEFAULT_MAX_PLAYERS,
+    MAX_ENROLLMENT_OPENING_DAYS,
+    MAX_PLAYERS,
+    MIN_ENROLLMENT_OPENING_DAYS,
+    MIN_PLAYERS,
+)
+from src.modules.competition.domain.services.ventana_de_actualizacion import CodigoDeVentana
+from src.modules.competition.domain.value_objects.overall_standing import OverallStanding
+from src.modules.competition.domain.value_objects.setup_mode import SetupMode
+from src.modules.competition.domain.value_objects.tournament_type import TournamentType
+from src.modules.competition.domain.value_objects.visibility import Visibility
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+from src.shared.domain.value_objects.gender import Gender
+
+# Código ISO de país tal y como lo aceptan `main_country` y los adyacentes. La
+# lista `countries` usa el mismo tipo: al convertirla a adjacent_country_1/2 se
+# asigna sobre el modelo ya validado, así que sin esto sus `min_length`/`max_length`
+# quedaban esquivados. Se recortan los espacios como hacen esos campos, para que
+# `countries: ["ES "]` no sea un 422 mientras `adjacent_country_1: "ES "` funciona.
+# Lo que no se hace aquí es pasar a mayúsculas: de eso sabe `CountryCode`.
+CountryCodeStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=2, max_length=2)
+]
+
+# Descripciones reutilizables para campos
+COMPETITION_NAME_DESC = "Nombre de la competición."
+MAX_PLAYERS_DESC = "Número máximo de jugadores."
+COMPETITION_ID_DESC = "ID de la competición."
+# Descripciones para nombres de equipos
+TEAM_1_NAME_DESC = "Nombre del equipo 1."
+TEAM_2_NAME_DESC = "Nombre del equipo 2."
+
+
+# Import shared DTOs
+# CountryResponseDTO definido aquí para evitar importación circular
+class CountryResponseDTO(BaseModel):
+    """DTO de respuesta para un país."""
+
+    code: str = Field(..., description="Código ISO 3166-1 alpha-2 del país")
+    name_en: str = Field(..., description="Nombre en inglés")
+    name_es: str = Field(..., description="Nombre en español")
+
+
+# El campo `date` de NextSessionDTO taparía al tipo dentro de su clase
+_Fecha = date
+
+
+class CompetitionCourseSummaryDTO(BaseModel):
+    """Un campo de la competición en su tarjeta: nombre y país (FE #846)."""
+
+    id: UUID
+    name: str
+    country_code: str
+
+
+class NextSessionDTO(BaseModel):
+    """La próxima salida de quien mira (FE #846)."""
+
+    date: _Fecha
+    session_type: str = Field(..., description="MORNING, AFTERNOON o EVENING.")
+    tee_time: str | None = Field(
+        None,
+        description=(
+            "HH:MM, hora del campo, de su partida. Null en la Ryder (no hay hora por "
+            "partido) y en una franja sin partidas generadas."
+        ),
+    )
+
+
+class CreatorDTO(BaseModel):
+    """
+    DTO para representar información básica del creador de una competición.
+
+    Se utiliza como objeto nested dentro de CompetitionResponseDTO
+    para evitar múltiples llamadas API desde el frontend.
+
+    Campos incluidos:
+    - Datos personales: id, first_name, last_name, display_name
+    - Datos de juego: handicap, country_code
+    - Sin email: el del organizador no sale nunca (BE #531)
+    """
+
+    id: UUID = Field(..., description="ID único del usuario creador")
+    first_name: str = Field(..., description="Nombre del creador")
+    last_name: str = Field(..., description="Apellido del creador")
+    display_name: str = Field(
+        ...,
+        description=(
+            "Nombre con el que se debe mostrar al creador. En una pública, su nombre "
+            "real; en una privada, su alias si tiene, y si no su nombre completo. Es "
+            "lo que hay que pintar (SB-08)."
+        ),
+    )
+    handicap: float | None = Field(None, description="Handicap actual del creador")
+    country_code: str | None = Field(None, description="Código ISO del país del creador")
+    alias: str | None = Field(
+        None,
+        description=(
+            "El alias del creador si tiene, para enseñar pequeño el nombre que no va "
+            "delante (SB-08). Null si no tiene."
+        ),
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Crear Competition
+# ======================================================================================
+
+
+class StrokePlaySettingsDTO(BaseModel):
+    """
+    Los ajustes de un Stableford o un Medal (#251). Al crear, lo que no llega
+    toma su valor por defecto; al cambiar, lo que no llega no se toca.
+    """
+
+    # Un tope generoso para no leer entera una lista desmesurada: el «como mucho
+    # 5 categorías» lo dice el dominio, con su motivo
+    category_limits: list[Decimal] | None = Field(
+        None,
+        max_length=20,
+        description=(
+            "Límites superiores de hándicap de las categorías, de menor a mayor y con "
+            "un decimal como mucho: [12.0, 26.0] son «hasta 12,0», «de 12,1 a 26,0» y "
+            "«más de 26,0». Hasta 4 límites (5 categorías). Una lista vacía quita las "
+            "categorías. Solo cuentan en la clasificación neta."
+        ),
+    )
+    max_matchdays_per_player: int | None = Field(
+        None,
+        description=(
+            "En cuántas jornadas puede jugar cada jugador, una franja por jornada. "
+            "Por defecto 1. No puede pasar de los días que dura el torneo."
+        ),
+    )
+    overall_standing: OverallStanding | None = Field(
+        None,
+        description=(
+            "Cómo se calcula la general: ACCUMULATED (por defecto: suma de puntos en "
+            "Stableford, de golpes netos en Medal) o BEST_CARD (la mejor tarjeta)."
+        ),
+    )
+    # Sin rango aquí: «entre 2 y 5» lo dice el dominio, con su motivo
+    category_count: int | None = Field(
+        None,
+        description=(
+            "Categorías iguales: cuántas (de 2 a 5). Los límites se calculan al cerrar "
+            "las inscripciones con los hándicaps fijados, con grupos lo más parecidos "
+            "posible; los empatados en una frontera van a la de hándicap más bajo. "
+            "Mandarlo pasa a este modo y borra los límites; mandar `category_limits` "
+            "vuelve a límites a mano. Los dos a la vez es un 400."
+        ),
+    )
+
+
+class StrokePlaySettingsResponseDTO(BaseModel):
+    """Los ajustes de un Stableford o un Medal, tal como están (#251)."""
+
+    category_limits: list[Decimal] = Field(
+        ..., description="Límites superiores de las categorías; vacía si no hay categorías."
+    )
+    max_matchdays_per_player: int = Field(
+        ..., description="En cuántas jornadas puede jugar cada jugador."
+    )
+    overall_standing: OverallStanding = Field(..., description="ACCUMULATED o BEST_CARD.")
+    category_count: int | None = Field(
+        None,
+        description=(
+            "Categorías iguales pedidas; null si los límites son a mano. Con él, "
+            "`category_limits` está vacía hasta el cierre, que la calcula."
+        ),
+    )
+
+
+class CreateCompetitionRequestDTO(BaseModel):
+    """
+    DTO de entrada para el caso de uso de creación de competición.
+    Define los datos necesarios para crear un nuevo torneo.
+    """
+
+    model_config = ConfigDict(
+        populate_by_name=True,  # Permite usar aliases
+    )
+
+    name: str = Field(..., min_length=3, max_length=100, description=COMPETITION_NAME_DESC)
+    start_date: date = Field(..., description="Fecha de inicio del torneo.")
+    end_date: date = Field(..., description="Fecha de fin del torneo.")
+
+    # Location
+    main_country: str = Field(
+        ...,
+        min_length=2,
+        max_length=2,
+        description="Código ISO del país principal (ej: 'ES').",
+    )
+    adjacent_country_1: str | None = Field(
+        None,
+        min_length=2,
+        max_length=2,
+        description="Código ISO del país adyacente 1 (opcional).",
+    )
+    adjacent_country_2: str | None = Field(
+        None,
+        min_length=2,
+        max_length=2,
+        description="Código ISO del país adyacente 2 (opcional).",
+    )
+    # Campo adicional para compatibilidad con frontend (se convierte automáticamente)
+    countries: list[CountryCodeStr] | None = Field(
+        None,
+        # Dos como mucho: una Location tiene el país principal y dos huecos, y los
+        # validadores solo miran los dos primeros. Un tercero se descartaba en
+        # silencio y el torneo quedaba en menos países de los que pidió su creador
+        max_length=2,
+        description="Lista de países adyacentes (formato frontend).",
+    )
+
+    # Play Mode
+    play_mode: str = Field(..., description="Modo de juego: 'SCRATCH' o 'HANDICAP'.")
+
+    # Competition Config - con alias para compatibilidad con frontend
+    max_players: int = Field(
+        default=DEFAULT_MAX_PLAYERS,
+        ge=MIN_PLAYERS,
+        le=MAX_PLAYERS,
+        description=MAX_PLAYERS_DESC,
+        alias="number_of_players",
+    )
+    tournament_type: TournamentType = Field(
+        TournamentType.RYDER_CUP,
+        description=(
+            "Qué torneo es (#251): RYDER_CUP (por defecto), STABLEFORD o MEDAL. "
+            "De él sale la modalidad: match play o stroke play. Un STABLEFORD o "
+            "un MEDAL no tiene equipos, modo de montaje ni reparto: mandarlos es "
+            "un 400 que dice por qué."
+        ),
+    )
+    team_assignment: str | None = Field(
+        default=None,
+        description="Asignación de equipos: 'MANUAL' (por defecto en una Ryder) o 'AUTOMATIC'.",
+    )
+
+    # Nombres de equipos: solo en una Ryder, que si no llegan usa «Team 1» y «Team 2»
+    team_1_name: str | None = Field(
+        default=None, min_length=3, max_length=50, description=TEAM_1_NAME_DESC
+    )
+    team_2_name: str | None = Field(
+        default=None, min_length=3, max_length=50, description=TEAM_2_NAME_DESC
+    )
+
+    # Límite de hándicap de juego
+    max_playing_handicap: int | None = Field(
+        None, ge=1, le=54, description="Límite máximo de hándicap de juego (WHS: 1-54)."
+    )
+    enrollment_opens_days_before: int | None = Field(
+        None,
+        ge=MIN_ENROLLMENT_OPENING_DAYS,
+        le=MAX_ENROLLMENT_OPENING_DAYS,
+        description=(
+            "Cuántos días antes del torneo se abren solas las inscripciones, de "
+            "2 a 14. Abren a las 00:00 del campo donde se juega, y la fecha se "
+            "calcula sobre el comienzo del torneo: si el torneo se mueve, la "
+            "apertura se mueve con él. Sin esto, la competición nace con las "
+            "inscripciones ya abiertas."
+        ),
+    )
+    visibility: Visibility = Field(
+        Visibility.PRIVATE,
+        description="Quién ve la competición y quién puede pedir sitio. PRIVATE (por defecto): solo se entra por invitación. PUBLIC: se ve al explorar y cualquiera puede pedir plaza.",
+    )
+    setup_mode: SetupMode | None = Field(
+        None,
+        description="Solo en una Ryder Cup. Cuánto monta la aplicación por su cuenta (FE #695). AUTOMATIC: equipos, capitanes y partidos solos, preguntando solo los días, las franjas y el campo. MANUAL: todo a mano. RYDER_CUP (por defecto): draft opcional, capitanes por el organizador, rondas configurables y sobres. Se cambia mientras las inscripciones siguen abiertas.",
+    )
+
+    stroke_play: StrokePlaySettingsDTO | None = Field(
+        None,
+        description=(
+            "Solo en un STABLEFORD o un MEDAL: categorías, jornadas por jugador y "
+            "regla de la general. Sin esto se crea con los valores por defecto. En "
+            "una Ryder Cup es un 400."
+        ),
+    )
+
+    organizer_plays: bool = Field(
+        True,
+        description=(
+            "Solo en un STABLEFORD o un MEDAL: si el organizador juega (#552). Si no, no "
+            "queda inscrito y puede cerrar las inscripciones sin plaza. En una Ryder Cup "
+            "se ignora: el organizador siempre queda inscrito."
+        ),
+    )
+
+    @field_validator("main_country", "adjacent_country_1", "adjacent_country_2", mode="before")
+    @classmethod
+    def uppercase_country_codes(cls, v: Any) -> Any:
+        """Convierte códigos de país a mayúsculas."""
+        if v:
+            return v.upper().strip()
+        return v
+
+    @field_validator("play_mode", mode="before")
+    @classmethod
+    def uppercase_play_mode(cls, v: Any) -> Any:
+        """Convierte play_mode a mayúsculas."""
+        if v:
+            return v.upper().strip()
+        return v
+
+    @field_validator("team_assignment", mode="before")
+    @classmethod
+    def uppercase_team_assignment(cls, v: Any) -> Any:
+        """Convierte team_assignment a mayúsculas."""
+        if v:
+            return v.upper().strip()
+        return v
+
+    @model_validator(mode="after")
+    def validate_and_convert_countries(self) -> "CreateCompetitionRequestDTO":
+        """Convierte el campo countries del frontend a adjacent_country_1/2 si es necesario."""
+        # Si se proporcionó countries pero no adjacent_country_1/2, convertir
+        if self.countries and not self.adjacent_country_1 and not self.adjacent_country_2:
+            if len(self.countries) > 0:
+                self.adjacent_country_1 = self.countries[0]
+            if len(self.countries) > 1:
+                self.adjacent_country_2 = self.countries[1]
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_config(self) -> "CreateCompetitionRequestDTO":
+        """Validaciones post-inicialización."""
+        # Validar fechas
+        if self.start_date > self.end_date:
+            raise ValueError("start_date debe ser anterior o igual a end_date")
+
+        # Validar play_mode
+        if self.play_mode not in ["SCRATCH", "HANDICAP"]:
+            raise ValueError("play_mode debe ser 'SCRATCH' o 'HANDICAP'")
+
+        # Validar team_assignment
+        if self.team_assignment not in [None, "MANUAL", "AUTOMATIC"]:
+            raise ValueError("team_assignment debe ser 'MANUAL' o 'AUTOMATIC'")
+
+        return self
+
+    @model_validator(mode="after")
+    def ryder_cup_defaults(self) -> "CreateCompetitionRequestDTO":
+        """
+        Los valores de siempre, solo para una Ryder Cup (#251).
+
+        El frontend de hoy no manda el tipo ni, a veces, los equipos: tiene que
+        seguir creando la misma Ryder. A un Stableford o un Medal no se le
+        inventa nada; si el cliente manda equipos, los rechaza el dominio.
+        """
+        if self.tournament_type.has_teams:
+            self.team_1_name = self.team_1_name or "Team 1"
+            self.team_2_name = self.team_2_name or "Team 2"
+            self.team_assignment = self.team_assignment or "MANUAL"
+            self.setup_mode = self.setup_mode or SetupMode.RYDER_CUP
+        return self
+
+
+class CreateCompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida para el caso de uso de creación de competición.
+    Devuelve la competición completa recién creada (mismo formato que CompetitionResponseDTO).
+    """
+
+    id: UUID = Field(..., description="ID único de la competición.")
+    creator_id: UUID = Field(..., description="ID del usuario creador.")
+    creator: CreatorDTO | None = Field(None, description="Información completa del creador.")
+    name: str = Field(..., description=COMPETITION_NAME_DESC)
+    status: str = Field(
+        ...,
+        description=(
+            "Estado de la competición. Al crearla es ACTIVE —nace con las "
+            "inscripciones abiertas—, salvo que se indique "
+            "`enrollment_opens_days_before`, en cuyo caso queda en DRAFT "
+            "esperando su apertura."
+        ),
+    )
+
+    # Dates
+    start_date: date = Field(..., description="Fecha de inicio.")
+    end_date: date = Field(..., description="Fecha de fin.")
+
+    # Location
+    country_code: str = Field(..., description="Código ISO del país principal.")
+    secondary_country_code: str | None = Field(None, description="Código ISO del país secundario.")
+    tertiary_country_code: str | None = Field(None, description="Código ISO del país terciario.")
+    location: str = Field(..., description="Ubicación formateada legible.")
+    countries: list[CountryResponseDTO] = Field(
+        default_factory=list,
+        description="Lista de países participantes con códigos y nombres.",
+    )
+
+    # Play Mode
+    tournament_type: str = Field(
+        "RYDER_CUP", description="Qué torneo es: RYDER_CUP, STABLEFORD o MEDAL (#251)."
+    )
+    modality: str = Field(
+        "MATCH_PLAY", description="Su modalidad, derivada del tipo: MATCH_PLAY o STROKE_PLAY."
+    )
+    stroke_play: StrokePlaySettingsResponseDTO | None = Field(
+        None, description="Ajustes del stroke play (#251); vacío en una Ryder Cup."
+    )
+    play_mode: str = Field(..., description="Modo de juego: 'SCRATCH' o 'HANDICAP'.")
+
+    # Nombres de equipos
+    team_1_name: str | None = Field(
+        None, description=TEAM_1_NAME_DESC + " Vacío si no es Ryder Cup."
+    )
+    team_2_name: str | None = Field(
+        None, description=TEAM_2_NAME_DESC + " Vacío si no es Ryder Cup."
+    )
+
+    # Config
+    max_players: int = Field(..., description=MAX_PLAYERS_DESC)
+    team_assignment: str | None = Field(
+        None, description="Tipo de asignación de equipos. Vacío si no es Ryder Cup."
+    )
+    max_playing_handicap: int | None = Field(
+        None, description="Límite máximo de hándicap de juego (WHS: 1-54)."
+    )
+    enrollment_opens_days_before: int | None = Field(
+        None,
+        description=(
+            "Cuántos días antes del torneo se abren solas las inscripciones, de "
+            "2 a 14. Abren a las 00:00 del campo donde se juega, y la fecha se "
+            "calcula sobre el comienzo del torneo: si el torneo se mueve, la "
+            "apertura se mueve con él. Sin esto, la competición nace con las "
+            "inscripciones ya abiertas."
+        ),
+    )
+    visibility: str = Field(
+        ...,
+        description="Quién ve la competición y quién puede pedir sitio. PRIVATE (por defecto): solo se entra por invitación. PUBLIC: se ve al explorar y cualquiera puede pedir plaza.",
+    )
+    setup_mode: str | None = Field(
+        None,
+        description="Vacío si no es Ryder Cup. Cuánto monta la aplicación por su cuenta (FE #695). AUTOMATIC: equipos, capitanes y partidos solos, preguntando solo los días, las franjas y el campo. MANUAL: todo a mano. RYDER_CUP (por defecto): draft opcional, capitanes por el organizador, rondas configurables y sobres. Se cambia mientras las inscripciones siguen abiertas.",
+    )
+
+    # Campos calculados
+    is_creator: bool = Field(default=True, description="Siempre True para el creador.")
+    enrolled_count: int = Field(default=0, description="Siempre 0 al crear.")
+
+    # Timestamps
+    created_at: datetime = Field(..., description="Fecha y hora de creación.")
+    updated_at: datetime = Field(..., description="Fecha y hora de última actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Actualizar Competition
+# ======================================================================================
+
+
+class UpdateCompetitionRequestDTO(BaseModel):
+    """
+    DTO de entrada para el caso de uso de actualización de competición.
+    Todos los campos son opcionales (actualización parcial).
+    Solo permitido en estado DRAFT.
+    """
+
+    model_config = ConfigDict(
+        populate_by_name=True,  # Permite usar aliases, igual que al crear
+    )
+
+    name: str | None = Field(
+        None,
+        max_length=100,
+        description=(
+            "Nuevo nombre de la competición. El mínimo lo mira el nombre ya limpio; uno "
+            "guardado con las reglas antiguas (de menos de 3) se puede reenviar igual (#540)."
+        ),
+    )
+    start_date: date | None = Field(None, description="Nueva fecha de inicio.")
+    end_date: date | None = Field(None, description="Nueva fecha de fin.")
+
+    # Location
+    main_country: str | None = Field(
+        None, min_length=2, max_length=2, description="Nuevo país principal."
+    )
+    adjacent_country_1: str | None = Field(
+        None, min_length=2, max_length=2, description="Nuevo país adyacente 1."
+    )
+    adjacent_country_2: str | None = Field(
+        None, min_length=2, max_length=2, description="Nuevo país adyacente 2."
+    )
+    # Igual que al crear: la pantalla manda el mismo payload en las dos llamadas,
+    # y sin este campo los países acompañantes no se podían cambiar al editar
+    countries: list[CountryCodeStr] | None = Field(
+        None,
+        # Dos como mucho: una Location tiene el país principal y dos huecos, y los
+        # validadores solo miran los dos primeros. Un tercero se descartaba en
+        # silencio y el torneo quedaba en menos países de los que pidió su creador
+        max_length=2,
+        description="Lista de países adyacentes (formato frontend).",
+    )
+
+    # Play Mode
+    play_mode: str | None = Field(None, description="Nuevo modo de juego: 'SCRATCH' o 'HANDICAP'.")
+
+    # Competition Config
+    # El alias es el mismo que al crear: el cliente manda `number_of_players` en las
+    # dos llamadas, y sin él Pydantic descartaba la clave y el cupo se quedaba igual
+    max_players: int | None = Field(
+        None,
+        ge=MIN_PLAYERS,
+        le=MAX_PLAYERS,
+        description="Nuevo máximo de jugadores.",
+        alias="number_of_players",
+    )
+    team_assignment: str | None = Field(None, description="Nueva asignación de equipos.")
+    max_playing_handicap: int | None = Field(
+        None, ge=1, le=54, description="Nuevo límite máximo de hándicap de juego (WHS: 1-54)."
+    )
+    enrollment_opens_days_before: int | None = Field(
+        None,
+        ge=MIN_ENROLLMENT_OPENING_DAYS,
+        le=MAX_ENROLLMENT_OPENING_DAYS,
+        description=(
+            "Cuántos días antes del torneo se abren solas las inscripciones, de "
+            "2 a 14. Abren a las 00:00 del campo donde se juega, y la fecha se "
+            "calcula sobre el comienzo del torneo: si el torneo se mueve, la "
+            "apertura se mueve con él. Sin esto, la competición nace con las "
+            "inscripciones ya abiertas."
+        ),
+    )
+    visibility: Visibility | None = Field(
+        None,
+        description="Quién ve la competición y quién puede pedir sitio. PRIVATE (por defecto): solo se entra por invitación. PUBLIC: se ve al explorar y cualquiera puede pedir plaza.",
+    )
+    setup_mode: SetupMode | None = Field(
+        None,
+        description="Cuánto monta la aplicación por su cuenta (FE #695). AUTOMATIC: equipos, capitanes y partidos solos, preguntando solo los días, las franjas y el campo. MANUAL: todo a mano. RYDER_CUP (por defecto): draft opcional, capitanes por el organizador, rondas configurables y sobres. Se cambia mientras las inscripciones siguen abiertas.",
+    )
+
+    team_1_name: str | None = Field(
+        None, min_length=3, max_length=50, description="Nuevo nombre del equipo 1."
+    )
+    team_2_name: str | None = Field(
+        None, min_length=3, max_length=50, description="Nuevo nombre del equipo 2."
+    )
+
+    @field_validator("main_country", "adjacent_country_1", "adjacent_country_2", mode="before")
+    @classmethod
+    def uppercase_country_codes(cls, v: Any) -> Any:
+        """Convierte códigos de país a mayúsculas."""
+        if v:
+            return v.upper().strip()
+        return v
+
+    @field_validator("play_mode", mode="before")
+    @classmethod
+    def uppercase_play_mode(cls, v: Any) -> Any:
+        """Convierte play_mode a mayúsculas."""
+        if v:
+            return v.upper().strip()
+        return v
+
+    @field_validator("team_assignment", mode="before")
+    @classmethod
+    def uppercase_team_assignment(cls, v: Any) -> Any:
+        """Convierte team_assignment a mayúsculas."""
+        if v:
+            return v.upper().strip()
+        return v
+
+    @model_validator(mode="after")
+    def validate_and_convert_countries(self) -> "UpdateCompetitionRequestDTO":
+        """Convierte el campo countries del frontend a adjacent_country_1/2 si es necesario."""
+        # Si se proporcionó countries pero no adjacent_country_1/2, convertir
+        if self.countries and not self.adjacent_country_1 and not self.adjacent_country_2:
+            if len(self.countries) > 0:
+                self.adjacent_country_1 = self.countries[0]
+            if len(self.countries) > 1:
+                self.adjacent_country_2 = self.countries[1]
+
+        return self
+
+
+class UpdateCompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida para el caso de uso de actualización de competición.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    name: str = Field(..., description="Nombre actualizado.")
+    updated_at: datetime = Field(..., description="Fecha y hora de actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO de Respuesta Genérico para Competition
+# ======================================================================================
+
+
+class PendingHandicapPlayerDTO(BaseModel):
+    """Un jugador al que falta actualizar el hándicap con la RFEG (#251)."""
+
+    user_id: UUID
+    name: str
+
+
+class HandicapUpdateStatusDTO(BaseModel):
+    """La última actualización de hándicaps con la RFEG de la competición (#251)."""
+
+    status: Literal["IN_PROGRESS", "COMPLETED", "INCOMPLETE", "STOPPED"] = Field(
+        ...,
+        description=(
+            "IN_PROGRESS: preguntando a la RFEG. COMPLETED: todos actualizados. "
+            "INCOMPLETE: alguien se quedó sin actualizar (se avisa al organizador por "
+            "correo). STOPPED: la competición empezó o se volvió a cerrar a mitad."
+        ),
+    )
+    origin: Literal["ENROLLMENTS_CLOSED", "ORGANIZER", "SCHEDULED"] = Field(
+        ..., description="Qué la lanzó: el cierre de inscripciones, el botón o una programada."
+    )
+    started_at: datetime
+    finished_at: datetime | None = None
+    pending_players: list[PendingHandicapPlayerDTO] = Field(
+        default_factory=list,
+        description=(
+            "En curso, quién falta todavía; incompleta, quién se quedó sin actualizar. "
+            "Vacío si está completa o cortada."
+        ),
+    )
+    not_updated_players: list[PendingHandicapPlayerDTO] = Field(
+        default_factory=list,
+        description=(
+            "Exactamente la lista del aviso al organizador «{N} jugadores sin actualizar "
+            "con la RFEG» (15 nov 2026): no encontrados, fallidos o sin preguntar, "
+            "españoles (y todos si la competición es en España). Se rellena con la "
+            "competición cerrada y la última actualización terminada (completa o "
+            "incompleta); mientras se vuelve a pasar una incompleta, lo que dejó esa "
+            "pasada, del que sale quien la RFEG ya haya encontrado (como en el aviso). "
+            "Vacía en la primera pasada en curso, cortada, o con la competición ya "
+            "empezada."
+        ),
+    )
+
+
+class HandicapsNotUpdatedAsOrganizerDTO(BaseModel):
+    """Una competición que organizo con jugadores sin actualizar con la RFEG (H2, 15 nov 2026)."""
+
+    competition_id: UUID
+    competition_name: str
+    count: int = Field(..., description="Cuántos se quedaron sin actualizar.")
+    players: list[PendingHandicapPlayerDTO] = Field(
+        default_factory=list,
+        description=(
+            "Quiénes, con el nombre que eligieron para la competición: los españoles, "
+            "y todos si la competición es en España."
+        ),
+    )
+
+
+class HandicapNotFoundAsPlayerDTO(BaseModel):
+    """Una competición en la que la RFEG no encontró mi hándicap (H3, 15 nov 2026)."""
+
+    competition_id: UUID
+    competition_name: str
+
+
+class MyHandicapsNotUpdatedDTO(BaseModel):
+    """
+    Los hándicaps sin actualizar con la RFEG, para «Requiere tu Atención» (15 nov 2026).
+
+    Solo de competiciones cerradas y sin empezar, con su última actualización ya
+    terminada. Desaparece solo: al empezar la competición, o cuando el hándicap
+    se actualiza (desde el perfil o en otra pasada).
+    """
+
+    as_organizer: list[HandicapsNotUpdatedAsOrganizerDTO] = Field(default_factory=list)
+    as_player: list[HandicapNotFoundAsPlayerDTO] = Field(default_factory=list)
+
+
+class HandicapUpdateWindowDTO(BaseModel):
+    """Si el organizador puede actualizar ahora los hándicaps con la RFEG (#251)."""
+
+    open: bool = Field(..., description="Si el botón «Actualizar hándicaps» está activo.")
+    closes_at: datetime | None = Field(
+        None,
+        description=(
+            "Hasta cuándo (10 s por jugador antes de la siguiente salida). Null sin "
+            "horas de salida (Ryder o stroke play sin franjas): hasta iniciar."
+        ),
+    )
+    reason: str | None = Field(None, description="Por qué no, si está cerrada.")
+    reason_code: CodigoDeVentana | None = Field(
+        None, description="El motivo como código, para decirlo en el idioma de la app (#541)."
+    )
+    scheduled_at: datetime | None = Field(
+        None, description="Si hay una actualización programada, para cuándo (#251)."
+    )
+
+
+class HandicapUpdateRefusedDTO(BaseModel):
+    """Por qué no se puede lanzar o programar la actualización de hándicaps (#541)."""
+
+    detail: str = Field(..., description="El motivo, en español.")
+    error_code: Literal["HANDICAP_UPDATE_NOT_ALLOWED"]
+    reason_code: CodigoDeVentana | None = Field(
+        None, description="El motivo como código, para decirlo en el idioma de la app."
+    )
+
+
+class ScheduleHandicapUpdateRequestDTO(BaseModel):
+    """Para cuándo programar la actualización de hándicaps (#251)."""
+
+    run_at: datetime = Field(
+        ...,
+        description=(
+            "Cuándo, con huso (por ejemplo 2030-10-11T03:00:00+02:00). Futuro y dentro "
+            "de la ventana del botón en esa hora."
+        ),
+    )
+
+    @field_validator("run_at")
+    @classmethod
+    def con_huso(cls, v: datetime) -> datetime:
+        """Sin huso no se sabe qué hora es: «las 3:00» de dónde."""
+        if v.tzinfo is None:
+            raise ValueError("La hora tiene que llevar su huso (por ejemplo +02:00 o Z).")
+        return v
+
+
+class ScheduledHandicapUpdateDTO(BaseModel):
+    """La actualización de hándicaps programada."""
+
+    run_at: datetime
+
+
+class HandicapUpdateLaunchedDTO(BaseModel):
+    """La actualización de hándicaps que acaba de lanzar el organizador (#251)."""
+
+    id: UUID
+    status: Literal["IN_PROGRESS"] = "IN_PROGRESS"
+    origin: Literal["ENROLLMENTS_CLOSED", "ORGANIZER", "SCHEDULED"] = Field(
+        ...,
+        description="La nueva viene del botón; si se reanudó una a medias, conserva la suya.",
+    )
+    started_at: datetime = Field(..., description="Cuándo empezó (la original, si se reanudó).")
+    resumed: bool = Field(
+        ..., description="True si se reanudó una incompleta: solo pregunta por lo pendiente."
+    )
+
+
+class MyPendingInvitationDTO(BaseModel):
+    """La invitación pendiente de quien mira la ficha."""
+
+    id: UUID = Field(..., description="La invitación, para responderla.")
+    expires_at: datetime = Field(
+        ...,
+        description=(
+            "Cuándo caduca, en la hora del servidor y sin zona, como en el resto de "
+            "las invitaciones: para «expira en N días» basta, en la frontera de un día "
+            "puede descuadrar unas horas."
+        ),
+    )
+
+
+class CompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida genérico para representar una competición.
+    Se utiliza para listar competiciones y consultas detalladas.
+
+    NOTA: Este DTO incluye campos calculados dinámicamente que NO existen
+    en la entidad de dominio (is_creator, enrolled_count, location_formatted, creator).
+    Estos se deben calcular en la capa de aplicación antes de construir el DTO.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    creator_id: UUID = Field(..., description="ID del usuario creador.")
+    creator: CreatorDTO | None = Field(None, description="Información completa del creador.")
+    name: str = Field(..., description=COMPETITION_NAME_DESC)
+    status: str = Field(..., description="Estado actual (DRAFT, ACTIVE, CLOSED, etc.).")
+
+    # Dates
+    start_date: date = Field(..., description="Fecha de inicio.")
+    end_date: date = Field(..., description="Fecha de fin.")
+
+    # Location - Raw country codes (para backward compatibility con tests)
+    country_code: str = Field(..., description="Código ISO del país principal.")
+    secondary_country_code: str | None = Field(None, description="Código ISO del país secundario.")
+    tertiary_country_code: str | None = Field(None, description="Código ISO del país terciario.")
+
+    # Location - Formatted string (NUEVO - requerido por frontend)
+    location: str = Field(
+        ..., description="Ubicación formateada legible (ej: 'Spain, France, Italy')."
+    )
+
+    # Location - Countries array (NUEVO - requerido por frontend)
+    countries: list[CountryResponseDTO] = Field(
+        default_factory=list,
+        description="Lista de países participantes con códigos y nombres.",
+    )
+
+    # Play Mode
+    tournament_type: str = Field(
+        "RYDER_CUP", description="Qué torneo es: RYDER_CUP, STABLEFORD o MEDAL (#251)."
+    )
+    modality: str = Field(
+        "MATCH_PLAY", description="Su modalidad, derivada del tipo: MATCH_PLAY o STROKE_PLAY."
+    )
+    stroke_play: StrokePlaySettingsResponseDTO | None = Field(
+        None, description="Ajustes del stroke play (#251); vacío en una Ryder Cup."
+    )
+    play_mode: str = Field(..., description="Modo de juego: 'SCRATCH' o 'HANDICAP'.")
+
+    # Nombres de equipos
+    team_1_name: str | None = Field(
+        None, description=TEAM_1_NAME_DESC + " Vacío si no es Ryder Cup."
+    )
+    team_2_name: str | None = Field(
+        None, description=TEAM_2_NAME_DESC + " Vacío si no es Ryder Cup."
+    )
+
+    # Config
+    max_players: int = Field(..., description=MAX_PLAYERS_DESC)
+    team_assignment: str | None = Field(
+        None, description="Tipo de asignación de equipos. Vacío si no es Ryder Cup."
+    )
+    max_playing_handicap: int | None = Field(
+        None, description="Límite máximo de hándicap de juego (WHS: 1-54)."
+    )
+    enrollment_opens_days_before: int | None = Field(
+        None,
+        description=(
+            "Cuántos días antes del torneo se abren solas las inscripciones, de "
+            "2 a 14. Abren a las 00:00 del campo donde se juega, y la fecha se "
+            "calcula sobre el comienzo del torneo: si el torneo se mueve, la "
+            "apertura se mueve con él. Sin esto, la competición nace con las "
+            "inscripciones ya abiertas."
+        ),
+    )
+    # El plazo de inscripción (15-16 nov 2026)
+    enrollment_deadline: datetime | None = Field(
+        None,
+        description=(
+            "Hasta cuándo se apunta uno: las 12:00 del día anterior al torneo, en la "
+            "zona del primer campo (Europe/Madrid sin campo), con su desfase "
+            "(p. ej. 2026-11-19T12:00:00+01:00). Null sin fecha de inicio."
+        ),
+    )
+    enrollment_deadline_applies: bool = Field(
+        True,
+        description=(
+            "Si el plazo cuenta para ella. False mientras esté abierta y exenta: el "
+            "organizador la abrió o reabrió a mano pasado el plazo, y sigue abierta "
+            "hasta que la cierre él."
+        ),
+    )
+    enrollment_closed_by_deadline: bool = Field(
+        False,
+        description="Si las inscripciones las cerró el plazo y no el organizador.",
+    )
+    visibility: str = Field(
+        ...,
+        description="Quién ve la competición y quién puede pedir sitio. PRIVATE (por defecto): solo se entra por invitación. PUBLIC: se ve al explorar y cualquiera puede pedir plaza.",
+    )
+    setup_mode: str | None = Field(
+        None,
+        description="Vacío si no es Ryder Cup. Cuánto monta la aplicación por su cuenta (FE #695). AUTOMATIC: equipos, capitanes y partidos solos, preguntando solo los días, las franjas y el campo. MANUAL: todo a mano. RYDER_CUP (por defecto): draft opcional, capitanes por el organizador, rondas configurables y sobres. Se cambia mientras las inscripciones siguen abiertas.",
+    )
+    team_a_captain_id: UUID | None = Field(
+        None, description="Capitán del equipo A, o null si no hay (BE #320)."
+    )
+    team_b_captain_id: UUID | None = Field(
+        None, description="Capitán del equipo B, o null si no hay (BE #320)."
+    )
+    team_a_vice_captain_id: UUID | None = Field(
+        None, description="Subcapitán del equipo A, o null si no hay (BE #320)."
+    )
+    team_b_vice_captain_id: UUID | None = Field(
+        None, description="Subcapitán del equipo B, o null si no hay (BE #320)."
+    )
+    teams_assigned: bool | None = Field(
+        None,
+        description=(
+            "Solo en la ficha: si ya hay equipos repartidos. Con equipos los capitanes "
+            "ya no se cambian, y reabrir las inscripciones no deshace el reparto. Null "
+            "en los listados, donde no se calcula."
+        ),
+    )
+    my_pending_invitation: MyPendingInvitationDTO | None = Field(
+        None,
+        description=(
+            "Solo en la ficha: la invitación de quien mira que aún puede aceptar, para "
+            "aceptarla o rechazarla desde ahí (27 oct 2026). Null si no la tiene, si "
+            "organiza, y en los listados."
+        ),
+    )
+    enrolled_visibility: Literal["ALL", "FRIENDS", "NONE"] | None = Field(
+        None,
+        description=(
+            "Solo en la ficha: qué ve quien mira de los inscritos (release social 2). "
+            "ALL, todos los aprobados; FRIENDS, solo sus amigos; NONE, a nadie más que "
+            "a sí mismo. Null en los listados."
+        ),
+    )
+    actual_team_assignment: str | None = Field(
+        None,
+        description=(
+            "Solo en la ficha: como se repartieron los equipos DE VERDAD. La "
+            "competicion guarda el modo con el que nacio —del tipo Ryder sale "
+            "MANUAL—, asi que unos equipos elegidos en la sala de draft salian "
+            "como repartidos a mano. Null mientras no haya reparto."
+        ),
+    )
+    can_delete: bool | None = Field(
+        None,
+        description=(
+            "Solo en la ficha: si quien la mira puede borrarla ahora (creador o admin, "
+            "estado que lo permita y nada jugado). Null en los listados, donde no "
+            "se calcula para no recorrer los partidos de cada competición."
+        ),
+    )
+    handicap_update_window: HandicapUpdateWindowDTO | None = Field(
+        None,
+        description=(
+            "Solo en la ficha y solo para el organizador o un admin: si puede "
+            "actualizar ahora los hándicaps con la RFEG (#251)."
+        ),
+    )
+    handicap_update: HandicapUpdateStatusDTO | None = Field(
+        None,
+        description=(
+            "Solo en la ficha y solo para el organizador o un admin: la última "
+            "actualización de hándicaps con la RFEG (#251). Null si no hay ninguna, "
+            "para cualquier otro y en los listados."
+        ),
+    )
+
+    # Campos calculados (NUEVO - requeridos por frontend)
+    is_creator: bool = Field(
+        ...,
+        description="True si el usuario autenticado es el creador de esta competición.",
+    )
+    enrolled_count: int = Field(
+        default=0, description="Número de jugadores con enrollment status APPROVED."
+    )
+    pending_enrollments_count: int = Field(
+        default=0,
+        description=(
+            "Número de solicitudes con enrollment status PENDING "
+            "(solo visible para el creador o un admin)."
+        ),
+    )
+    user_enrollment_status: str | None = Field(
+        None,
+        description="Estado de inscripción del usuario actual (REQUESTED, APPROVED, REJECTED, etc.). None si no está inscrito.",
+    )
+
+    # La tarjeta de «Mis competiciones» (FE #846)
+    golf_courses: list[CompetitionCourseSummaryDTO] = Field(
+        default_factory=list, description="Sus campos, en su orden, con nombre y país."
+    )
+    playing_days: int | None = Field(
+        None, description="Stableford/Medal: días con franjas (0 sin franjas). Null en la Ryder."
+    )
+    my_next_session: NextSessionDTO | None = Field(
+        None,
+        description=(
+            "Solo si quien mira juega (inscrito y aprobado): su próxima franja o sesión "
+            "sin terminar, con su partida o partido en juego. Null si no le queda ninguna."
+        ),
+    )
+
+    # Timestamps
+    created_at: datetime = Field(..., description="Fecha y hora de creación.")
+    updated_at: datetime = Field(..., description="Fecha y hora de última actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("id", "creator_id", mode="before")
+    @classmethod
+    def convert_value_objects_uuid(cls, v: Any) -> Any:
+        """Convierte Value Objects UUID a UUID primitivo."""
+        if hasattr(v, "value"):
+            return v.value
+        return v
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def convert_competition_name(cls, v: Any) -> Any:
+        """Convierte CompetitionName a string."""
+        if hasattr(v, "value"):
+            return v.value
+        return v
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def convert_competition_status(cls, v: Any) -> Any:
+        """Convierte CompetitionStatus enum a string."""
+        if hasattr(v, "value"):
+            return v.value
+        return v
+
+
+# ======================================================================================
+# DTOs para Transiciones de Estado del Ciclo de Vida
+# ======================================================================================
+
+# --------------------------------------------------------------------------------------
+# Activate Competition (DRAFT → ACTIVE)
+# --------------------------------------------------------------------------------------
+
+
+class ActivateCompetitionRequestDTO(BaseModel):
+    """
+    DTO de entrada para activar una competición.
+    Transición: DRAFT → ACTIVE (abre inscripciones).
+
+    Solo el creador puede activar la competición.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class ActivateCompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida para activación de competición.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (ACTIVE).")
+    activated_at: datetime = Field(..., description="Fecha y hora de activación.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------------------------------
+# Close Enrollments (ACTIVE → CLOSED)
+# --------------------------------------------------------------------------------------
+
+
+class CloseEnrollmentsRequestDTO(BaseModel):
+    """
+    DTO de entrada para cerrar inscripciones de una competición.
+    Transición: ACTIVE → CLOSED (cierra inscripciones).
+
+    Solo el creador puede cerrar las inscripciones.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class CloseEnrollmentsResponseDTO(BaseModel):
+    """
+    DTO de salida para cierre de inscripciones.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (CLOSED).")
+    total_enrollments: int = Field(..., description="Número total de inscripciones aprobadas.")
+    closed_at: datetime = Field(..., description="Fecha y hora de cierre.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------------------------------
+# Name Captains (BE #320): nombrarlos cierra las inscripciones
+# --------------------------------------------------------------------------------------
+
+
+class NameCaptainsBodyDTO(BaseModel):
+    """Cuerpo de PUT /competitions/{id}/captains: la competición va en la ruta."""
+
+    team_a_captain_id: UUID = Field(..., description="Capitán del equipo A: un inscrito aprobado.")
+    team_b_captain_id: UUID = Field(
+        ..., description="Capitán del equipo B: un inscrito aprobado, distinto del A."
+    )
+
+
+class NameCaptainsRequestDTO(BaseModel):
+    """
+    DTO de entrada para nombrar a los dos capitanes.
+
+    Con las inscripciones abiertas, las cierra (ACTIVE → CLOSED). Ya cerradas,
+    los cambia, mientras no haya equipos repartidos.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    team_a_captain_id: UUID = Field(..., description="Capitán del equipo A: un inscrito aprobado.")
+    team_b_captain_id: UUID = Field(
+        ..., description="Capitán del equipo B: un inscrito aprobado, distinto del A."
+    )
+
+
+class NameCaptainsResponseDTO(BaseModel):
+    """
+    DTO de salida al nombrar capitanes, con el aviso de números que no cuadran.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Estado tras nombrarlos (CLOSED).")
+    team_a_captain_id: UUID = Field(..., description="Capitán del equipo A.")
+    team_b_captain_id: UUID = Field(..., description="Capitán del equipo B.")
+    total_players: int = Field(..., description="Inscritos aprobados.")
+    uneven_teams: bool = Field(
+        ...,
+        description=(
+            "Aviso, no bloqueo: con un número impar de inscritos los equipos no "
+            "saldrán iguales. Los capitanes quedan nombrados, pero para repartir "
+            "los equipos hará falta un número par: que entre o salga alguien."
+        ),
+    )
+
+
+class TeamPlayerBodyDTO(BaseModel):
+    """Cuerpo de las rutas de capitanía de un equipo: el jugador elegido."""
+
+    player_id: UUID = Field(..., description="Jugador del equipo, inscrito y aprobado.")
+
+
+class NameViceCaptainRequestDTO(BaseModel):
+    """
+    DTO de entrada para nombrar al subcapitán de un equipo, tras el draft.
+
+    Lo elige el capitán de ese equipo; también el organizador o un admin.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    team: Literal["A", "B"] = Field(..., description="Equipo: A o B.")
+    player_id: UUID = Field(..., description="Subcapitán: un jugador de ese equipo.")
+
+
+class FillCaptainRequestDTO(BaseModel):
+    """
+    DTO de entrada para cubrir el puesto de un capitán que se fue sin subcapitán.
+
+    Solo el organizador o un admin, solo tras el draft y solo un puesto vacío.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    team: Literal["A", "B"] = Field(..., description="Equipo: A o B.")
+    player_id: UUID = Field(..., description="Nuevo capitán: un jugador de ese equipo.")
+
+
+class CaptaincyResponseDTO(BaseModel):
+    """Capitanes y subcapitanes de la competición, tras cambiar alguno."""
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    team_a_captain_id: UUID | None = Field(None, description="Capitán del equipo A.")
+    team_b_captain_id: UUID | None = Field(None, description="Capitán del equipo B.")
+    team_a_vice_captain_id: UUID | None = Field(None, description="Subcapitán del equipo A.")
+    team_b_vice_captain_id: UUID | None = Field(None, description="Subcapitán del equipo B.")
+
+
+# --------------------------------------------------------------------------------------
+# Start Competition (CLOSED → IN_PROGRESS)
+# --------------------------------------------------------------------------------------
+
+
+class StartCompetitionRequestDTO(BaseModel):
+    """
+    DTO de entrada para iniciar una competición.
+    Transición: CLOSED → IN_PROGRESS (inicia el torneo).
+
+    Solo el creador puede iniciar la competición.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class StartCompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida para inicio de competición.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (IN_PROGRESS).")
+    started_at: datetime = Field(..., description="Fecha y hora de inicio.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------------------------------
+# Revert Competition Status (IN_PROGRESS → CLOSED)
+# --------------------------------------------------------------------------------------
+
+
+class RevertCompetitionStatusRequestDTO(BaseModel):
+    """
+    DTO de entrada para revertir una competición a CLOSED.
+    Transición: IN_PROGRESS → CLOSED (permite corregir el schedule).
+
+    Solo el creador puede revertir la competición.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class RevertCompetitionStatusResponseDTO(BaseModel):
+    """
+    DTO de salida para reversión de competición.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (CLOSED).")
+    reverted_at: datetime = Field(..., description="Fecha y hora de reversión.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------------------------------
+# Revert Competition To In Progress (COMPLETED → IN_PROGRESS)
+# --------------------------------------------------------------------------------------
+
+
+class RevertCompetitionToInProgressRequestDTO(BaseModel):
+    """
+    DTO de entrada para revertir una competición finalizada a IN_PROGRESS.
+    Transición: COMPLETED → IN_PROGRESS (permite, p.ej., añadir una ronda más).
+
+    Solo el creador puede revertir la competición. No afecta a rounds/matches existentes.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class RevertCompetitionToInProgressResponseDTO(BaseModel):
+    """
+    DTO de salida para reversión de competición a IN_PROGRESS.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (IN_PROGRESS).")
+    reverted_at: datetime = Field(..., description="Fecha y hora de reversión.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------------------------------
+# Reopen Enrollments (CLOSED → ACTIVE)
+# --------------------------------------------------------------------------------------
+
+
+class ReopenEnrollmentsRequestDTO(BaseModel):
+    """
+    DTO de entrada para reabrir inscripciones de una competición.
+    Transición: CLOSED → ACTIVE (reabre inscripciones).
+
+    Solo el creador puede reabrir inscripciones.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class ReopenEnrollmentsResponseDTO(BaseModel):
+    """
+    DTO de salida para reapertura de inscripciones.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (ACTIVE).")
+    reopened_at: datetime = Field(..., description="Fecha y hora de reapertura.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------------------------------
+# Complete Competition (IN_PROGRESS → COMPLETED)
+# --------------------------------------------------------------------------------------
+
+
+class CompleteCompetitionRequestDTO(BaseModel):
+    """
+    DTO de entrada para completar/finalizar una competición.
+    Transición: IN_PROGRESS → COMPLETED (finaliza el torneo).
+
+    Solo el creador puede completar la competición.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class CompleteCompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida para completar competición.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (COMPLETED).")
+    completed_at: datetime = Field(..., description="Fecha y hora de finalización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTOs para Delete y Cancel Competition
+# ======================================================================================
+
+# --------------------------------------------------------------------------------------
+# Delete Competition (eliminación física - mientras no haya nada jugado)
+# --------------------------------------------------------------------------------------
+
+
+class DeleteCompetitionRequestDTO(BaseModel):
+    """
+    DTO de entrada para eliminar físicamente una competición.
+
+    Restricciones:
+    - Solo si el estado lo permite (todos menos IN_PROGRESS y COMPLETED)
+    - Y solo si no hay nada jugado (el calendario y los equipos no impiden)
+    - Solo el creador o un administrador pueden eliminar
+    - Se elimina permanentemente de la BD (incluyendo enrollments)
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+
+
+class DeleteCompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida para eliminación de competición.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    name: str = Field(..., description=COMPETITION_NAME_DESC)
+    deleted: bool = Field(default=True, description="Confirmación de eliminación.")
+    deleted_at: datetime = Field(..., description="Fecha y hora de eliminación.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --------------------------------------------------------------------------------------
+# Cancel Competition (cancelación lógica - cualquier estado no final)
+# --------------------------------------------------------------------------------------
+
+
+class CancelCompetitionRequestDTO(BaseModel):
+    """
+    DTO de entrada para cancelar una competición.
+    Transición: cualquier estado → CANCELLED (cancelación lógica).
+
+    Restricciones:
+    - No se puede cancelar si ya está en estado final (COMPLETED/CANCELLED)
+    - Solo el creador puede cancelar
+    - Se mantiene el registro histórico (no se elimina)
+
+    Use cases:
+    - Cancelar por mal tiempo
+    - Cancelar por falta de participantes
+    - Cancelar por razones organizativas
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    reason: str | None = Field(
+        None, max_length=500, description="Razón de la cancelación (opcional)."
+    )
+
+
+class CancelCompetitionResponseDTO(BaseModel):
+    """
+    DTO de salida para cancelación de competición.
+    """
+
+    id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    status: str = Field(..., description="Nuevo estado (CANCELLED).")
+    reason: str | None = Field(None, description="Razón de la cancelación.")
+    cancelled_at: datetime = Field(..., description="Fecha y hora de cancelación.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# =============================================================================
+# Golf Course Management DTOs
+# =============================================================================
+
+
+class AddGolfCourseRequestDTO(BaseModel):
+    """
+    DTO de entrada para añadir un campo de golf a una competición.
+
+    Business Rules:
+    - La competición debe estar en estado DRAFT
+    - El campo de golf debe estar APPROVED
+    - El campo no puede estar ya asociado a la competición
+    - El país del campo debe ser compatible con la ubicación de la competición
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    golf_course_id: UUID = Field(..., description="ID del campo de golf a añadir.")
+
+
+class AddGolfCourseResponseDTO(BaseModel):
+    """
+    DTO de salida para añadir un campo de golf a una competición.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    golf_course_id: UUID = Field(..., description="ID del campo de golf añadido.")
+    display_order: int = Field(..., description="Orden de visualización asignado.")
+    added_at: datetime = Field(..., description="Fecha y hora de adición.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RemoveGolfCourseRequestDTO(BaseModel):
+    """
+    DTO de entrada para eliminar un campo de golf de una competición.
+
+    Business Rules:
+    - La competición debe estar en estado DRAFT
+    - El campo debe estar asociado a la competición
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    golf_course_id: UUID = Field(..., description="ID del campo de golf a eliminar.")
+
+
+class RemoveGolfCourseResponseDTO(BaseModel):
+    """
+    DTO de salida para eliminar un campo de golf de una competición.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    golf_course_id: UUID = Field(..., description="ID del campo de golf eliminado.")
+    removed_at: datetime = Field(..., description="Fecha y hora de eliminación.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ReorderGolfCoursesRequestDTO(BaseModel):
+    """
+    DTO de entrada para reordenar los campos de golf de una competición.
+
+    Business Rules:
+    - La competición debe estar en estado DRAFT
+    - Todos los golf_course_ids deben existir en la competición
+    - No puede haber duplicados
+    - Debe incluir TODOS los campos asociados
+
+    Example:
+        {
+            "competition_id": "123e4567-e89b-12d3-a456-426614174000",
+            "golf_course_ids": [
+                "uuid-golf-course-3",  # display_order = 1
+                "uuid-golf-course-1",  # display_order = 2
+                "uuid-golf-course-2"   # display_order = 3
+            ]
+        }
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    golf_course_ids: list[UUID] = Field(
+        ...,
+        min_length=1,
+        description="Lista ordenada de IDs de campos de golf (orden final deseado).",
+    )
+
+
+class ReorderGolfCoursesResponseDTO(BaseModel):
+    """
+    DTO de salida para reordenar campos de golf.
+    """
+
+    competition_id: UUID = Field(..., description=COMPETITION_ID_DESC)
+    golf_course_count: int = Field(..., description="Número de campos reordenados.")
+    reordered_at: datetime = Field(..., description="Fecha y hora de reordenación.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTOs para API endpoints (request bodies y responses específicos)
+# ======================================================================================
+
+
+class AddGolfCourseBodyDTO(BaseModel):
+    """
+    DTO para el body del endpoint de añadir campo de golf a competición.
+
+    Este DTO valida que el request body contenga un golf_course_id válido.
+    El competition_id viene del path parameter.
+    """
+
+    golf_course_id: UUID = Field(..., description="ID del campo de golf a añadir.")
+
+
+class ReorderGolfCourseIdsRequest(BaseModel):
+    """
+    DTO para el body del endpoint de reordenar campos de golf.
+
+    Valida que el request body contenga una lista de UUIDs.
+    El competition_id viene del path parameter.
+    """
+
+    golf_course_ids: list[UUID] = Field(
+        ...,
+        min_length=1,
+        description="Lista ordenada de IDs de campos de golf (orden final deseado).",
+    )
+
+
+# ======================================================================================
+# DTOs para listado detallado de campos de golf de una competición
+# ======================================================================================
+
+
+class TeeResponseDTO(BaseModel):
+    """DTO de respuesta para un tee de un campo de golf."""
+
+    color: str = Field(
+        ..., description="Color de las barras, que junto al género identifica la salida"
+    )
+    gender: str | None = Field(None, description="Género del tee (MALE, FEMALE, o null)")
+    identifier: str | None = Field(
+        None, description="Nombre libre opcional (ej: 'Championship', 'Gold/White')"
+    )
+    course_rating: float = Field(..., description="Course Rating (WHS)")
+    slope_rating: int = Field(..., description="Slope Rating (WHS)")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class HoleResponseDTO(BaseModel):
+    """DTO de respuesta para un hoyo de un campo de golf."""
+
+    hole_number: int = Field(..., description="Número del hoyo (1-18)")
+    par: int = Field(..., description="Par del hoyo (3, 4, o 5)")
+    stroke_index: int = Field(..., description="Índice de dificultad (1-18)")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GolfCourseDetailDTO(BaseModel):
+    """DTO de respuesta con detalles completos de un campo de golf."""
+
+    id: UUID = Field(..., description="ID del campo de golf")
+    name: str = Field(..., description="Nombre del campo")
+    country_code: str = Field(..., description="Código ISO del país")
+    course_type: str = Field(
+        ..., description="Tipo de campo (STANDARD_18, PITCH_AND_PUTT, EXECUTIVE)"
+    )
+    total_par: int = Field(..., description="Par total del campo (suma de pares de los 18 hoyos)")
+    approval_status: str = Field(
+        ..., description="Estado de aprobación (PENDING_APPROVAL, APPROVED, REJECTED)"
+    )
+    tees: list[TeeResponseDTO] = Field(default_factory=list, description="Tees del campo")
+    holes: list[HoleResponseDTO] = Field(default_factory=list, description="Hoyos del campo")
+    timezone: str | None = Field(
+        None,
+        description=(
+            "Zona horaria IANA del campo, deducida de sus coordenadas (BE #305). "
+            "`null` cuando no se conoce: entonces la anotación de sus partidos NO "
+            "se abre sola y hay que pulsar START, cosa que conviene saber antes "
+            "de llegar a un campo sin cobertura."
+        ),
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CompetitionGolfCourseResponseDTO(BaseModel):
+    """DTO de respuesta para un campo de golf asociado a una competición."""
+
+    golf_course_id: UUID = Field(..., description="ID del campo de golf")
+    display_order: int = Field(..., description="Orden de visualización")
+    created_at: datetime = Field(..., description="Fecha de asociación")
+    golf_course: GolfCourseDetailDTO = Field(..., description="Detalles completos del campo")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GetCompetitionSummaryRequestDTO(BaseModel):
+    """La competición de la que se pide el resumen público."""
+
+    competition_id: UUID = Field(..., description="ID de la competición.")
+
+
+class CompetitionSummaryDTO(BaseModel):
+    """
+    El resumen público de una competición, sin sesión (release social 3, L5).
+
+    Para que la página de la clasificación sepa qué pintar sin la ficha.
+    """
+
+    id: UUID = Field(..., description="ID de la competición.")
+    name: str = Field(..., description="Nombre de la competición.")
+    tournament_type: str = Field(..., description="RYDER_CUP, STABLEFORD o MEDAL.")
+    has_teams: bool = Field(..., description="Si es por equipos (Ryder): su leaderboard.")
+    status: str = Field(..., description="Estado de la competición.")
+    visibility: str = Field(..., description="PUBLIC o PRIVATE.")
+    start_date: date = Field(..., description="Primer día.")
+    end_date: date = Field(..., description="Último día.")
+
+
+class SetCompetitionCourseTeeRequestDTO(BaseModel):
+    """
+    DTO de entrada para la barra de un campo para todos los de un género (R2,
+    barras por campo). Sin barras (null) se quita.
+    """
+
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    golf_course_id: UUID = Field(..., description="ID del campo de la competición.")
+    gender: Gender = Field(..., description="MALE o FEMALE.")
+    tee_color: TeeColor | None = Field(
+        ..., description="Las barras de ese campo para ese género, o null para quitarlas."
+    )
+
+
+class CompetitionCourseTeeResponseDTO(BaseModel):
+    """DTO de salida de la barra de un campo para un género."""
+
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    golf_course_id: UUID = Field(..., description="ID del campo.")
+    gender: str = Field(..., description="MALE o FEMALE.")
+    tee_color: str | None = Field(None, description="La barra fijada, o null si se quitó.")
+
+
+class GetCompetitionCourseTeesRequestDTO(BaseModel):
+    """DTO de entrada de lo fijado por campo y género (tabla del 21 nov 2026, A)."""
+
+    competition_id: UUID = Field(..., description="ID de la competición.")
+
+
+class CourseTeeForGenderDTO(BaseModel):
+    """La barra que el organizador fijó en un campo para un género (R2, tabla del 21 nov 2026)."""
+
+    golf_course_id: UUID = Field(..., description="ID del campo de la competición.")
+    gender: str = Field(..., description="MALE o FEMALE.")
+    tee_color: str = Field(..., description="La barra fijada en ese campo para ese género.")

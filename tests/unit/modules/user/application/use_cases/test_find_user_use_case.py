@@ -1,0 +1,465 @@
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+
+from src.modules.user.application.dto.user_dto import (
+    FindUserRequestDTO,
+    FindUserResponseDTO,
+)
+from src.modules.user.application.ports.bloqueos_interface import BloqueosInterface
+from src.modules.user.application.use_cases.find_user_use_case import FindUserUseCase
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.errors.user_errors import UserNotFoundError
+from src.modules.user.domain.value_objects.email import Email
+from src.modules.user.domain.value_objects.password import Password
+from src.modules.user.domain.value_objects.user_id import UserId
+
+# Marcar todos los tests para ejecutarse con asyncio
+pytestmark = pytest.mark.asyncio
+
+
+class _Bloqueos(BloqueosInterface):
+    """`me_bloquearon`: quienes bloquearon a quien busca."""
+
+    def __init__(self, me_bloquearon=()):
+        """Con quienes bloquearon a quien busca."""
+        self.me_bloquearon = set(me_bloquearon)
+
+    async def me_bloqueo(self, quien_mira, otro):
+        """Si `otro` está entre quienes me bloquearon."""
+        return otro in self.me_bloquearon
+
+    async def quienes_me_bloquearon(self, quien_mira):
+        """Quienes me bloquearon."""
+        return frozenset(self.me_bloquearon)
+
+
+class TestFindUserUseCase:
+    """
+    Suite de tests unitarios para FindUserUseCase.
+    """
+
+    @pytest.fixture
+    def mock_uow(self):
+        """Mock para Unit of Work."""
+        uow = AsyncMock()
+        uow.users = AsyncMock()
+        uow.__aenter__ = AsyncMock(return_value=uow)
+        uow.__aexit__ = AsyncMock(return_value=None)
+        return uow
+
+    @pytest.fixture
+    def sample_user(self):
+        """Usuario de muestra para testing."""
+        user = User(
+            id=UserId(uuid4()),
+            email=Email("test@example.com"),
+            password=Password.from_plain_text("s3cur3P@ssw0rd!"),
+            first_name="Test",
+            last_name="User",
+        )
+        return user
+
+    @pytest.fixture
+    def use_case(self, mock_uow):
+        """Instancia del caso de uso con mock dependencies."""
+        return FindUserUseCase(mock_uow, _Bloqueos())
+
+    async def test_find_user_by_email_successfully(self, use_case, mock_uow, sample_user):
+        """
+        Verifica que se puede encontrar un usuario por email correctamente.
+        """
+        # Arrange
+        mock_uow.users.find_by_email.return_value = sample_user
+
+        request = FindUserRequestDTO(email="test@example.com", full_name=None)
+
+        # Act
+        result = await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        # Assert
+        assert isinstance(result, FindUserResponseDTO)
+        assert result.user_id == sample_user.id.value
+        assert result.email == sample_user.email.value
+        assert result.full_name == "Test User"
+
+        # Verificar que se llamó al método correcto
+        mock_uow.users.find_by_email.assert_called_once()
+        call_args = mock_uow.users.find_by_email.call_args[0][0]
+        assert call_args.value == "test@example.com"
+
+    async def test_find_user_by_full_name_successfully(self, use_case, mock_uow, sample_user):
+        """
+        Verifica que se puede encontrar un usuario por nombre completo.
+        """
+        # Arrange
+        mock_uow.users.find_by_email.return_value = None  # No encontrado por email
+        mock_uow.users.find_by_full_name.return_value = sample_user
+
+        request = FindUserRequestDTO(email=None, full_name="Test User")
+
+        # Act
+        result = await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        # Assert
+        assert isinstance(result, FindUserResponseDTO)
+        assert result.user_id == sample_user.id.value
+        # Buscado por nombre por otro: sin correo
+        assert result.email == ""
+        assert result.full_name == "Test User"
+
+        # Verificar que se llamó al método correcto
+        mock_uow.users.find_by_full_name.assert_called_once_with("Test User")
+
+    async def test_find_user_prioritizes_email_over_name(self, use_case, mock_uow, sample_user):
+        """
+        Verifica que se prioriza la búsqueda por email cuando ambos parámetros están presentes.
+        """
+        # Arrange
+        mock_uow.users.find_by_email.return_value = sample_user
+
+        request = FindUserRequestDTO(email="test@example.com", full_name="Different User")
+
+        # Act
+        result = await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        # Assert
+        assert result.email == sample_user.email.value
+
+        # Verificar que se buscó por email pero NO por nombre
+        mock_uow.users.find_by_email.assert_called_once()
+        mock_uow.users.find_by_full_name.assert_not_called()
+
+    async def test_find_user_falls_back_to_name_when_email_not_found(
+        self, use_case, mock_uow, sample_user
+    ):
+        """
+        Verifica que se busca por nombre cuando no se encuentra por email.
+        """
+        # Arrange
+        mock_uow.users.find_by_email.return_value = None  # No encontrado por email
+        mock_uow.users.find_by_full_name.return_value = sample_user
+
+        request = FindUserRequestDTO(email="notfound@example.com", full_name="Test User")
+
+        # Act
+        result = await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        # Assert
+        assert result.full_name == "Test User"
+
+        # Verificar que se intentó buscar por ambos métodos
+        mock_uow.users.find_by_email.assert_called_once()
+        mock_uow.users.find_by_full_name.assert_called_once_with("Test User")
+
+    async def test_find_user_not_found_by_email_raises_error(self, use_case, mock_uow):
+        """
+        Verifica que se lanza UserNotFoundError cuando no se encuentra por email.
+        """
+        # Arrange
+        mock_uow.users.find_by_email.return_value = None
+
+        request = FindUserRequestDTO(email="notfound@example.com", full_name=None)
+
+        # Act & Assert
+        with pytest.raises(UserNotFoundError) as exc_info:
+            await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        assert "notfound@example.com" in str(exc_info.value)
+
+    async def test_find_user_not_found_by_name_raises_error(self, use_case, mock_uow):
+        """
+        Verifica que se lanza UserNotFoundError cuando no se encuentra por nombre.
+        """
+        # Arrange
+        mock_uow.users.find_by_full_name.return_value = None
+
+        request = FindUserRequestDTO(email=None, full_name="Nonexistent User")
+
+        # Act & Assert
+        with pytest.raises(UserNotFoundError) as exc_info:
+            await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        assert "Nonexistent User" in str(exc_info.value)
+
+    async def test_find_user_not_found_by_either_criteria_raises_error(self, use_case, mock_uow):
+        """
+        Verifica que se lanza UserNotFoundError cuando no se encuentra por ningún criterio.
+        """
+        # Arrange
+        mock_uow.users.find_by_email.return_value = None
+        mock_uow.users.find_by_full_name.return_value = None
+
+        request = FindUserRequestDTO(email="notfound@example.com", full_name="Nonexistent User")
+
+        # Act & Assert
+        with pytest.raises(UserNotFoundError) as exc_info:
+            await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        error_message = str(exc_info.value)
+        assert "notfound@example.com" in error_message
+        assert "Nonexistent User" in error_message
+
+    def test_find_user_validates_dto_constraints(self):
+        """
+        Verifica que el DTO valida correctamente las restricciones.
+        """
+        # Act & Assert - Sin ningún campo debe fallar
+        with pytest.raises(ValueError) as exc_info:
+            FindUserRequestDTO(email=None, full_name=None)
+
+        assert "al menos" in str(exc_info.value).lower()
+
+    def test_find_user_response_dto_structure(self, sample_user):
+        """
+        Verifica que el DTO de respuesta tiene la estructura correcta.
+        """
+        # Act
+        response = FindUserResponseDTO(
+            user_id=sample_user.id.value,
+            email=sample_user.email.value,
+            full_name=sample_user.get_full_name(),
+            display_name=sample_user.display_name,
+        )
+
+        # Assert
+        assert hasattr(response, "user_id")
+        assert hasattr(response, "email")
+        assert hasattr(response, "full_name")
+        assert hasattr(response, "display_name")
+        assert response.user_id == sample_user.id.value
+        assert response.email == sample_user.email.value
+        assert response.full_name == "Test User"
+
+    async def test_find_user_handles_complex_names(self, use_case, mock_uow):
+        """
+        Verifica que maneja correctamente nombres compuestos.
+        """
+        # Arrange
+        complex_user = User(
+            id=UserId(uuid4()),
+            email=Email("complex@example.com"),
+            password=Password.from_plain_text("s3cur3P@ssw0rd!"),
+            first_name="María José",
+            last_name="García-López de la Torre",
+        )
+
+        mock_uow.users.find_by_full_name.return_value = complex_user
+
+        request = FindUserRequestDTO(email=None, full_name="María José García-López de la Torre")
+
+        # Act
+        result = await use_case.execute(request, viewer_id=UserId(uuid4()))
+
+        # Assert
+        assert result.full_name == "María José García-López de la Torre"
+        mock_uow.users.find_by_full_name.assert_called_once_with(
+            "María José García-López de la Torre"
+        )
+
+
+class TestFindUserEmailPrivacy:
+    """
+    El correo del encontrado solo vuelve si es eco de lo que se tecleó o es uno
+    mismo: buscar por nombre no debe destapar correos ajenos.
+    """
+
+    @pytest.fixture
+    def mock_uow(self):
+        uow = AsyncMock()
+        uow.users = AsyncMock()
+        uow.__aenter__ = AsyncMock(return_value=uow)
+        uow.__aexit__ = AsyncMock(return_value=None)
+        return uow
+
+    @pytest.fixture
+    def otro(self):
+        return User(
+            id=UserId(uuid4()),
+            email=Email("otro@example.com"),
+            password=Password.from_plain_text("s3cur3P@ssw0rd!"),
+            first_name="Otro",
+            last_name="Jugador",
+        )
+
+    async def test_find_user_by_name_other_user_returns_empty_email(self, mock_uow, otro):
+        """
+        Given: un jugador que no es quien busca
+        When: se le busca por nombre
+        Then: llega sin correo
+        """
+        mock_uow.users.find_by_full_name.return_value = otro
+
+        result = await FindUserUseCase(mock_uow, _Bloqueos()).execute(
+            FindUserRequestDTO(full_name="Otro Jugador"), viewer_id=UserId(uuid4())
+        )
+
+        assert result.user_id == otro.id.value
+        assert result.email == ""
+
+    async def test_find_user_by_exact_email_other_user_echoes_email(self, mock_uow, otro):
+        """
+        Given: un jugador que no es quien busca
+        When: se le busca por su correo exacto, en otras mayúsculas
+        Then: el correo vuelve (es eco de lo tecleado)
+        """
+        mock_uow.users.find_by_email.return_value = otro
+
+        result = await FindUserUseCase(mock_uow, _Bloqueos()).execute(
+            FindUserRequestDTO(email="OTRO@Example.com"), viewer_id=UserId(uuid4())
+        )
+
+        assert result.email == "otro@example.com"
+
+    async def test_find_user_by_email_returning_another_user_returns_empty_email(
+        self, mock_uow, otro
+    ):
+        """
+        Given: la búsqueda por correo devuelve a alguien con otro correo
+        When: se busca
+        Then: no se destapa ese otro correo
+        """
+        mock_uow.users.find_by_email.return_value = otro
+
+        result = await FindUserUseCase(mock_uow, _Bloqueos()).execute(
+            FindUserRequestDTO(email="distinto@example.com"), viewer_id=UserId(uuid4())
+        )
+
+        assert result.email == ""
+
+    async def test_find_user_email_miss_then_name_hit_returns_empty_email(self, mock_uow, otro):
+        """
+        Given: el correo tecleado no existe y el nombre sí
+        When: se busca con ambos
+        Then: el encontrado por nombre llega sin correo
+        """
+        mock_uow.users.find_by_email.return_value = None
+        mock_uow.users.find_by_full_name.return_value = otro
+
+        result = await FindUserUseCase(mock_uow, _Bloqueos()).execute(
+            FindUserRequestDTO(email="nadie@example.com", full_name="Otro Jugador"),
+            viewer_id=UserId(uuid4()),
+        )
+
+        assert result.user_id == otro.id.value
+        assert result.email == ""
+
+    async def test_find_user_by_name_self_returns_own_email(self, mock_uow, otro):
+        """
+        Given: quien busca se busca a sí mismo por nombre
+        When: se busca
+        Then: ve su propio correo
+        """
+        mock_uow.users.find_by_full_name.return_value = otro
+
+        result = await FindUserUseCase(mock_uow, _Bloqueos()).execute(
+            FindUserRequestDTO(full_name="Otro Jugador"), viewer_id=UserId(otro.id.value)
+        )
+
+        assert result.email == "otro@example.com"
+
+
+class TestCuentaDesactivada:
+    """F-01b: una cuenta desactivada responde como una que no existe."""
+
+    @staticmethod
+    def _uow(user):
+        """Una unidad de trabajo falsa que encuentra a ese usuario por correo y por nombre."""
+        uow = AsyncMock()
+        uow.users = AsyncMock()
+        uow.users.find_by_email.return_value = user
+        uow.users.find_by_full_name.return_value = user
+        uow.__aenter__ = AsyncMock(return_value=uow)
+        uow.__aexit__ = AsyncMock(return_value=None)
+        return uow
+
+    @staticmethod
+    def _desactivada():
+        """Una cuenta desactivada."""
+        user = User(
+            id=UserId(uuid4()),
+            email=Email("baja@example.com"),
+            password=Password.from_plain_text("s3cur3P@ssw0rd!"),
+            first_name="Baja",
+            last_name="User",
+            is_active=False,
+        )
+        return user
+
+    async def test_f2_desactivada_no_se_encuentra_por_correo(self):
+        """
+        Given: Una cuenta desactivada
+        When: Se busca por su correo
+        Then: UserNotFoundError, como si no existiera. Por nombre la descarta el
+            propio repositorio (F7): ver test_in_memory_user_repository_search
+        """
+        use_case = FindUserUseCase(self._uow(self._desactivada()), _Bloqueos())
+
+        with pytest.raises(UserNotFoundError):
+            await use_case.execute(
+                FindUserRequestDTO(email="baja@example.com"), viewer_id=UserId(uuid4())
+            )
+
+
+class TestQuienMeBloqueo:
+    """F-09 (/code-review de la fase 3): quien me bloqueó no se encuentra; a quien bloqueé, sí."""
+
+    @staticmethod
+    def _uow(user):
+        """Una unidad de trabajo falsa que encuentra a ese usuario por correo y por nombre."""
+        uow = AsyncMock()
+        uow.users = AsyncMock()
+        uow.users.find_by_email.return_value = user
+        uow.users.find_by_full_name.return_value = user
+        uow.__aenter__ = AsyncMock(return_value=uow)
+        uow.__aexit__ = AsyncMock(return_value=None)
+        return uow
+
+    @staticmethod
+    def _otro():
+        """Otra cuenta activa."""
+        return User(
+            id=UserId(uuid4()),
+            email=Email("otro@example.com"),
+            password=Password.from_plain_text("s3cur3P@ssw0rd!"),
+            first_name="Otro",
+            last_name="User",
+        )
+
+    @pytest.mark.parametrize(
+        "busqueda",
+        [{"email": "otro@example.com"}, {"full_name": "Otro User"}],
+        ids=["por-correo", "por-nombre"],
+    )
+    async def test_quien_me_bloqueo_no_se_encuentra(self, busqueda):
+        """
+        Given: El dueño de ese correo o nombre me bloqueó
+        When: Lo busco
+        Then: UserNotFoundError, como si no existiera
+        """
+        otro = self._otro()
+        use_case = FindUserUseCase(self._uow(otro), _Bloqueos({otro.id}))
+
+        with pytest.raises(UserNotFoundError):
+            await use_case.execute(FindUserRequestDTO(**busqueda), viewer_id=UserId(uuid4()))
+
+    @pytest.mark.parametrize(
+        "busqueda",
+        [{"email": "otro@example.com"}, {"full_name": "Otro User"}],
+        ids=["por-correo", "por-nombre"],
+    )
+    async def test_a_quien_bloquee_yo_lo_encuentro(self, busqueda):
+        """
+        Given: Ningún bloqueo suyo hacia mí (quizá lo bloqueé yo)
+        When: Lo busco
+        Then: Lo encuentro
+        """
+        otro = self._otro()
+        use_case = FindUserUseCase(self._uow(otro), _Bloqueos())
+
+        resultado = await use_case.execute(
+            FindUserRequestDTO(**busqueda), viewer_id=UserId(uuid4())
+        )
+
+        assert resultado.user_id == otro.id.value

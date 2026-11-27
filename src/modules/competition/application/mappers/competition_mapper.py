@@ -1,0 +1,393 @@
+"""Mapper para convertir entidades Competition a DTOs de presentación."""
+
+import logging
+from collections.abc import Awaitable, Callable
+from typing import Any
+from uuid import UUID
+
+from src.modules.competition.application.dto.competition_dto import (
+    CaptaincyResponseDTO,
+    CompetitionCourseSummaryDTO,
+    CompetitionResponseDTO,
+    CountryResponseDTO,
+    CreatorDTO,
+    NextSessionDTO,
+    StrokePlaySettingsResponseDTO,
+)
+from src.modules.competition.application.services.resumen_de_la_competicion import (
+    ResumenDeLaCompeticion,
+)
+from src.modules.competition.domain.entities.competition import Competition
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.value_objects.campo_de_la_competicion import (
+    CampoDeLaCompeticion,
+)
+from src.modules.competition.domain.value_objects.enrollment_status import EnrollmentStatus
+from src.modules.competition.domain.value_objects.stroke_play_setup import StrokePlaySetup
+from src.modules.competition.domain.value_objects.visibility import Visibility
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.entities.country import Country
+
+logger = logging.getLogger(__name__)
+
+
+# Los capitanes y vices de la Ryder, en la respuesta de una competición
+_CARGOS = (
+    "team_a_captain_id",
+    "team_b_captain_id",
+    "team_a_vice_captain_id",
+    "team_b_vice_captain_id",
+)
+
+
+class CompetitionDTOMapper:
+    """
+    Mapper para convertir entidades Competition a DTOs de presentación.
+
+    RESPONSABILIDAD: Capa de aplicación
+    - Convertir entidades de dominio a DTOs
+    - Calcular campos derivados para UI (is_creator, enrolled_count, location)
+    - Formatear datos para el frontend
+    """
+
+    @staticmethod
+    async def to_response_dto(
+        competition: Competition,
+        current_user_id: UserId,
+        uow: CompetitionUnitOfWorkInterface,
+        user_uow: UserUnitOfWorkInterface | None = None,
+        is_admin: bool = False,
+        campos: list[CampoDeLaCompeticion] | None = None,
+    ) -> CompetitionResponseDTO:
+        """
+        Convierte una entidad Competition a CompetitionResponseDTO.
+
+        Calcula campos dinámicos:
+        - is_creator: si el usuario actual es el creador
+        - enrolled_count: número de enrollments APPROVED
+        - location: string formateado con nombres de países
+        - creator: información completa del creador (si user_uow es provisto)
+
+        pending_enrollments_count solo se calcula y expone para el creador
+        de la competición o para administradores (is_admin=True).
+
+        `campos`: los de esta competición si ya se leyeron (un listado los lee
+        todos de una vez con `to_response_dtos`); si no, se leen aquí.
+        """
+        is_creator = competition.creator_id == current_user_id
+
+        # Calcular enrolled_count
+        enrolled_count = await uow.enrollments.count_approved(competition.id)
+
+        # Calcular pending_enrollments_count (solo visible para creador/admin)
+        pending_enrollments_count = 0
+        if is_creator or is_admin:
+            pending_enrollments_count = await uow.enrollments.count_pending(competition.id)
+
+        # Obtener enrollment status del usuario actual (si existe)
+        user_enrollment_status = None
+        user_enrollment = await uow.enrollments.find_by_user_and_competition(
+            current_user_id, competition.id
+        )
+        if user_enrollment:
+            user_enrollment_status = (
+                user_enrollment.status.value
+                if hasattr(user_enrollment.status, "value")
+                else user_enrollment.status
+            )
+            logger.debug(
+                "Found enrollment for user %s in competition %s: %s",
+                current_user_id.value,
+                competition.id.value,
+                user_enrollment_status,
+            )
+        else:
+            logger.debug(
+                "No enrollment found for user %s in competition %s",
+                current_user_id.value,
+                competition.id.value,
+            )
+
+        # Formatear location
+        paises = await CompetitionDTOMapper._paises(competition, uow)
+        location_str = CompetitionDTOMapper._format_location(paises)
+
+        # Obtener lista de países con detalles
+        countries_list = CompetitionDTOMapper._get_countries_list(paises)
+
+        # Obtener información del creador (si user_uow es provisto)
+        creator_dto = None
+        if user_uow:
+            # Si el organizador juega, su elección de nombre, como la de cualquier
+            # inscrito: si no, una tarjeta y la lista le darían dos nombres. Se lee
+            # solo si hace falta (ver `_get_creator_dto`): la ficha tiene tope de
+            # consultas
+            async def eligio_su_nombre() -> bool:
+                inscripcion = (
+                    user_enrollment
+                    if is_creator
+                    else await uow.enrollments.find_by_user_and_competition(
+                        competition.creator_id, competition.id
+                    )
+                )
+                return inscripcion.use_real_name if inscripcion else False
+
+            creator_dto = await CompetitionDTOMapper._get_creator_dto(
+                competition.creator_id,
+                user_uow,
+                competition.visibility,
+                eligio_su_nombre=eligio_su_nombre,
+            )
+
+        # La tarjeta de «Mis competiciones» (FE #846)
+        if campos is None:
+            campos = (await uow.competitions.campos_de([competition.id])).get(competition.id, [])
+        juega = user_enrollment_status == EnrollmentStatus.APPROVED.value
+        del_torneo = CompetitionDTOMapper.tournament_fields(competition)
+        # En una privada, quien no está no ve a sus jugadores: tampoco a sus
+        # capitanes, que con el id se sacan del perfil (27 oct 2026, revisor)
+        if competition.visibility is Visibility.PRIVATE and not (is_creator or is_admin or juega):
+            del_torneo.update(dict.fromkeys(_CARGOS))
+        resumen = await ResumenDeLaCompeticion.de(competition, current_user_id, juega, uow)
+        proxima = resumen.proxima
+
+        # Construir DTO
+        return CompetitionResponseDTO(
+            id=competition.id.value,
+            creator_id=competition.creator_id.value,
+            creator=creator_dto,
+            name=str(competition.name),
+            status=competition.status.value,
+            # Dates
+            start_date=competition.dates.start_date,
+            end_date=competition.dates.end_date,
+            # Location - raw codes
+            country_code=competition.location.main_country.value,
+            secondary_country_code=(
+                competition.location.adjacent_country_1.value
+                if competition.location.adjacent_country_1
+                else None
+            ),
+            tertiary_country_code=(
+                competition.location.adjacent_country_2.value
+                if competition.location.adjacent_country_2
+                else None
+            ),
+            # Location - formatted
+            location=location_str,
+            # Location - countries array
+            countries=countries_list,
+            # Play Mode
+            play_mode=competition.play_mode.value,
+            # Config
+            max_players=competition.max_players,
+            max_playing_handicap=competition.max_playing_handicap,
+            enrollment_opens_days_before=competition.enrollment_opens_days_before,
+            # El plazo, con la zona del primer campo, de los campos ya leídos
+            **CompetitionDTOMapper.deadline_fields(competition, campos),
+            visibility=str(competition.visibility),
+            # Tipo de torneo y lo de la Ryder (vacío si no lo es)
+            **del_torneo,
+            # Campos calculados
+            is_creator=is_creator,
+            enrolled_count=enrolled_count,
+            pending_enrollments_count=pending_enrollments_count,
+            user_enrollment_status=user_enrollment_status,
+            golf_courses=[
+                CompetitionCourseSummaryDTO(
+                    id=c.golf_course_id.value, name=c.nombre, country_code=c.country_code.value
+                )
+                for c in campos
+            ],
+            playing_days=resumen.jornadas,
+            my_next_session=(
+                NextSessionDTO(
+                    date=proxima.fecha,
+                    session_type=proxima.sesion.value,
+                    tee_time=proxima.hora.strftime("%H:%M") if proxima.hora else None,
+                )
+                if proxima
+                else None
+            ),
+            # Timestamps
+            created_at=competition.created_at,
+            updated_at=competition.updated_at,
+        )
+
+    @staticmethod
+    async def to_response_dtos(
+        competitions: list[Competition],
+        current_user_id: UserId,
+        uow: CompetitionUnitOfWorkInterface,
+        user_uow: UserUnitOfWorkInterface | None = None,
+        is_admin: bool = False,
+    ) -> list[CompetitionResponseDTO]:
+        """Un listado: los campos de todas en una sola lectura (FE #846)."""
+        campos = await uow.competitions.campos_de([c.id for c in competitions])
+        return [
+            await CompetitionDTOMapper.to_response_dto(
+                c, current_user_id, uow, user_uow, is_admin=is_admin, campos=campos.get(c.id, [])
+            )
+            for c in competitions
+        ]
+
+    @staticmethod
+    def deadline_fields(
+        competition: Competition, campos: list[CampoDeLaCompeticion]
+    ) -> dict[str, Any]:
+        """
+        El plazo de inscripción para la app (16 nov 2026): su instante, si cuenta
+        y si fue él quien las cerró. La zona es la del primer campo, que ya viene
+        en `campos` (en su orden): ni una consulta más por competición.
+        """
+        zona = campos[0].zona if campos else None
+        return {
+            "enrollment_deadline": (
+                competition.enrollment_deadline(zona) if competition.dates.start_date else None
+            ),
+            "enrollment_deadline_applies": competition.deadline_applies(zona),
+            "enrollment_closed_by_deadline": competition.enrollment_closed_by_deadline,
+        }
+
+    @staticmethod
+    def tournament_fields(competition: Competition) -> dict[str, Any]:
+        """
+        El tipo de torneo, su modalidad y lo que es solo de la Ryder Cup (#251).
+
+        Un solo sitio para las respuestas que lo llevan (la ficha, la de crear y
+        la de editar), que antes lo construían a mano leyendo la pieza de la
+        Ryder como si siempre existiera. En un Stableford o un Medal no existe:
+        sus campos van vacíos.
+        """
+        ryder_cup = competition.ryder_cup
+
+        def valor(user_id: UserId | None) -> UUID | None:
+            return user_id.value if user_id else None
+
+        return {
+            "tournament_type": str(competition.tournament_type),
+            "modality": str(competition.modality),
+            "team_1_name": ryder_cup.team_1_name if ryder_cup else None,
+            "team_2_name": ryder_cup.team_2_name if ryder_cup else None,
+            "team_assignment": ryder_cup.team_assignment.value if ryder_cup else None,
+            "setup_mode": str(ryder_cup.setup_mode) if ryder_cup else None,
+            "team_a_captain_id": valor(ryder_cup.team_a_captain_id) if ryder_cup else None,
+            "team_b_captain_id": valor(ryder_cup.team_b_captain_id) if ryder_cup else None,
+            "team_a_vice_captain_id": (
+                valor(ryder_cup.team_a_vice_captain_id) if ryder_cup else None
+            ),
+            "team_b_vice_captain_id": (
+                valor(ryder_cup.team_b_vice_captain_id) if ryder_cup else None
+            ),
+            "stroke_play": (
+                CompetitionDTOMapper.to_stroke_play_dto(competition.stroke_play)
+                if competition.stroke_play
+                else None
+            ),
+        }
+
+    @staticmethod
+    def to_stroke_play_dto(ajustes: StrokePlaySetup) -> StrokePlaySettingsResponseDTO:
+        """Los ajustes del stroke play de una competición (#251)."""
+        return StrokePlaySettingsResponseDTO(
+            category_limits=list(ajustes.category_limits),
+            max_matchdays_per_player=ajustes.max_matchdays_per_player,
+            overall_standing=ajustes.overall_standing,
+            category_count=ajustes.category_count,
+        )
+
+    @staticmethod
+    def to_captaincy_dto(competition: Competition) -> CaptaincyResponseDTO:
+        """Capitanes y subcapitanes de la competición (BE #320)."""
+
+        def valor(user_id: UserId | None) -> UUID | None:
+            """El UUID del jugador, o None si el puesto está vacío."""
+            return user_id.value if user_id else None
+
+        ryder_cup = competition.require_ryder_cup()
+        return CaptaincyResponseDTO(
+            id=competition.id.value,
+            team_a_captain_id=valor(ryder_cup.team_a_captain_id),
+            team_b_captain_id=valor(ryder_cup.team_b_captain_id),
+            team_a_vice_captain_id=valor(ryder_cup.team_a_vice_captain_id),
+            team_b_vice_captain_id=valor(ryder_cup.team_b_vice_captain_id),
+        )
+
+    @staticmethod
+    async def _paises(
+        competition: Competition, uow: CompetitionUnitOfWorkInterface
+    ) -> list[Country]:
+        """
+        Los países de la competición, el principal primero: una lectura de
+        cada uno para la ubicación y para la lista (PR 2 de rendimiento).
+        """
+        location = competition.location
+        codigos = [location.main_country, location.adjacent_country_1, location.adjacent_country_2]
+        paises = []
+        for codigo in codigos:
+            if codigo and (pais := await uow.countries.find_by_code(codigo)):
+                paises.append(pais)
+        return paises
+
+    @staticmethod
+    def _format_location(paises: list[Country]) -> str:
+        """Formatea la ubicación como string legible (ej: "Spain, France")."""
+        return ", ".join(p.name_en for p in paises) if paises else "Unknown"
+
+    @staticmethod
+    def _get_countries_list(paises: list[Country]) -> list[CountryResponseDTO]:
+        """La lista de países participantes con códigos y nombres."""
+        return [
+            CountryResponseDTO(code=p.code.value, name_en=p.name_en, name_es=p.name_es)
+            for p in paises
+        ]
+
+    @staticmethod
+    async def _get_creator_dto(
+        creator_id: UserId,
+        user_uow: UserUnitOfWorkInterface,
+        visibility: Visibility,
+        *,
+        eligio_su_nombre: Callable[[], Awaitable[bool]] | None = None,
+    ) -> CreatorDTO | None:
+        """
+        Obtiene la información del creador de una competición. Sin su correo:
+        no sale nunca (BE #531).
+
+        Qué nombre va delante, con la regla de los jugadores (SB-08): en una pública,
+        el real; en una privada, lo que eligió si juega en ella (`eligio_su_nombre`)
+        y si no, el visible (su alias si tiene). Nombre, apellidos y alias van
+        siempre: el alias es un apodo, no un dato oculto (Agustín, 17 nov 2026).
+
+        Assumes caller manages the user_uow transaction context.
+        """
+        creator = await user_uow.users.find_by_id(creator_id)
+
+        if not creator:
+            logger.warning("Creator with id %s not found", creator_id.value)
+            return None
+
+        # Su inscripción solo importa en una privada y si tiene alias: si no, el nombre
+        # que se enseña es el mismo elija lo que elija, y no se lee
+        eligio = (
+            await eligio_su_nombre()
+            if eligio_su_nombre is not None
+            and visibility is Visibility.PRIVATE
+            and creator.alias is not None
+            else False
+        )
+        nombre_real = visibility.shows_real_name(eligio)
+        return CreatorDTO(
+            id=creator.id.value,
+            first_name=creator.first_name,
+            last_name=creator.last_name,
+            display_name=creator.display_name_or_legal(nombre_real),
+            alias=creator.alias,
+            handicap=creator.handicap.value if creator.handicap else None,
+            country_code=(creator.country_code.value if creator.country_code else None),
+        )

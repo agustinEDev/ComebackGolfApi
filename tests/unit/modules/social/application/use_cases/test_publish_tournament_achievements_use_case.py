@@ -1,0 +1,714 @@
+"""
+Tests de la publicacion de logros de un torneo (BE #175).
+
+Un torneo son varias vueltas por jugador, y eso trae dos reglas propias: cada
+partido lleva su propio `source_match_id`, y `FIRST_TOURNAMENT` se publica una
+sola vez aunque el jugador haya jugado cuatro partidos.
+"""
+
+from datetime import date, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+
+from src.modules.competition.domain.entities.competition import Competition
+from src.modules.competition.domain.entities.enrollment import Enrollment
+from src.modules.competition.domain.entities.hole_score import HoleScore
+from src.modules.competition.domain.entities.match import Match
+from src.modules.competition.domain.entities.round import Round
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.competition_name import CompetitionName
+from src.modules.competition.domain.value_objects.date_range import DateRange
+from src.modules.competition.domain.value_objects.enrollment_id import EnrollmentId
+from src.modules.competition.domain.value_objects.location import Location
+from src.modules.competition.domain.value_objects.match_player import MatchPlayer
+from src.modules.competition.domain.value_objects.session_type import SessionType
+from src.modules.competition.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork as InMemoryCompetitionUnitOfWork,
+)
+from src.modules.golf_course.domain.entities.golf_course import GolfCourse
+from src.modules.golf_course.domain.entities.hole import Hole
+from src.modules.golf_course.domain.entities.tee import Tee
+from src.modules.golf_course.domain.value_objects.course_type import CourseType
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+from src.modules.golf_course.infrastructure.persistence.in_memory.in_memory_golf_course_unit_of_work import (
+    InMemoryGolfCourseUnitOfWork,
+)
+from src.modules.quick_match.infrastructure.persistence.in_memory.in_memory_quick_match_unit_of_work import (
+    InMemoryQuickMatchUnitOfWork,
+)
+from src.modules.social.application.ports.player_course_history_interface import (
+    PlayedRound,
+    PlayerCourseHistoryInterface,
+)
+from src.modules.social.application.ports.player_differentials_interface import (
+    PlayerDifferentialsInterface,
+)
+from src.modules.social.application.use_cases.publish_tournament_achievements_use_case import (
+    PublishTournamentAchievementsUseCase,
+)
+from src.modules.social.domain.repositories.activity_event_repository_interface import (
+    ActivitySlice,
+)
+from src.modules.social.domain.value_objects.activity_event_type import ActivityEventType
+from src.modules.social.infrastructure.adapters.player_course_history_adapter import (
+    PlayerCourseHistoryAdapter,
+)
+from src.modules.social.infrastructure.persistence.in_memory.in_memory_social_unit_of_work import (
+    InMemorySocialUnitOfWork,
+)
+from src.modules.user.domain.entities.user import User
+from src.modules.user.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork as InMemoryUserUnitOfWork,
+)
+from src.shared.domain.value_objects.country_code import CountryCode
+from src.shared.domain.value_objects.gender import Gender
+from src.shared.domain.value_objects.match_format import MatchFormat
+from src.shared.domain.value_objects.play_mode import PlayMode
+
+pytestmark = pytest.mark.asyncio
+
+PAR = 4
+ROUND_DATE = date(2026, 6, 1)
+
+
+def _todos(*user_ids) -> ActivitySlice:
+    """Todo lo de esos jugadores, de cualquier tipo y visibilidad."""
+    return ActivitySlice(user_ids=tuple(user_ids), types=frozenset(ActivityEventType))
+
+
+class _DifferentialsStub(PlayerDifferentialsInterface):
+    """Las vueltas con diferencial de cada jugador, fijadas por el test."""
+
+    def __init__(self, por_jugador: dict | None = None):
+        self._por_jugador = por_jugador or {}
+
+    async def round_differentials(self, user_id):
+        return self._por_jugador.get(str(user_id.value), [])
+
+
+class _CourseHistoryFake(PlayerCourseHistoryInterface):
+    """Sin historial previo: todo campo se estrena, salvo lo que se registre."""
+
+    def __init__(self):
+        self._vueltas: set = set()
+        # El historial de verdad sobre las uows del test: devuelve tambien la
+        # vuelta que se publica, que es de donde cuelga el logro (22 oct 2026)
+        self.real: PlayerCourseHistoryInterface | None = None
+
+    def registra(self, user_id, golf_course_id: str, match_id: str) -> None:
+        self._vueltas.add((user_id, golf_course_id, match_id))
+
+    async def played_rounds(self, user_ids):
+        reales = await self.real.played_rounds(user_ids) if self.real else []
+        # Lo registrado se jugo hace mucho: es lo mas antiguo
+        return reales + [
+            PlayedRound(
+                user_id=usuario,
+                golf_course_id=campo,
+                instant=datetime(2000, 1, 1),
+                source_id=partida,
+                holes_played=18,
+            )
+            for usuario, campo, partida in self._vueltas
+            if usuario in set(user_ids)
+        ]
+
+
+@pytest.fixture
+def competition_uow():
+    return InMemoryCompetitionUnitOfWork()
+
+
+@pytest.fixture
+def golf_course_uow():
+    return InMemoryGolfCourseUnitOfWork()
+
+
+@pytest.fixture
+def user_uow():
+    return InMemoryUserUnitOfWork()
+
+
+@pytest.fixture
+def social_uow():
+    return InMemorySocialUnitOfWork()
+
+
+async def _create_user(user_uow, share_activity: bool = True) -> User:
+    user = User.create(
+        first_name="Test",
+        last_name="User",
+        email_str=f"tfeed_{uuid4().hex[:8]}@test.com",
+        plain_password="SecureP@ssw0rd123",
+    )
+    if not share_activity:
+        user.set_activity_sharing(False)
+    async with user_uow:
+        await user_uow.users.save(user)
+    return user
+
+
+async def _create_course(golf_course_uow, creator_id):
+    course = GolfCourse.create(
+        name="Tournament Golf Club",
+        country_code=CountryCode("ES"),
+        course_type=CourseType.STANDARD_18,
+        creator_id=creator_id,
+        tees=[
+            Tee(
+                color=TeeColor.YELLOW,
+                gender=Gender.MALE,
+                identifier="Yellow",
+                course_rating=70.0,
+                slope_rating=125,
+            ),
+            Tee(
+                color=TeeColor.WHITE,
+                gender=Gender.MALE,
+                identifier="White",
+                course_rating=72.0,
+                slope_rating=130,
+            ),
+        ],
+        holes=[Hole(number=i, par=PAR, stroke_index=i) for i in range(1, 19)],
+    )
+    course.approve()
+    async with golf_course_uow:
+        await golf_course_uow.golf_courses.save(course)
+    return course
+
+
+async def _completed_tournament(
+    competition_uow,
+    course,
+    player,
+    rival,
+    *,
+    scores_by_hole: dict | None = None,
+    matches: int = 1,
+    round_date: date = ROUND_DATE,
+    complete: bool = True,
+    tee_color: TeeColor = TeeColor.YELLOW,
+    tee_gender: Gender = Gender.MALE,
+):
+    """Un torneo terminado con la tarjeta del jugador anotada en cada partido."""
+    competition = Competition.create(
+        id=CompetitionId(uuid4()),
+        creator_id=player.id,
+        name=CompetitionName("Ryder Cup Test"),
+        dates=DateRange(start_date=round_date, end_date=round_date + timedelta(days=2)),
+        location=Location(main_country=CountryCode("ES")),
+        play_mode=PlayMode.SCRATCH,
+        team_1_name="Team A",
+        team_2_name="Team B",
+    )
+    if complete:
+        competition.activate()
+        competition.close_enrollments()
+        competition.start()
+        competition.complete()
+
+    round_ = Round.create(
+        competition_id=competition.id,
+        golf_course_id=course.id,
+        round_date=round_date,
+        session_type=SessionType.MORNING,
+        match_format=MatchFormat.SINGLES,
+    )
+
+    def match_player(user_id):
+        return MatchPlayer(
+            user_id=user_id,
+            playing_handicap=0,
+            tee_color=tee_color,
+            tee_gender=tee_gender,
+            # Scratch: no recibe golpe en ningun hoyo
+            strokes_received=(),
+        )
+
+    tarjeta = scores_by_hole or dict.fromkeys(range(1, 19), PAR)
+    creados = []
+
+    async with competition_uow:
+        await competition_uow.competitions.add(competition)
+        await competition_uow.rounds.add(round_)
+        for numero in range(1, matches + 1):
+            match = Match.create(
+                round_id=round_.id,
+                match_number=numero,
+                team_a_players=[match_player(player.id)],
+                team_b_players=[match_player(rival.id)],
+            )
+            match.start()
+            match.complete({"winner": "A", "score": "2UP"})
+            await competition_uow.matches.add(match)
+            for hole_number, strokes in tarjeta.items():
+                hole_score = HoleScore.create(
+                    match_id=match.id,
+                    hole_number=hole_number,
+                    player_user_id=player.id,
+                    team="A",
+                    strokes_received=0,
+                )
+                hole_score.set_own_score(strokes)
+                await competition_uow.hole_scores.add(hole_score)
+            creados.append(match)
+
+        for jugador in (player, rival):
+            await competition_uow.enrollments.add(
+                Enrollment.direct_enroll(
+                    id=EnrollmentId(uuid4()),
+                    competition_id=competition.id,
+                    user_id=jugador.id,
+                )
+            )
+        await competition_uow.commit()
+
+    return competition, creados
+
+
+def _use_case(
+    social_uow, competition_uow, golf_course_uow, user_uow, differentials=None, history=None
+):
+    return PublishTournamentAchievementsUseCase(
+        social_uow=social_uow,
+        competition_uow=competition_uow,
+        golf_course_uow=golf_course_uow,
+        user_uow=user_uow,
+        differentials=differentials or _DifferentialsStub(),
+        history=_con_historial_real(
+            history or _CourseHistoryFake(), competition_uow, golf_course_uow
+        ),
+    )
+
+
+def _con_historial_real(history, competition_uow, golf_course_uow):
+    if isinstance(history, _CourseHistoryFake) and history.real is None:
+        history.real = PlayerCourseHistoryAdapter(
+            InMemoryQuickMatchUnitOfWork(), competition_uow, golf_course_uow
+        )
+    return history
+
+
+async def _feed_de(social_uow, user):
+    async with social_uow:
+        return await social_uow.activity_events.find_in([_todos(user.id)], limit=50)
+
+
+async def test_publica_los_logros_de_la_vuelta_de_torneo(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """Given un torneo con un birdie / When se cierra / Then sale en el feed."""
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    tarjeta = dict.fromkeys(range(1, 19), PAR)
+    tarjeta[4] = PAR - 1
+    competition, _ = await _completed_tournament(
+        competition_uow, course, player, rival, scores_by_hole=tarjeta
+    )
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    eventos = await _feed_de(social_uow, player)
+    birdies = [e for e in eventos if e.type == ActivityEventType.BIRDIE]
+    assert len(birdies) == 1
+    assert birdies[0].payload["from_tournament"] is True
+
+
+async def test_el_primer_torneo_se_publica_una_sola_vez(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    Given un jugador que estrena torneo jugando tres partidos / When se cierra /
+    Then la noticia sale una vez, no tres.
+    """
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(competition_uow, course, player, rival, matches=3)
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    estrenos = [
+        e
+        for e in await _feed_de(social_uow, player)
+        if e.type == ActivityEventType.FIRST_TOURNAMENT
+    ]
+    assert len(estrenos) == 1
+
+
+async def test_cada_partido_lleva_su_propia_entrada(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    Given dos partidos con birdie / When se cierra el torneo / Then hay una
+    entrada de birdie por partido, cada una colgada del suyo.
+    """
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    tarjeta = dict.fromkeys(range(1, 19), PAR)
+    tarjeta[4] = PAR - 1
+    competition, partidos = await _completed_tournament(
+        competition_uow, course, player, rival, scores_by_hole=tarjeta, matches=2
+    )
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    birdies = [e for e in await _feed_de(social_uow, player) if e.type == ActivityEventType.BIRDIE]
+    assert len(birdies) == 2
+    assert {e.source_match_id for e in birdies} == {str(p.id.value) for p in partidos}
+
+
+async def test_reprocesar_el_cierre_no_duplica(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """Given un torneo ya publicado / When se reprocesa / Then el feed no crece."""
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(competition_uow, course, player, rival)
+    use_case = _use_case(social_uow, competition_uow, golf_course_uow, user_uow)
+
+    await use_case.execute(str(competition.id.value))
+    antes = len(await _feed_de(social_uow, player))
+    await use_case.execute(str(competition.id.value))
+
+    assert len(await _feed_de(social_uow, player)) == antes
+
+
+async def test_con_la_publicacion_apagada_publica_solo_para_el(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    D20a. Given un inscrito con la publicacion apagada / When se cierra / Then
+    sus logros se guardan, pero ocultos a sus amigos.
+    """
+    player = await _create_user(user_uow, share_activity=False)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(competition_uow, course, player, rival)
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    suyos = await _feed_de(social_uow, player)
+    assert suyos
+    assert all(e.visible_to_friends is False for e in suyos)
+
+
+async def test_con_la_publicacion_encendida_lo_ven_sus_amigos(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """D20c. Given un inscrito que publica / When se cierra / Then sus logros son visibles."""
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(competition_uow, course, player, rival)
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    suyos = await _feed_de(social_uow, player)
+    assert suyos
+    assert all(e.visible_to_friends is True for e in suyos)
+
+
+async def test_un_torneo_sin_cerrar_no_publica(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """Given un torneo en juego / When se intenta publicar / Then no publica nada."""
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(
+        competition_uow, course, player, rival, complete=False
+    )
+
+    publicados = await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    assert publicados == 0
+
+
+async def test_una_tarjeta_incompleta_no_llega_al_feed(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    Given una tarjeta con huecos / When se cierra / Then esa vuelta no cuenta
+    para el birdie, pero piso el campo: «campo nuevo» y «primer torneo» si
+    (Agustin, 22 oct 2026).
+    """
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    tarjeta = dict.fromkeys(range(1, 13), PAR)
+    tarjeta[4] = PAR - 1
+    competition, _ = await _completed_tournament(
+        competition_uow, course, player, rival, scores_by_hole=tarjeta
+    )
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    assert sorted(e.type for e in await _feed_de(social_uow, player)) == sorted(
+        [ActivityEventType.NEW_COURSE, ActivityEventType.FIRST_TOURNAMENT]
+    )
+
+
+async def test_un_torneo_que_no_existe_no_rompe(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """Given un id que no existe / When se publica / Then devuelve cero sin fallar."""
+    publicados = await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(uuid4())
+    )
+
+    assert publicados == 0
+
+
+async def test_el_birdie_de_torneo_se_mide_contra_el_par_de_su_barra(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    Un 4 en el hoyo 1 es birdie desde rojas (par 5) y solo par en la tarjeta
+    del campo, que es contra la que se medía antes. En 25 de los 800 campos
+    federados el par cambia de una barra a otra.
+    """
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = GolfCourse.create(
+        name="Two Cards Club",
+        country_code=CountryCode("ES"),
+        course_type=CourseType.STANDARD_18,
+        creator_id=player.id,
+        tees=[
+            Tee(
+                color=TeeColor.YELLOW,
+                gender=Gender.MALE,
+                identifier="Yellow",
+                course_rating=70.0,
+                slope_rating=125,
+                holes=[Hole(number=i, par=PAR, stroke_index=i) for i in range(1, 19)],
+            ),
+            Tee(
+                color=TeeColor.RED,
+                gender=Gender.FEMALE,
+                identifier="Red",
+                course_rating=72.0,
+                slope_rating=130,
+                holes=[
+                    Hole(number=i, par=PAR + 1 if i == 1 else PAR, stroke_index=i)
+                    for i in range(1, 19)
+                ],
+            ),
+        ],
+        holes=[Hole(number=i, par=PAR, stroke_index=i) for i in range(1, 19)],
+    )
+    course.approve()
+    async with golf_course_uow:
+        await golf_course_uow.golf_courses.save(course)
+
+    competition, _ = await _completed_tournament(
+        competition_uow,
+        course,
+        player,
+        rival,
+        scores_by_hole=dict.fromkeys(range(1, 19), PAR),
+        tee_color=TeeColor.RED,
+        tee_gender=Gender.FEMALE,
+    )
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    eventos = await _feed_de(social_uow, player)
+    birdies = [e for e in eventos if e.type == ActivityEventType.BIRDIE]
+    assert len(birdies) == 1
+    assert birdies[0].payload["holes"] == [1]
+
+
+class _ApagaAlJuzgar(_CourseHistoryFake):
+    """Apaga la publicacion del jugador mientras se juzgan sus vueltas."""
+
+    def __init__(self, user):
+        super().__init__()
+        self._user = user
+
+    async def played_rounds(self, user_ids):
+        self._user.set_activity_sharing(False)
+        return await super().played_rounds(user_ids)
+
+
+async def test_apagar_la_publicacion_antes_de_guardar_deja_el_logro_oculto(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    Given un inscrito que publica al empezar / When apaga la publicacion antes
+    de que se guarden sus logros / Then se guardan ocultos.
+    """
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(competition_uow, course, player, rival)
+
+    await _use_case(
+        social_uow, competition_uow, golf_course_uow, user_uow, history=_ApagaAlJuzgar(player)
+    ).execute(str(competition.id.value))
+
+    eventos = await _feed_de(social_uow, player)
+    assert eventos
+    assert all(e.visible_to_friends is False for e in eventos)
+
+
+async def test_los_logros_de_un_torneo_comparten_fecha_de_publicacion(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """Given un torneo con varios logros / When se publica / Then un solo `published_at`."""
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(competition_uow, course, player, rival)
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    eventos = await _feed_de(social_uow, player)
+    assert len(eventos) >= 2
+    assert len({e.published_at for e in eventos}) == 1
+
+
+async def test_la_ronda_de_torneo_se_fecha_a_mediodia_utc(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    Given un torneo jugado el 1 de junio / When se publica / Then `occurred_at`
+    es ese dia a las 12:00 UTC: sale con «Z», y a medianoche se veria el dia
+    anterior en cualquier zona al oeste de Greenwich.
+    """
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    competition, _ = await _completed_tournament(competition_uow, course, player, rival)
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    eventos = await _feed_de(social_uow, player)
+    assert eventos
+    assert {e.occurred_at for e in eventos} == {datetime(2026, 6, 1, 12, 0)}
+
+
+async def test_l1_a_ryder_card_with_a_raya_publishes_its_birdie(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """
+    Agustin, 23 oct 2026: la raya (enviada sin numero) es un hoyo jugado, como
+    en la partida rapida. Antes la vuelta quedaba con 17 y no publicaba nada.
+    """
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    tarjeta: dict = dict.fromkeys(range(1, 19), PAR)
+    tarjeta[4] = PAR - 1
+    tarjeta[7] = None
+    competition, _ = await _completed_tournament(
+        competition_uow, course, player, rival, scores_by_hole=tarjeta
+    )
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    tipos = [e.type for e in await _feed_de(social_uow, player)]
+    assert ActivityEventType.BIRDIE in tipos
+
+
+async def test_l7_a_ryder_hole_nobody_sent_still_does_not_count(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """Un hoyo con su fila pero sin nada enviado no es una raya: la vuelta no cuenta."""
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    tarjeta: dict = dict.fromkeys(range(1, 18), PAR)
+    tarjeta[4] = PAR - 1
+    competition, (partido,) = await _completed_tournament(
+        competition_uow, course, player, rival, scores_by_hole=tarjeta
+    )
+    async with competition_uow:
+        await competition_uow.hole_scores.add(
+            HoleScore.create(
+                match_id=partido.id,
+                hole_number=18,
+                player_user_id=player.id,
+                team="A",
+                strokes_received=0,
+            )
+        )
+        await competition_uow.commit()
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    tipos = [e.type for e in await _feed_de(social_uow, player)]
+    assert ActivityEventType.BIRDIE not in tipos
+
+
+async def test_l4_a_ryder_raya_alone_gives_no_achievement(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    """La raya se juzga como doble bogey: solo pisar el campo y el primer torneo."""
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    tarjeta: dict = dict.fromkeys(range(1, 19), PAR)
+    tarjeta[7] = None
+    competition, _ = await _completed_tournament(
+        competition_uow, course, player, rival, scores_by_hole=tarjeta
+    )
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    assert sorted(e.type for e in await _feed_de(social_uow, player)) == sorted(
+        [ActivityEventType.NEW_COURSE, ActivityEventType.FIRST_TOURNAMENT]
+    )
+
+
+async def test_l6_half_a_ryder_round_with_a_raya(
+    social_uow, competition_uow, golf_course_uow, user_uow
+):
+    player = await _create_user(user_uow)
+    rival = await _create_user(user_uow)
+    course = await _create_course(golf_course_uow, player.id)
+    tarjeta: dict = dict.fromkeys(range(1, 10), PAR)
+    tarjeta[4] = PAR - 1
+    tarjeta[7] = None
+    competition, _ = await _completed_tournament(
+        competition_uow, course, player, rival, scores_by_hole=tarjeta
+    )
+
+    await _use_case(social_uow, competition_uow, golf_course_uow, user_uow).execute(
+        str(competition.id.value)
+    )
+
+    tipos = [e.type for e in await _feed_de(social_uow, player)]
+    assert ActivityEventType.BIRDIE in tipos

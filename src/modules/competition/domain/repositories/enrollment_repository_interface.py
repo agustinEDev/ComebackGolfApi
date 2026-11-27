@@ -1,0 +1,245 @@
+"""
+Enrollment Repository Interface - Domain Layer
+
+Define el contrato para la persistencia de inscripciones siguiendo principios de Clean Architecture.
+Esta interfaz pertenece al dominio y será implementada en la capa de infraestructura.
+"""
+
+from abc import ABC, abstractmethod
+
+from src.modules.user.domain.value_objects.user_id import UserId
+
+from ..entities.enrollment import Enrollment
+from ..value_objects.competition_id import CompetitionId
+from ..value_objects.enrollment_id import EnrollmentId
+from ..value_objects.enrollment_status import EnrollmentStatus
+
+
+class EnrollmentRepositoryInterface(ABC):
+    """
+    Interfaz para el repositorio de inscripciones.
+
+    Define las operaciones CRUD y consultas específicas del dominio de enrollments.
+    Esta interfaz es independiente de la implementación de persistencia concreta.
+
+    Principios seguidos:
+    - Dependency Inversion: El dominio define el contrato, infraestructura lo implementa
+    - Single Responsibility: Solo operaciones relacionadas con persistencia de enrollments
+    - Interface Segregation: Métodos específicos y cohesivos
+    """
+
+    @abstractmethod
+    async def add(self, enrollment: Enrollment) -> None:
+        """
+        Agrega una nueva inscripción al repositorio.
+
+        Args:
+            enrollment: La entidad inscripción a guardar
+
+        Raises:
+            EnrollmentAlreadyExistsError: Si ya existe una inscripción con el mismo ID
+        """
+        pass
+
+    @abstractmethod
+    async def update(self, enrollment: Enrollment) -> None:
+        """
+        Actualiza una inscripción existente en el repositorio.
+
+        Args:
+            enrollment: La entidad inscripción con los datos actualizados
+
+        Raises:
+            EnrollmentNotFoundError: Si la inscripción no existe
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_id(self, enrollment_id: EnrollmentId) -> Enrollment | None:
+        """
+        Busca una inscripción por su ID único.
+
+        Args:
+            enrollment_id: El identificador único de la inscripción
+
+        Returns:
+            Optional[Enrollment]: La inscripción encontrada o None si no existe
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_id_for_update(self, enrollment_id: EnrollmentId) -> Enrollment | None:
+        """
+        Busca una inscripción por su ID con bloqueo de fila (SELECT ... FOR UPDATE).
+
+        Devuelve el estado de la base de datos, aunque la sesión ya la tuviera
+        cargada: quien la lee tras esperar un bloqueo decide con el estado nuevo.
+
+        Args:
+            enrollment_id: El identificador único de la inscripción
+
+        Returns:
+            Optional[Enrollment]: La inscripción encontrada o None si no existe
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_competition(
+        self, competition_id: CompetitionId, limit: int | None = None, offset: int = 0
+    ) -> list[Enrollment]:
+        """
+        Busca todas las inscripciones de una competición específica.
+
+        Útil para: Listar todos los jugadores inscritos en un torneo.
+
+        Args:
+            competition_id: El ID de la competición
+            limit: Número máximo de inscripciones; None (por defecto) = todas
+            offset: Número de inscripciones a saltar (default: 0)
+
+        Returns:
+            List[Enrollment]: Lista de inscripciones de la competición
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_competition_and_status(
+        self,
+        competition_id: CompetitionId,
+        status: EnrollmentStatus,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Enrollment]:
+        """
+        Busca inscripciones de una competición filtradas por estado.
+
+        Útil para: Listar solo APPROVED para formar equipos, ver REQUESTED pendientes.
+
+        Args:
+            competition_id: El ID de la competición
+            status: El estado de inscripción (REQUESTED, APPROVED, etc.)
+            limit: Número máximo de inscripciones; None (por defecto) = todas
+            offset: Número de inscripciones a saltar (default: 0)
+
+        Returns:
+            List[Enrollment]: Lista de inscripciones con el estado especificado
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_user(
+        self, user_id: UserId, limit: int | None = None, offset: int = 0
+    ) -> list[Enrollment]:
+        """
+        Busca todas las inscripciones de un usuario específico.
+
+        Útil para: Dashboard del jugador ("Mis inscripciones").
+
+        Args:
+            user_id: El ID del usuario
+            limit: Número máximo de inscripciones; None (por defecto) = todas
+            offset: Número de inscripciones a saltar (default: 0)
+
+        Returns:
+            List[Enrollment]: Lista de inscripciones del usuario
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_user_ids_and_competition(
+        self, user_ids: list[UserId], competition_id: CompetitionId
+    ) -> list[Enrollment]:
+        """
+        Busca las inscripciones de un conjunto conocido de usuarios en una competición.
+
+        Útil para: resolver un dato por-inscripción (por ejemplo la
+        preferencia de nombre, BE #254) de un grupo de jugadores ya
+        identificado —los que aparecen en la clasificación—, sin traer el
+        historial entero de inscripciones de la competición ni paginar.
+
+        Args:
+            user_ids: Los IDs de los usuarios de interés
+            competition_id: El ID de la competición
+
+        Returns:
+            List[Enrollment]: Las inscripciones encontradas, como mucho una
+                por usuario (a lo sumo `len(user_ids)` resultados)
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_user_and_competition(
+        self, user_id: UserId, competition_id: CompetitionId
+    ) -> Enrollment | None:
+        """
+        Busca una inscripción específica de un usuario en una competición.
+
+        Útil para: Obtener enrollment existente para validaciones de business logic.
+
+        Args:
+            user_id: El ID del usuario
+            competition_id: El ID de la competición
+
+        Returns:
+            Optional[Enrollment]: La inscripción encontrada o None si no existe
+        """
+        pass
+
+    @abstractmethod
+    async def count_approved(self, competition_id: CompetitionId) -> int:
+        """
+        Cuenta el total de inscripciones aprobadas en una competición.
+
+        Útil para: Saber cuántos jugadores están confirmados, validar mínimos/máximos.
+
+        Args:
+            competition_id: El ID de la competición
+
+        Returns:
+            int: Número total de inscripciones aprobadas
+        """
+        pass
+
+    @abstractmethod
+    async def count_approved_by_competition(self, competition_id: CompetitionId) -> int:
+        """
+        Alias para count_approved.
+        Cuenta el total de inscripciones aprobadas en una competición.
+
+        Args:
+            competition_id: El ID de la competición
+
+        Returns:
+            int: Número total de inscripciones aprobadas
+        """
+        pass
+
+    @abstractmethod
+    async def count_active_by_user(self, user_id: UserId) -> int:
+        """
+        Cuenta el total de inscripciones activas (APPROVED/REQUESTED) de un usuario.
+
+        Útil para: Validar límite de inscripciones por usuario (business logic guard).
+
+        Args:
+            user_id: El ID del usuario
+
+        Returns:
+            int: Número total de inscripciones activas
+        """
+        pass
+
+    @abstractmethod
+    async def count_pending(self, competition_id: CompetitionId) -> int:
+        """
+        Cuenta el total de inscripciones pendientes (REQUESTED) en una competición.
+
+        Útil para: Mostrar notificaciones al creador sobre solicitudes pendientes.
+
+        Args:
+            competition_id: El ID de la competición
+
+        Returns:
+            int: Número total de inscripciones con estado REQUESTED
+        """
+        pass

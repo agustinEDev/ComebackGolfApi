@@ -1,0 +1,417 @@
+"""
+Enrollment Entity - Representa la inscripción de un jugador en una competición.
+
+Esta entidad gestiona el estado de participación de un jugador en un torneo.
+"""
+
+from datetime import datetime
+from decimal import Decimal
+
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+
+from ..value_objects.competition_id import CompetitionId
+from ..value_objects.enrollment_id import EnrollmentId
+from ..value_objects.enrollment_status import EnrollmentStatus
+from ..value_objects.stroke_play_setup import handicap_fijado
+
+
+class EnrollmentStateError(Exception):
+    """Excepción lanzada cuando se intenta una operación en un estado inválido."""
+
+    pass
+
+
+class Enrollment:
+    """
+    Entidad Enrollment - Representa una inscripción de jugador.
+
+    Gestiona:
+    - Estado de inscripción (solicitudes, invitaciones, aprobaciones)
+    - Asignación a equipo
+    - Hándicap personalizado (override del oficial)
+
+    Invariantes:
+    - competition_id y user_id no pueden ser None
+    - custom_handicap debe estar en rango válido si se especifica
+    - Las transiciones de estado deben ser válidas
+    - team_id puede ser None hasta que se asigne
+    """
+
+    def __init__(
+        self,
+        id: EnrollmentId,
+        competition_id: CompetitionId,
+        user_id: UserId,
+        status: EnrollmentStatus,
+        team_id: str | None = None,
+        custom_handicap: Decimal | None = None,
+        tee_color: TeeColor | None = None,
+        use_real_name: bool = True,
+        fixed_handicap: Decimal | None = None,
+        fixed_category: int | None = None,
+        entered_waiting: bool = False,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+    ):
+        # Validaciones
+        """
+        Raises:
+            ValueError: Si el hándicap personalizado está fuera de rango
+        """
+        if custom_handicap is not None:
+            self._validate_custom_handicap(custom_handicap)
+
+        # Asignación de atributos privados (encapsulación)
+        self._id = id
+        self._competition_id = competition_id
+        self._user_id = user_id
+        self._status = status
+        self._team_id = team_id
+        self._custom_handicap = custom_handicap
+        self._tee_color = tee_color
+        self._use_real_name = use_real_name
+        # El hándicap de todo el torneo, fijado al cerrar las inscripciones: de
+        # él sale su categoría en un stroke play (#251)
+        self._fixed_handicap = fixed_handicap
+        # Y su categoría, con la regla de los seis, fijada a la vez (#251)
+        self._fixed_category = fixed_category
+        # Entró en la competición apuntándose a una lista de espera: si se queda
+        # sin plaza y sin espera, sale (W2 y A4, 28 oct 2026)
+        self._entered_waiting = entered_waiting
+        self._created_at = created_at or ahora_utc_sin_zona()
+        self._updated_at = updated_at or ahora_utc_sin_zona()
+
+    @classmethod
+    def request(
+        cls,
+        id: EnrollmentId,
+        competition_id: CompetitionId,
+        user_id: UserId,
+        tee_color: TeeColor | None = None,
+    ) -> "Enrollment":
+        """Factory method para crear una solicitud de inscripción."""
+        enrollment = cls(
+            id=id,
+            competition_id=competition_id,
+            user_id=user_id,
+            status=EnrollmentStatus.REQUESTED,
+            tee_color=tee_color,
+        )
+
+        return enrollment
+
+    @classmethod
+    def invite(
+        cls, id: EnrollmentId, competition_id: CompetitionId, user_id: UserId
+    ) -> "Enrollment":
+        """Factory method para crear una invitación."""
+        return cls(
+            id=id,
+            competition_id=competition_id,
+            user_id=user_id,
+            status=EnrollmentStatus.INVITED,
+        )
+
+    @classmethod
+    def direct_enroll(
+        cls,
+        id: EnrollmentId,
+        competition_id: CompetitionId,
+        user_id: UserId,
+        custom_handicap: Decimal | None = None,
+        tee_color: TeeColor | None = None,
+    ) -> "Enrollment":
+        """Factory method para inscripción directa por el creador."""
+        enrollment = cls(
+            id=id,
+            competition_id=competition_id,
+            user_id=user_id,
+            status=EnrollmentStatus.APPROVED,
+            custom_handicap=custom_handicap,
+            tee_color=tee_color,
+        )
+
+        return enrollment
+
+    @staticmethod
+    def _validate_custom_handicap(handicap: Decimal) -> None:
+        """Valida que el hándicap personalizado esté en rango válido."""
+        min_handicap = Decimal("-10.0")
+        max_handicap = Decimal("54.0")
+
+        if handicap < min_handicap or handicap > max_handicap:
+            raise ValueError(
+                f"El hándicap personalizado debe estar entre {min_handicap} y {max_handicap}. "
+                f"Se recibió: {handicap}"
+            )
+
+    # ===========================================
+    # PROPERTIES (Encapsulación — solo lectura)
+    # ===========================================
+
+    @property
+    def id(self) -> EnrollmentId:
+        return self._id
+
+    @property
+    def competition_id(self) -> CompetitionId:
+        return self._competition_id
+
+    @property
+    def user_id(self) -> UserId:
+        return self._user_id
+
+    @property
+    def status(self) -> EnrollmentStatus:
+        return self._status
+
+    @property
+    def team_id(self) -> str | None:
+        return self._team_id
+
+    @property
+    def custom_handicap(self) -> Decimal | None:
+        return self._custom_handicap
+
+    @property
+    def tee_color(self) -> TeeColor | None:
+        return self._tee_color
+
+    @property
+    def use_real_name(self) -> bool:
+        """
+        Si esta competición muestra el nombre legal del jugador en vez de su
+        alias (BE #254). `True` por defecto: una competición tiene lista de
+        salida y clasificación pública, así que enseña el nombre legal salvo
+        que el jugador pida su alias para ella. En las partidas rápidas el
+        alias sigue siendo incondicional.
+        """
+        return self._use_real_name
+
+    @property
+    def created_at(self) -> datetime:
+        return self._created_at
+
+    @property
+    def updated_at(self) -> datetime:
+        return self._updated_at
+
+    # ===========================================
+    # MÉTODOS DE CONSULTA (QUERIES)
+    # ===========================================
+
+    def is_pending(self) -> bool:
+        """Verifica si está pendiente de acción (REQUESTED o INVITED)."""
+        return self._status.is_pending()
+
+    def is_approved(self) -> bool:
+        """Verifica si está aprobado/inscrito."""
+        return self._status.is_active()
+
+    @property
+    def fixed_handicap(self) -> Decimal | None:
+        """El hándicap de todo el torneo, fijado al cerrar las inscripciones (#251)."""
+        return self._fixed_handicap
+
+    @property
+    def fixed_category(self) -> int | None:
+        """Su categoría, fijada al cerrar las inscripciones con la regla de los seis (#251)."""
+        return self._fixed_category
+
+    def congelar_handicap(self, handicap: Decimal | None, categoria: int | None = None) -> None:
+        """
+        Fija el hándicap de todo el torneo y su categoría, al cerrar las inscripciones (#251).
+
+        Si se reabren y se vuelven a cerrar, se fija de nuevo con el de ese momento.
+        Y no se mueve aunque luego alguien se retire (decidido el 7 oct 2026).
+        """
+        # Con un decimal, como lo guarda la columna: lo que se compara es lo guardado
+        self._fixed_handicap = handicap_fijado(handicap)
+        self._fixed_category = categoria
+
+    def handicap_que_cuenta(self, del_perfil: Decimal | None) -> Decimal | None:
+        """
+        El hándicap con el que juega en esta competición (BE #251).
+
+        El propio de la inscripción si el organizador le puso uno, y si no el de
+        su perfil. Sin ninguno, None: qué hacer entonces lo decide quien pregunta
+        (la Ryder juega con cero; el stroke play no deja empezar).
+
+        Args:
+            del_perfil: El hándicap del perfil del jugador, si lo tiene
+        """
+        # `is not None` y no `or`: un personalizado de 0,0 es un hándicap
+        return self._custom_handicap if self._custom_handicap is not None else del_perfil
+
+    def has_custom_handicap(self) -> bool:
+        """Verifica si tiene hándicap personalizado."""
+        return self._custom_handicap is not None
+
+    # ===========================================
+    # MÉTODOS DE COMANDO (CAMBIOS DE ESTADO)
+    # ===========================================
+
+    def approve(self) -> None:
+        """Aprueba la inscripción (REQUESTED/INVITED → APPROVED)."""
+        if not self._status.can_transition_to(EnrollmentStatus.APPROVED):
+            raise EnrollmentStateError(
+                f"No se puede aprobar un enrollment en estado {self._status.value}"
+            )
+
+        self._status = EnrollmentStatus.APPROVED
+        self._updated_at = ahora_utc_sin_zona()
+
+    def reject(self) -> None:
+        """Rechaza la inscripción (REQUESTED/INVITED → REJECTED)."""
+        if not self._status.can_transition_to(EnrollmentStatus.REJECTED):
+            raise EnrollmentStateError(
+                f"No se puede rechazar un enrollment en estado {self._status.value}"
+            )
+
+        self._status = EnrollmentStatus.REJECTED
+        self._updated_at = ahora_utc_sin_zona()
+
+    def withdraw(self) -> None:
+        """Retira la inscripción voluntariamente (APPROVED → WITHDRAWN)."""
+        if not self._status.can_transition_to(EnrollmentStatus.WITHDRAWN):
+            raise EnrollmentStateError(
+                f"No se puede retirar un enrollment en estado {self._status.value}. "
+                f"Solo se permite desde APPROVED."
+            )
+
+        self._status = EnrollmentStatus.WITHDRAWN
+        self._updated_at = ahora_utc_sin_zona()
+
+    def cancel(self) -> None:
+        """Cancela la solicitud (REQUESTED/INVITED → CANCELLED)."""
+        if not self._status.can_transition_to(EnrollmentStatus.CANCELLED):
+            raise EnrollmentStateError(
+                f"No se puede cancelar un enrollment en estado {self._status.value}. "
+                f"Solo se permite desde REQUESTED o INVITED."
+            )
+
+        self._status = EnrollmentStatus.CANCELLED
+        self._updated_at = ahora_utc_sin_zona()
+
+    @property
+    def entered_waiting(self) -> bool:
+        """Si entró apuntándose a una lista de espera (release social 3)."""
+        return self._entered_waiting
+
+    def entra_esperando(self) -> None:
+        """
+        Entró en una pública apuntándose a la espera de una franja llena (D6).
+
+        Así se distingue de quien entró por invitación o a mano y aún no tiene
+        franja: solo a quien entró esperando le saca quedarse sin plaza y sin
+        espera (decidido el 28 oct 2026).
+        """
+        self._entered_waiting = True
+        self._updated_at = ahora_utc_sin_zona()
+
+    def consigue_plaza(self) -> None:
+        """
+        Ya tiene plaza en una franja: deja de contar como entrado esperando. Si
+        luego la suelta, el organizador lo coloca, como a cualquiera (code-review,
+        28 oct 2026).
+        """
+        if self._entered_waiting:
+            self._entered_waiting = False
+            self._updated_at = ahora_utc_sin_zona()
+
+    def volver_a_entrar(
+        self,
+        *,
+        aprobada: bool,
+        tee_color: TeeColor | None = None,
+        custom_handicap: Decimal | None = None,
+    ) -> None:
+        """
+        Una inscripción cerrada vuelve a abrirse (release social 2, 27 oct 2026).
+
+        Rechazada, cancelada o retirada se queda en la tabla, y la restricción
+        única (competición, usuario) no mira el estado: sin esto, quien la tenía
+        no podía volver a entrar por ninguna vía. Se reutiliza la misma fila,
+        limpia de lo de la vez anterior (equipo, hándicap fijado). Entra como
+        nuevo: con la fecha de hoy, que ordena las solicitudes (decidido el 27
+        oct). El nombre que eligió mostrar es preferencia suya: se queda.
+
+        Args:
+            aprobada: Entra ya (invitación aceptada, inscripción a mano) o pide plaza
+            tee_color: Su barra, si la elige
+            custom_handicap: El hándicap que le pone el organizador, si lo hay
+
+        Raises:
+            EnrollmentStateError: Si no está cerrada (aprobada o pendiente)
+            ValueError: Si el hándicap no es válido
+        """
+        if not self._status.is_final():
+            raise EnrollmentStateError(
+                f"Solo vuelve a entrar una inscripción cerrada, no una en estado "
+                f"{self._status.value}"
+            )
+        if custom_handicap is not None:
+            self._validate_custom_handicap(custom_handicap)
+
+        self._status = EnrollmentStatus.APPROVED if aprobada else EnrollmentStatus.REQUESTED
+        self._team_id = None
+        self._entered_waiting = False
+        self._custom_handicap = custom_handicap
+        self._tee_color = tee_color
+        self._fixed_handicap = None
+        self._fixed_category = None
+        self._created_at = ahora_utc_sin_zona()
+        self._updated_at = self._created_at
+
+    # ===========================================
+    # MÉTODOS DE ACTUALIZACIÓN
+    # ===========================================
+
+    def set_custom_handicap(self, handicap: Decimal) -> None:
+        """Establece un hándicap personalizado."""
+        self._validate_custom_handicap(handicap)
+        self._custom_handicap = handicap
+        self._updated_at = ahora_utc_sin_zona()
+
+    def remove_custom_handicap(self) -> None:
+        """Elimina el hándicap personalizado."""
+        self._custom_handicap = None
+        self._updated_at = ahora_utc_sin_zona()
+
+    def set_tee_color(self, tee_color: TeeColor | None) -> None:
+        """
+        Establece o cambia el color de barras del jugador. Sin color, vuelve a
+        jugar desde las habituales de su género (BE #912).
+        """
+        self._tee_color = tee_color
+        self._updated_at = ahora_utc_sin_zona()
+
+    def set_name_preference(self, use_real_name: bool) -> None:
+        """
+        Elige si esta competición muestra el nombre legal en vez del alias (BE #254).
+
+        Quien decide es el propio jugador, sobre su propia inscripción — a
+        diferencia del hándicap personalizado, que decide el creador. Y a
+        diferencia del hándicap, esto no se congela al empezar el torneo: se
+        puede corregir en cualquier estado de la competición.
+        """
+        self._use_real_name = use_real_name
+        self._updated_at = ahora_utc_sin_zona()
+
+    # ===========================================
+    # MÉTODOS ESPECIALES
+    # ===========================================
+
+    def __str__(self) -> str:
+        return (
+            f"Enrollment({self._user_id} → Competition {self._competition_id}, "
+            f"{self._status.value})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Enrollment) and self._id == other._id
+
+    def __hash__(self) -> int:
+        return hash(self._id)

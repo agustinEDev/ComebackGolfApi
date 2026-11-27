@@ -1,0 +1,197 @@
+"""In-Memory Competition Repository para testing."""
+
+from collections.abc import Iterable, Sequence
+from datetime import date, datetime, time
+
+from src.modules.competition.domain.entities.competition import Competition
+from src.modules.competition.domain.repositories.competition_repository_interface import (
+    CompetitionRepositoryInterface,
+)
+from src.modules.competition.domain.value_objects.campo_de_la_competicion import (
+    CampoDeLaCompeticion,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.competition_name import (
+    CompetitionName,
+)
+from src.modules.competition.domain.value_objects.competition_status import (
+    CompetitionStatus,
+)
+from src.modules.competition.domain.value_objects.visibility import Visibility
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+def _mas_recientes_primero(competiciones: Iterable[Competition]) -> list[Competition]:
+    """El orden del repositorio de SQL (created_at descendente), para paginar igual."""
+    return sorted(competiciones, key=lambda c: c.created_at, reverse=True)
+
+
+class InMemoryCompetitionRepository(CompetitionRepositoryInterface):
+    """
+    Implementación en memoria del repositorio de competiciones para testing.
+    """
+
+    def __init__(self):
+        self._competitions: dict[CompetitionId, Competition] = {}
+        # En memoria no hay campos de verdad: los tests los ponen con su nombre
+        self._campos: dict[CompetitionId, list[CampoDeLaCompeticion]] = {}
+
+    def con_campos(self, competition_id: CompetitionId, campos: list[CampoDeLaCompeticion]) -> None:
+        """Para los tests: los campos que tiene una competición, en su orden."""
+        self._campos[competition_id] = list(campos)
+
+    async def campos_de(
+        self, competition_ids: Sequence[CompetitionId]
+    ) -> dict[CompetitionId, list[CampoDeLaCompeticion]]:
+        return {i: list(self._campos[i]) for i in competition_ids if self._campos.get(i)}
+
+    async def add(self, competition: Competition) -> None:
+        """Agrega una nueva competición."""
+        self._competitions[competition.id] = competition
+
+    async def update(self, competition: Competition) -> None:
+        """Actualiza una competición existente."""
+        if competition.id in self._competitions:
+            self._competitions[competition.id] = competition
+
+    async def save(self, competition: Competition) -> None:
+        """Guarda o actualiza una competición (alias para compatibilidad)."""
+        self._competitions[competition.id] = competition
+
+    async def find_by_id(self, competition_id: CompetitionId) -> Competition | None:
+        """Busca una competición por su ID."""
+        return self._competitions.get(competition_id)
+
+    async def find_by_id_for_update(self, competition_id: CompetitionId) -> Competition | None:
+        """Busca una competición por su ID con bloqueo (no-op en memoria)."""
+        return self._competitions.get(competition_id)
+
+    async def find_by_creator(
+        self, creator_id: UserId, limit: int = 100, offset: int = 0
+    ) -> list[Competition]:
+        """Busca las competiciones creadas por un usuario, paginadas como la de SQL."""
+        suyas = [comp for comp in self._competitions.values() if comp.creator_id == creator_id]
+        return _mas_recientes_primero(suyas)[offset : offset + limit]
+
+    async def find_by_status(
+        self, status: CompetitionStatus, limit: int = 100, offset: int = 0
+    ) -> list[Competition]:
+        """Busca las competiciones con un estado, paginadas como la de SQL."""
+        con_ese = [comp for comp in self._competitions.values() if comp.status == status]
+        return _mas_recientes_primero(con_ese)[offset : offset + limit]
+
+    async def find_active_starting_by(self, first_day: date, last_day: date) -> list[Competition]:
+        return [
+            c
+            for c in self._competitions.values()
+            if c.status == CompetitionStatus.ACTIVE
+            and first_day <= c.dates.start_date <= last_day
+            and (
+                c.enrollment_opened_at is None
+                or c.enrollment_opened_at < datetime.combine(c.dates.start_date, time(0, 0))
+            )
+        ]
+
+    async def find_active_without_opening_time(self) -> list[Competition]:
+        return [
+            c
+            for c in self._competitions.values()
+            if c.status == CompetitionStatus.ACTIVE and c.enrollment_opened_at is None
+        ]
+
+    async def exists_with_name(
+        self,
+        name: CompetitionName,
+        creator_id: UserId,
+        except_id: CompetitionId | None = None,
+    ) -> bool:
+        """Verifica si existe una competición con un nombre específico para un creador."""
+        return any(
+            comp.name.clave == name.clave and comp.creator_id == creator_id and comp.id != except_id
+            for comp in self._competitions.values()
+        )
+
+    async def delete(self, competition_id: CompetitionId) -> bool:
+        """Elimina una competición por su ID: True si existía."""
+        return self._competitions.pop(competition_id, None) is not None
+
+    async def find_all(self, limit: int = 100, offset: int = 0) -> list[Competition]:
+        """Retorna las competiciones, paginadas como el repositorio de verdad."""
+        return _mas_recientes_primero(self._competitions.values())[offset : offset + limit]
+
+    async def count_all(self) -> int:
+        """Cuenta el total de competiciones en el sistema."""
+        return len(self._competitions)
+
+    async def count_by_creator(self, creator_id: UserId) -> int:
+        """Cuenta el total de competiciones creadas por un usuario."""
+        return sum(1 for comp in self._competitions.values() if comp.creator_id == creator_id)
+
+    async def find_by_filters(
+        self,
+        search_name: str | None = None,
+        search_creator: str | None = None,
+        status: CompetitionStatus | None = None,
+        creator_id: UserId | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Competition]:
+        """
+        Busca competiciones aplicando múltiples filtros opcionales.
+
+        Esta implementación in-memory simula el comportamiento de la búsqueda
+        case-insensitive que se hace en la base de datos con ILIKE.
+
+        Note: search_creator requiere acceso a User data, que en memoria no está
+        disponible. Esta implementación solo filtra por los campos de Competition.
+        """
+        results = list(self._competitions.values())
+
+        # Apply filter: search by competition name (case-insensitive)
+        if search_name:
+            search_lower = search_name.lower()
+            results = [comp for comp in results if search_lower in str(comp.name).lower()]
+
+        # Apply filter: filter by competition status
+        if status:
+            results = [comp for comp in results if comp.status == status]
+
+        # Apply filter: filter by creator user ID
+        if creator_id:
+            results = [comp for comp in results if comp.creator_id == creator_id]
+
+        # Ordenar por created_at descendente (más recientes primero)
+        results.sort(key=lambda c: c.created_at, reverse=True)
+
+        # Paginar
+        return results[offset : offset + limit]
+
+    async def find_status_mark(
+        self, competition_id: CompetitionId
+    ) -> tuple[CompetitionStatus, datetime] | None:
+        competition = self._competitions.get(competition_id)
+        return None if competition is None else (competition.status, competition.updated_at)
+
+    async def find_visibilities(
+        self, competition_ids: list[CompetitionId]
+    ) -> dict[CompetitionId, Visibility]:
+        return {
+            i: self._competitions[i].visibility for i in competition_ids if i in self._competitions
+        }
+
+    async def find_by_ids(self, competition_ids: list[CompetitionId]) -> list[Competition]:
+        return [
+            self._competitions[i] for i in dict.fromkeys(competition_ids) if i in self._competitions
+        ]
+
+    async def find_ids_with_status(
+        self, competition_ids: list[CompetitionId], status: CompetitionStatus
+    ) -> list[CompetitionId]:
+        return sorted(
+            (
+                i
+                for i in dict.fromkeys(competition_ids)
+                if i in self._competitions and self._competitions[i].status == status
+            ),
+            key=lambda i: str(i.value),
+        )

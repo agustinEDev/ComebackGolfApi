@@ -1,0 +1,228 @@
+"""Tests para MatchPlayer value object."""
+
+from decimal import Decimal
+
+import pytest
+
+from src.modules.competition.domain.value_objects.match_player import MatchPlayer
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.value_objects.gender import Gender
+
+
+class TestMatchPlayerCreate:
+    """Tests para creación de MatchPlayer"""
+
+    def test_create_with_valid_data(self):
+        """Crea MatchPlayer con datos válidos."""
+        user_id = UserId.generate()
+
+        player = MatchPlayer.create(
+            user_id=user_id,
+            playing_handicap=12,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 3, 5, 7, 9, 11, 13, 15, 17, 2, 4, 6],
+        )
+
+        assert player.user_id == user_id
+        assert player.playing_handicap == 12
+        assert player.tee_color == TeeColor.YELLOW
+        assert player.tee_gender == Gender.MALE
+        assert len(player.strokes_received) == 12
+
+    def test_create_with_zero_handicap(self):
+        """Crea MatchPlayer con handicap 0 (scratch)."""
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=0,
+            tee_color=TeeColor.WHITE,
+            tee_gender=Gender.MALE,
+            strokes_received=[],
+        )
+
+        assert player.playing_handicap == 0
+        assert len(player.strokes_received) == 0
+
+    def test_a_plus_player_has_a_negative_playing_handicap(self):
+        """
+        Un plus juega con hándicap negativo (BE #165): en individual se guarda el
+        suyo, y los golpes son la diferencia con el rival.
+        """
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=-2,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[],
+        )
+
+        assert player.playing_handicap == -2
+
+    def test_create_with_invalid_hole_number_raises(self):
+        """Error si número de hoyo es inválido."""
+        with pytest.raises(ValueError, match="Invalid hole number"):
+            MatchPlayer.create(
+                user_id=UserId.generate(),
+                playing_handicap=5,
+                tee_color=TeeColor.YELLOW,
+                tee_gender=Gender.MALE,
+                strokes_received=[1, 2, 3, 19],  # 19 es inválido
+            )
+
+    def test_create_with_duplicate_holes_allowed(self):
+        """PH > 18: duplicados permitidos (wrap-around por stroke index)."""
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=23,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3, 3, 5],  # 3 aparece 2 veces (2 strokes en hoyo 3)
+        )
+        assert player.strokes_on_hole(3) == 2
+        assert player.strokes_on_hole(1) == 1
+        assert player.strokes_on_hole(4) == 0
+
+
+class TestMatchPlayerPlayerHandicap:
+    """Tests para el snapshot player_handicap (HM-1b)."""
+
+    def test_defaults_to_none_when_not_provided(self):
+        """Si no se pasa player_handicap, queda en None (compat con partidos previos a HM-1b)."""
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=12,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+
+        assert player.player_handicap is None
+
+    def test_stores_snapshot_value(self):
+        """Guarda el HI del jugador en el momento de generar el partido."""
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=12,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+            player_handicap=Decimal("14.2"),
+        )
+
+        assert player.player_handicap == Decimal("14.2")
+
+
+class TestMatchPlayerImmutability:
+    """Tests para inmutabilidad de MatchPlayer"""
+
+    def test_is_frozen_dataclass(self):
+        """MatchPlayer es inmutable (frozen)."""
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=10,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+
+        with pytest.raises(AttributeError):
+            player.playing_handicap = 15
+
+
+class TestMatchPlayerQueryMethods:
+    """Tests para métodos de consulta"""
+
+    def test_receives_stroke_on_hole_true(self):
+        """Retorna True si recibe golpe en el hoyo."""
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=5,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 3, 5, 7, 9],
+        )
+
+        assert player.receives_stroke_on_hole(1) is True
+        assert player.receives_stroke_on_hole(5) is True
+        assert player.receives_stroke_on_hole(9) is True
+
+    def test_receives_stroke_on_hole_false(self):
+        """Retorna False si no recibe golpe en el hoyo."""
+        player = MatchPlayer.create(
+            user_id=UserId.generate(),
+            playing_handicap=5,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 3, 5, 7, 9],
+        )
+
+        assert player.receives_stroke_on_hole(2) is False
+        assert player.receives_stroke_on_hole(18) is False
+
+
+class TestMatchPlayerEquality:
+    """Tests para igualdad (value object)"""
+
+    def test_same_values_are_equal(self):
+        """MatchPlayers con mismos valores son iguales."""
+        user_id = UserId.generate()
+
+        player1 = MatchPlayer.create(
+            user_id=user_id,
+            playing_handicap=10,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+        player2 = MatchPlayer.create(
+            user_id=user_id,
+            playing_handicap=10,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+
+        assert player1 == player2
+
+    def test_different_handicap_not_equal(self):
+        """MatchPlayers con diferente handicap no son iguales."""
+        user_id = UserId.generate()
+
+        player1 = MatchPlayer.create(
+            user_id=user_id,
+            playing_handicap=10,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+        player2 = MatchPlayer.create(
+            user_id=user_id,
+            playing_handicap=15,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+
+        assert player1 != player2
+
+    def test_different_tee_not_equal(self):
+        """MatchPlayers con diferente tee no son iguales."""
+        user_id = UserId.generate()
+
+        player1 = MatchPlayer.create(
+            user_id=user_id,
+            playing_handicap=10,
+            tee_color=TeeColor.YELLOW,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+        player2 = MatchPlayer.create(
+            user_id=user_id,
+            playing_handicap=10,
+            tee_color=TeeColor.BLUE,
+            tee_gender=Gender.MALE,
+            strokes_received=[1, 2, 3],
+        )
+
+        assert player1 != player2

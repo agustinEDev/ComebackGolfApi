@@ -1,0 +1,146 @@
+"""
+Competition Unit of Work Interface - Competition Module Domain Layer.
+
+Define el contrato específico para el Unit of Work del módulo de competiciones.
+Esta interfaz extiende la base añadiendo acceso a los repositorios de competiciones.
+"""
+
+from abc import abstractmethod
+from contextlib import AbstractAsyncContextManager
+
+from src.shared.domain.repositories.country_repository_interface import (
+    CountryRepositoryInterface,
+)
+from src.shared.domain.repositories.unit_of_work_interface import UnitOfWorkInterface
+
+from .barras_por_campo_repository_interface import BarrasPorCampoRepositoryInterface
+from .competition_repository_interface import CompetitionRepositoryInterface
+from .draft_repository_interface import DraftRepositoryInterface
+from .enrollment_repository_interface import EnrollmentRepositoryInterface
+from .envelope_repository_interface import EnvelopeRepositoryInterface
+from .espera_en_franja_repository_interface import EsperaEnFranjaRepositoryInterface
+from .golpe_de_partida_repository_interface import GolpeDePartidaRepositoryInterface
+from .handicap_update_repository_interface import HandicapUpdateRepositoryInterface
+from .hole_score_repository_interface import HoleScoreRepositoryInterface
+from .invitation_repository_interface import InvitationRepositoryInterface
+from .match_repository_interface import MatchRepositoryInterface
+from .partida_repository_interface import PartidaRepositoryInterface
+from .plaza_en_franja_repository_interface import PlazaEnFranjaRepositoryInterface
+from .round_repository_interface import RoundRepositoryInterface
+from .team_assignment_repository_interface import TeamAssignmentRepositoryInterface
+
+
+class CompetitionUnitOfWorkInterface(UnitOfWorkInterface):
+    """
+    Interfaz especifica para el Unit of Work del modulo de competiciones.
+
+    Proporciona acceso coordinado a todos los repositorios relacionados
+    con el dominio de competiciones, manteniendo consistencia transaccional.
+    """
+
+    @property
+    @abstractmethod
+    def competitions(self) -> CompetitionRepositoryInterface:
+        """Acceso al repositorio de competiciones."""
+        pass
+
+    @property
+    @abstractmethod
+    def enrollments(self) -> EnrollmentRepositoryInterface:
+        """Acceso al repositorio de inscripciones."""
+        pass
+
+    @property
+    @abstractmethod
+    def envelopes(self) -> EnvelopeRepositoryInterface:
+        """Acceso al repositorio de sobres (FE #655)."""
+        pass
+
+    @property
+    @abstractmethod
+    def countries(self) -> CountryRepositoryInterface:
+        """Acceso al repositorio de paises."""
+        pass
+
+    @property
+    @abstractmethod
+    def rounds(self) -> RoundRepositoryInterface:
+        """Acceso al repositorio de rondas."""
+        pass
+
+    @property
+    @abstractmethod
+    def matches(self) -> MatchRepositoryInterface:
+        """Acceso al repositorio de partidos."""
+        pass
+
+    @property
+    @abstractmethod
+    def team_assignments(self) -> TeamAssignmentRepositoryInterface:
+        """Acceso al repositorio de asignaciones de equipos."""
+        pass
+
+    @property
+    @abstractmethod
+    def drafts(self) -> DraftRepositoryInterface:
+        """Acceso al repositorio de salas de draft (FE #653)."""
+        pass
+
+    @property
+    @abstractmethod
+    def invitations(self) -> InvitationRepositoryInterface:
+        """Acceso al repositorio de invitaciones."""
+        pass
+
+    @property
+    @abstractmethod
+    def hole_scores(self) -> HoleScoreRepositoryInterface:
+        """Acceso al repositorio de hole scores."""
+        pass
+
+    @property
+    @abstractmethod
+    def esperas(self) -> EsperaEnFranjaRepositoryInterface:
+        """Las listas de espera de las franjas de stroke play (#251)."""
+        pass
+
+    @property
+    @abstractmethod
+    def plazas(self) -> PlazaEnFranjaRepositoryInterface:
+        """Las plazas de los jugadores en las franjas de stroke play (#251)."""
+        pass
+
+    @property
+    @abstractmethod
+    def partidas(self) -> PartidaRepositoryInterface:
+        """Las partidas de las franjas de stroke play (#251, PR 4)."""
+        pass
+
+    @property
+    @abstractmethod
+    def golpes_de_partida(self) -> GolpeDePartidaRepositoryInterface:
+        """Los golpes de los jugadores de las partidas (#251, PR 5)."""
+        pass
+
+    @property
+    @abstractmethod
+    def handicap_updates(self) -> HandicapUpdateRepositoryInterface:
+        """Las actualizaciones de hándicaps con la RFEG y sus resultados (#251)."""
+        pass
+
+    @property
+    @abstractmethod
+    def barras_por_campo(self) -> BarrasPorCampoRepositoryInterface:
+        """Los cambios de barras por campo: propios y para todos los de un género."""
+        pass
+
+    @abstractmethod
+    def savepoint(self) -> AbstractAsyncContextManager[None]:
+        """Un punto de vuelta dentro de la transaccion abierta (BE #361).
+
+        Lo que se escriba dentro se deshace si sale una excepcion, y lo de
+        antes se queda. Lo necesita abrir los sobres: los partidos se generan
+        en la misma transaccion, y si fallan a mitad no pueden dejar ni los
+        sobres cerrados ni la mitad de los partidos escritos.
+        """
+        pass

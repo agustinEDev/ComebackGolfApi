@@ -1,0 +1,308 @@
+"""
+RefreshToken Entity.
+
+Entidad que representa un token de renovación (refresh token) para autenticación.
+"""
+
+from datetime import datetime, timedelta
+
+from src.modules.user.domain.value_objects.refresh_token_id import RefreshTokenId
+from src.modules.user.domain.value_objects.token_hash import TokenHash
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+
+# Dos pestañas refrescan a la vez con la misma cookie: la segunda llega con el token
+# que la primera acaba de sustituir. Dentro de este margen no es un robo (F-02, A2)
+MARGEN_DE_LA_SUSTITUCION = timedelta(seconds=60)
+
+
+class RefreshToken:
+    """
+    Entidad de dominio RefreshToken.
+
+    Representa un token de renovación que permite obtener nuevos access tokens
+    sin necesidad de re-autenticarse con usuario/contraseña.
+
+    Lifecycle:
+    - Creado en login/register
+    - Usado en /refresh-token para obtener nuevo access token
+    - Revocado en logout o cambio de contraseña
+    - Expirado después de 7 días (o configurado)
+    - Sustituido en cada refresco por su sucesor (rotación, F-02): no se borra ni se
+      revoca, porque hace falta para distinguir dos pestañas, una respuesta perdida y
+      un robo. El sucesor es de la misma sesión: hereda la caducidad absoluta y el
+      inicio (`created_at`), así que «una sesión más nueva» (BE #734) sigue siendo un
+      login más nuevo y nunca la propia cadena
+
+    Attributes:
+        id: Identificador único del refresh token
+        user_id: ID del usuario propietario
+        device_id: ID del dispositivo asociado (permite revocar por dispositivo)
+        token_hash: Hash SHA256 del token JWT (no almacenamos texto plano)
+        expires_at: Fecha/hora de expiración
+        created_at: Fecha/hora de creación
+        revoked: Si el token ha sido revocado manualmente
+        revoked_at: Fecha/hora de revocación (si aplica)
+        replaced_at: Cuándo se sustituyó por su sucesor (None: vigente)
+        replaced_by_id: Su último sucesor (None: vigente)
+        annulled_at: Cuándo se anuló: el sustituto de una respuesta perdida, que nunca
+            llegó al navegador (F-02, A3). Si vuelve, alguien lo tenía: robo
+    """
+
+    def __init__(
+        self,
+        id: RefreshTokenId,
+        user_id: UserId,
+        token_hash: TokenHash,
+        expires_at: datetime,
+        device_id: UserDeviceId | None = None,
+        created_at: datetime | None = None,
+        revoked: bool = False,
+        revoked_at: datetime | None = None,
+        replaced_at: datetime | None = None,
+        replaced_by_id: RefreshTokenId | None = None,
+        annulled_at: datetime | None = None,
+    ):
+        """
+        Inicializa un RefreshToken.
+
+        Args:
+            id: Identificador único del token
+            user_id: ID del usuario propietario
+            token_hash: Hash del token JWT
+            expires_at: Fecha/hora de expiración
+            device_id: ID del dispositivo asociado (opcional para backward compatibility)
+            created_at: Fecha/hora de creación (auto-generado si None)
+            revoked: Si el token está revocado
+            revoked_at: Fecha/hora de revocación
+        """
+        self._id = id
+        self._user_id = user_id
+        self._token_hash = token_hash
+        self._expires_at = expires_at
+        self._device_id = device_id
+        self._created_at = created_at or ahora_utc_sin_zona()
+        self._revoked = revoked
+        self._revoked_at = revoked_at
+        self._replaced_at = replaced_at
+        self._replaced_by_id = replaced_by_id
+        self._annulled_at = annulled_at
+
+    @property
+    def id(self) -> RefreshTokenId:
+        """Retorna el ID del refresh token."""
+        return self._id
+
+    @property
+    def user_id(self) -> UserId:
+        """Retorna el ID del usuario propietario."""
+        return self._user_id
+
+    @property
+    def token_hash(self) -> TokenHash:
+        """Retorna el hash del token."""
+        return self._token_hash
+
+    @property
+    def expires_at(self) -> datetime:
+        """Retorna la fecha de expiración."""
+        return self._expires_at
+
+    @property
+    def created_at(self) -> datetime:
+        """Retorna la fecha de creación."""
+        return self._created_at
+
+    @property
+    def revoked(self) -> bool:
+        """Retorna si el token está revocado."""
+        return self._revoked
+
+    @property
+    def revoked_at(self) -> datetime | None:
+        """Retorna la fecha de revocación (si aplica)."""
+        return self._revoked_at
+
+    @property
+    def device_id(self) -> UserDeviceId | None:
+        """Retorna el ID del dispositivo asociado."""
+        return self._device_id
+
+    @property
+    def replaced_at(self) -> datetime | None:
+        """Cuándo se sustituyó por su sucesor; None si es el vigente de su sesión."""
+        return self._replaced_at
+
+    @property
+    def replaced_by_id(self) -> RefreshTokenId | None:
+        """Su último sucesor; None si es el vigente de su sesión."""
+        return self._replaced_by_id
+
+    @property
+    def is_replaced(self) -> bool:
+        """Si ya se sustituyó (rotó) por un sucesor."""
+        return self._replaced_at is not None
+
+    def sustituye(self, token: str, ahora: datetime) -> "RefreshToken":
+        """
+        Rota: crea el sucesor con el JWT `token` y marca este como sustituido por él.
+
+        El sucesor es de la misma sesión: mismo usuario y dispositivo, la misma
+        caducidad absoluta (7 días desde el login: no se alarga) y el mismo inicio. Si
+        este ya estaba sustituido (la respuesta se perdió, F-02 A3), apunta al nuevo y
+        el margen empieza otra vez.
+
+        Raises:
+            ValueError: si está revocado (una sesión cerrada no se reanuda)
+        """
+        if self._revoked:
+            raise ValueError("A revoked refresh token cannot be replaced")
+        sucesor = RefreshToken(
+            id=RefreshTokenId.generate(),
+            user_id=self._user_id,
+            token_hash=TokenHash.from_token(token),
+            expires_at=self._expires_at,
+            device_id=self._device_id,
+            created_at=self._created_at,
+        )
+        self._replaced_at = ahora
+        self._replaced_by_id = sucesor.id
+        return sucesor
+
+    @property
+    def annulled_at(self) -> datetime | None:
+        """Cuándo se anuló (A3); None si no."""
+        return self._annulled_at
+
+    @property
+    def is_annulled(self) -> bool:
+        """Si es el sustituto anulado de una respuesta perdida (A3)."""
+        return self._annulled_at is not None
+
+    def anula(self, ahora: datetime) -> None:
+        """
+        Anula el sustituto de una respuesta perdida (A3): queda revocado y marcado, para
+        reconocerlo como robo si alguien llega con él (F-02, tras la revisión).
+        """
+        self.revoke()
+        self._annulled_at = ahora
+
+    def en_el_margen(self, ahora: datetime) -> bool:
+        """Si se sustituyó hace como mucho MARGEN_DE_LA_SUSTITUCION (60 s incluidos)."""
+        if self._replaced_at is None:
+            return False
+        return ahora - self._replaced_at <= MARGEN_DE_LA_SUSTITUCION
+
+    @classmethod
+    def create(
+        cls,
+        user_id: UserId,
+        token: str,
+        device_id: UserDeviceId | None = None,
+        expires_in_days: int = 7,
+    ) -> "RefreshToken":
+        """
+        Crea un nuevo RefreshToken.
+
+        Factory method para crear tokens con valores por defecto.
+
+        Args:
+            user_id: ID del usuario propietario
+            token: Token JWT en texto plano (se hasheará)
+            device_id: ID del dispositivo asociado (requerido para revocación correcta)
+            expires_in_days: Días hasta expiración (default 7)
+
+        Returns:
+            Nueva instancia de RefreshToken
+
+        Example:
+            >>> user_id = UserId.generate()
+            >>> device_id = UserDeviceId.generate()
+            >>> token_jwt = "<jwt firmado>"
+            >>> refresh_token = RefreshToken.create(user_id, token_jwt, device_id)
+        """
+        token_id = RefreshTokenId.generate()
+        token_hash = TokenHash.from_token(token)
+        expires_at = ahora_utc_sin_zona() + timedelta(days=expires_in_days)
+
+        return cls(
+            id=token_id,
+            user_id=user_id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+            device_id=device_id,
+            created_at=ahora_utc_sin_zona(),
+            revoked=False,
+            revoked_at=None,
+        )
+
+    def is_valid(self, token: str) -> bool:
+        """
+        Verifica si este refresh token es válido para uso.
+
+        Un token es válido si:
+        1. No está revocado
+        2. No ha expirado
+        3. El token proporcionado coincide con el hash almacenado
+
+        Args:
+            token: Token JWT en texto plano a verificar
+
+        Returns:
+            True si el token es válido y puede usarse
+        """
+        # 1. Verificar que no esté revocado
+        if self._revoked:
+            return False
+
+        # 2. Verificar que no haya expirado
+        if ahora_utc_sin_zona() > self._expires_at:
+            return False
+
+        # 3. Verificar que el token coincida con el hash
+        return self._token_hash.verify(token)
+
+    def revoke(self) -> None:
+        """
+        Revoca este refresh token.
+
+        Marca el token como revocado y establece la fecha de revocación.
+        Llamado en logout o cambio de contraseña.
+
+        Example:
+            >>> refresh_token.revoke()
+            >>> assert refresh_token.revoked is True
+        """
+        if not self._revoked:
+            self._revoked = True
+            self._revoked_at = ahora_utc_sin_zona()
+
+    def is_expired(self) -> bool:
+        """
+        Verifica si el token ha expirado.
+
+        Returns:
+            True si la fecha de expiración ha pasado
+        """
+        return ahora_utc_sin_zona() > self._expires_at
+
+    def __eq__(self, other: object) -> bool:
+        """Compara dos RefreshTokens por ID."""
+        if not isinstance(other, RefreshToken):
+            return False
+        return self._id == other._id
+
+    def __hash__(self) -> int:
+        """Hash del RefreshToken para usar en sets/dicts."""
+        return hash(self._id)
+
+    def __repr__(self) -> str:
+        """Representación debug del RefreshToken."""
+        if self._revoked:
+            status = "revoked"
+        elif self.is_expired():
+            status = "expired"
+        else:
+            status = "valid"
+        return f"RefreshToken(id={self._id}, user_id={self._user_id}, status={status})"

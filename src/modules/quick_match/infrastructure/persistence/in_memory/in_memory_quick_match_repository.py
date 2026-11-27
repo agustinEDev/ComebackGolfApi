@@ -1,0 +1,169 @@
+"""In-Memory QuickMatch Repository para testing."""
+
+from collections.abc import Callable
+
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.quick_match.domain.entities.quick_match import QuickMatch
+from src.modules.quick_match.domain.repositories.quick_match_repository_interface import (
+    QuickMatchRepositoryInterface,
+)
+from src.modules.quick_match.domain.value_objects.participant_id import ParticipantId
+from src.modules.quick_match.domain.value_objects.quick_match_id import QuickMatchId
+from src.modules.quick_match.domain.value_objects.quick_match_status import QuickMatchStatus
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class InMemoryQuickMatchRepository(QuickMatchRepositoryInterface):
+    """Implementacion en memoria del repositorio de partidas rapidas para testing."""
+
+    def __init__(self, al_borrar: Callable[[QuickMatchId], None] | None = None):
+        self._quick_matches: dict[QuickMatchId, QuickMatch] = {}
+        # Lo que en la base de datos hace el ON DELETE CASCADE: la unidad de
+        # trabajo pasa aqui como llevarse los golpes de la partida borrada
+        self._al_borrar = al_borrar
+
+    async def add(self, quick_match: QuickMatch) -> None:
+        self._quick_matches[quick_match.id] = quick_match
+
+    async def update(self, quick_match: QuickMatch) -> None:
+        if quick_match.id in self._quick_matches:
+            self._quick_matches[quick_match.id] = quick_match
+
+    async def delete(self, quick_match: QuickMatch) -> None:
+        if self._quick_matches.pop(quick_match.id, None) is None:
+            return
+        if self._al_borrar is not None:
+            self._al_borrar(quick_match.id)
+
+    async def find_by_id(self, quick_match_id: QuickMatchId) -> QuickMatch | None:
+        return self._quick_matches.get(quick_match_id)
+
+    async def find_by_ids(self, quick_match_ids: list[QuickMatchId]) -> list[QuickMatch]:
+        return [
+            qm for qid in dict.fromkeys(quick_match_ids) if (qm := self._quick_matches.get(qid))
+        ]
+
+    async def find_by_id_for_update(self, quick_match_id: QuickMatchId) -> QuickMatch | None:
+        return self._quick_matches.get(quick_match_id)
+
+    def _matches_user(
+        self,
+        qm: QuickMatch,
+        user_id: UserId,
+        status: QuickMatchStatus | None,
+        golf_course_id: GolfCourseId | None = None,
+    ) -> bool:
+        """Participa, no la oculto y cumple el estado y el campo pedidos: lista y total, iguales."""
+        participant_id = ParticipantId(user_id.value)
+        return (
+            qm.is_participant(participant_id)
+            and not qm.is_hidden_for(participant_id)
+            and (status is None or qm.status == status)
+            and (golf_course_id is None or qm.golf_course_id == golf_course_id)
+        )
+
+    async def list_for_stats(
+        self,
+        user_id: UserId,
+        status: QuickMatchStatus | None = None,
+        limit: int | None = None,
+    ) -> list[QuickMatch]:
+        """
+        Las que cuentan: ni ocultas del historial ni excluidas de estadisticas.
+
+        Se apoya en `_matches_user` en vez de repetir su condicion: si cambia la
+        regla de "oculta", esto la hereda. Reescrita a mano, la copia vieja se
+        quedaria aqui y los tests unitarios —que corren contra este repositorio—
+        seguirian en verde mientras el SQL dice otra cosa.
+        """
+        participant_id = ParticipantId(user_id.value)
+        results = sorted(
+            [
+                qm
+                for qm in self._quick_matches.values()
+                if self._matches_user(qm, user_id, status)
+                and not qm.is_stats_excluded_for(participant_id)
+            ],
+            key=lambda qm: qm.played_at,
+            reverse=True,
+        )
+        return results[:limit] if limit is not None else results
+
+    async def list_for_user(
+        self,
+        user_id: UserId,
+        status: QuickMatchStatus | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        golf_course_id: GolfCourseId | None = None,
+    ) -> list[QuickMatch]:
+        """Como la de SQLAlchemy: la ultima jugada primero, el id desempata."""
+        results = [
+            qm
+            for qm in self._quick_matches.values()
+            if self._matches_user(qm, user_id, status, golf_course_id)
+        ]
+        results.sort(key=lambda x: (x.played_at, str(x.id.value)), reverse=True)
+        return results[offset : offset + limit]
+
+    async def count_for_user(
+        self,
+        user_id: UserId,
+        status: QuickMatchStatus | None = None,
+        golf_course_id: GolfCourseId | None = None,
+    ) -> int:
+        """El total de `list_for_user` con los mismos filtros, sin paginar."""
+        return sum(
+            1
+            for qm in self._quick_matches.values()
+            if self._matches_user(qm, user_id, status, golf_course_id)
+        )
+
+    async def count_all(self) -> int:
+        """Cuenta el total de partidas rapidas en el sistema."""
+        return len(self._quick_matches)
+
+    async def exists_created_by(self, creator_id: UserId) -> bool:
+        """True si el usuario ha creado alguna partida rapida."""
+        return any(qm.creator_id == creator_id for qm in self._quick_matches.values())
+
+    async def list_shared_by(
+        self, user_id: UserId, other_id: UserId, status: QuickMatchStatus
+    ) -> list[QuickMatch]:
+        results = [
+            qm
+            for qm in self._quick_matches.values()
+            if self._matches_user(qm, user_id, status) and self._matches_user(qm, other_id, status)
+        ]
+        results.sort(key=lambda x: x.played_at, reverse=True)
+        return results
+
+    async def find_trashed_with_participant(self, user_id: UserId) -> list[QuickMatchId]:
+        participante = ParticipantId(user_id.value)
+        return sorted(
+            (
+                qm.id
+                for qm in self._quick_matches.values()
+                if qm.is_participant(participante) and qm.hidden_by_participant_ids
+            ),
+            key=lambda quick_match_id: str(quick_match_id.value),
+        )
+
+    async def list_completed_for_users(self, user_ids: list[UserId]) -> list[QuickMatch]:
+        participantes = {ParticipantId(u.value) for u in user_ids}
+        return [
+            qm
+            for qm in self._quick_matches.values()
+            if qm.status == QuickMatchStatus.COMPLETED
+            and any(qm.is_participant(p) for p in participantes)
+        ]
+
+    async def list_open(self) -> list[QuickMatch]:
+        return sorted(
+            (
+                qm
+                for qm in self._quick_matches.values()
+                if qm.status in (QuickMatchStatus.PENDING, QuickMatchStatus.IN_PROGRESS)
+            ),
+            key=lambda qm: qm.created_at,
+        )

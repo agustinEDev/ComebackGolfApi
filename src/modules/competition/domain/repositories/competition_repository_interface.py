@@ -1,0 +1,307 @@
+"""
+Competition Repository Interface - Domain Layer
+
+Define el contrato para la persistencia de competiciones siguiendo principios de Clean Architecture.
+Esta interfaz pertenece al dominio y será implementada en la capa de infraestructura.
+"""
+
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from datetime import date, datetime
+
+from src.modules.competition.domain.value_objects.visibility import Visibility
+from src.modules.user.domain.value_objects.user_id import UserId
+
+from ..entities.competition import Competition
+from ..value_objects.campo_de_la_competicion import CampoDeLaCompeticion
+from ..value_objects.competition_id import CompetitionId
+from ..value_objects.competition_name import CompetitionName
+from ..value_objects.competition_status import CompetitionStatus
+
+
+class CompetitionRepositoryInterface(ABC):
+    """
+    Interfaz para el repositorio de competiciones.
+
+    Define las operaciones CRUD y consultas específicas del dominio de torneos.
+    Esta interfaz es independiente de la implementación de persistencia concreta.
+
+    Principios seguidos:
+    - Dependency Inversion: El dominio define el contrato, infraestructura lo implementa
+    - Single Responsibility: Solo operaciones relacionadas con persistencia de competitions
+    - Interface Segregation: Métodos específicos y cohesivos
+    """
+
+    @abstractmethod
+    async def add(self, competition: Competition) -> None:
+        """
+        Agrega una nueva competición al repositorio.
+
+        Args:
+            competition: La entidad competición a guardar
+
+        Raises:
+            CompetitionAlreadyExistsError: Si ya existe una competición con el mismo ID
+        """
+        pass
+
+    @abstractmethod
+    async def update(self, competition: Competition) -> None:
+        """
+        Actualiza una competición existente en el repositorio.
+
+        Args:
+            competition: La entidad competición con los datos actualizados
+
+        Raises:
+            CompetitionNotFoundError: Si la competición no existe
+        """
+        pass
+
+    @abstractmethod
+    async def delete(self, competition_id: CompetitionId) -> bool:
+        """
+        Elimina una competición del repositorio (soft delete recomendado).
+
+        Args:
+            competition_id: El identificador único de la competición
+
+        Returns:
+            bool: True si se eliminó, False si no existía
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_id(self, competition_id: CompetitionId) -> Competition | None:
+        """
+        Busca una competición por su ID único.
+
+        Args:
+            competition_id: El identificador único de la competición
+
+        Returns:
+            Optional[Competition]: La competición encontrada o None si no existe
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_id_for_update(self, competition_id: CompetitionId) -> Competition | None:
+        """
+        Busca una competición por su ID con bloqueo de fila (SELECT ... FOR UPDATE).
+
+        Útil para: Operaciones que requieren consistencia transaccional,
+        como la aprobación de inscripciones con validación de capacidad.
+
+        Devuelve el agregado entero, como `find_by_id`, campos de golf incluidos
+        (BE #370): quien bloquea luego pregunta por ellos.
+
+        Args:
+            competition_id: El identificador único de la competición
+
+        Returns:
+            Optional[Competition]: La competición encontrada o None
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_creator(
+        self, creator_id: UserId, limit: int = 100, offset: int = 0
+    ) -> list[Competition]:
+        """
+        Busca todas las competiciones creadas por un usuario específico.
+
+        Útil para: Dashboard del creador ("Mis torneos").
+
+        Args:
+            creator_id: El ID del usuario creador
+            limit: Número máximo de competiciones a retornar (default: 100)
+            offset: Número de competiciones a saltar (default: 0)
+
+        Returns:
+            List[Competition]: Lista de competiciones del creador
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_status(
+        self, status: CompetitionStatus, limit: int = 100, offset: int = 0
+    ) -> list[Competition]:
+        """
+        Busca todas las competiciones con un estado específico.
+
+        Útil para: Admin puede ver todos los torneos ACTIVE, listar DRAFT, etc.
+
+        Args:
+            status: El estado de la competición (DRAFT, ACTIVE, etc.)
+            limit: Número máximo de competiciones a retornar (default: 100)
+            offset: Número de competiciones a saltar (default: 0)
+
+        Returns:
+            List[Competition]: Lista de competiciones con el estado especificado
+        """
+        pass
+
+    @abstractmethod
+    async def find_active_starting_by(self, first_day: date, last_day: date) -> list[Competition]:
+        """
+        Las abiertas (ACTIVE) que empiezan entre esos dos dias: las unicas cuyo
+        plazo de inscripcion puede haber pasado y que todavia importa cerrar
+        (15 nov 2026). Sin las que se abrieron el dia del torneo o despues: su
+        plazo (como muy tarde, las 00:00 UTC de ese dia) ya habia pasado al
+        abrirlas, y estan exentas en cualquier zona (16 nov 2026, F6).
+        """
+        pass
+
+    @abstractmethod
+    async def find_active_without_opening_time(self) -> list[Competition]:
+        """
+        Las ACTIVE sin `enrollment_opened_at`: las abrio la release anterior entre
+        la migracion y el despliegue (16 nov 2026). Normalmente ninguna.
+        """
+        pass
+
+    @abstractmethod
+    async def exists_with_name(
+        self,
+        name: CompetitionName,
+        creator_id: UserId,
+        except_id: CompetitionId | None = None,
+    ) -> bool:
+        """
+        Verifica si existe una competición con el nombre especificado para un creador.
+
+        Útil para: Prevenir duplicados por creador (mismo creador, mismo nombre),
+        sin distinguir mayúsculas (#540).
+
+        Args:
+            name: El nombre de la competición
+            creator_id: El ID del usuario creador
+            except_id: La que se renombra, que no cuenta como repetida
+
+        Returns:
+            bool: True si existe, False si no existe
+        """
+        pass
+
+    @abstractmethod
+    async def campos_de(
+        self, competition_ids: Sequence[CompetitionId]
+    ) -> dict[CompetitionId, list[CampoDeLaCompeticion]]:
+        """
+        Los campos de varias competiciones, con su nombre, en una sola lectura
+        (FE #846): para el listado, sin cargar cada agregado entero.
+
+        Returns:
+            Por competición, sus campos en su orden; sin campos, no aparece
+        """
+        pass
+
+    @abstractmethod
+    async def find_all(self, limit: int = 100, offset: int = 0) -> list[Competition]:
+        """
+        Obtiene todas las competiciones con paginación.
+
+        Útil para: Listado general de torneos.
+
+        Args:
+            limit: Número máximo de competiciones a retornar (default: 100)
+            offset: Número de competiciones a saltar (default: 0)
+
+        Returns:
+            List[Competition]: Lista de todas las competiciones
+        """
+        pass
+
+    @abstractmethod
+    async def count_all(self) -> int:
+        """
+        Cuenta el total de competiciones en el sistema.
+
+        Útil para: Estadísticas del panel de administración.
+
+        Returns:
+            int: Número total de competiciones
+        """
+        pass
+
+    @abstractmethod
+    async def count_by_creator(self, creator_id: UserId) -> int:
+        """
+        Cuenta el total de competiciones creadas por un usuario.
+
+        Útil para: Estadísticas, límites de torneos por usuario.
+
+        Args:
+            creator_id: El ID del usuario creador
+
+        Returns:
+            int: Número total de competiciones del creador
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_filters(
+        self,
+        search_name: str | None = None,
+        search_creator: str | None = None,
+        status: CompetitionStatus | None = None,
+        creator_id: UserId | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Competition]:
+        """
+        Busca competiciones aplicando múltiples filtros opcionales.
+
+        Útil para: Búsqueda avanzada con múltiples criterios.
+
+        Args:
+            search_name: Búsqueda parcial case-insensitive en nombre de competición
+            search_creator: Búsqueda parcial case-insensitive en nombre del creador (first_name, last_name o alias)
+            status: Filtrar por estado específico
+            creator_id: Filtrar por creador específico
+            limit: Número máximo de resultados (default: 100)
+            offset: Número de resultados a saltar (default: 0)
+
+        Returns:
+            List[Competition]: Lista de competiciones que cumplen los criterios
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_ids(self, competition_ids: list[CompetitionId]) -> list[Competition]:
+        """Esas competiciones en una sola lectura, no una por competicion (BE-3)."""
+        pass
+
+    @abstractmethod
+    async def find_ids_with_status(
+        self, competition_ids: list[CompetitionId], status: CompetitionStatus
+    ) -> list[CompetitionId]:
+        """
+        De esas, las que están en ese estado, filtradas en la base y en orden de
+        id: quien las bloquee después lo hace siempre en el mismo orden (R1).
+        """
+        pass
+
+    @abstractmethod
+    async def find_status_mark(
+        self, competition_id: CompetitionId
+    ) -> tuple[CompetitionStatus, datetime] | None:
+        """
+        El estado y la ultima modificacion de la competicion, leidos en ese
+        momento y sin el agregado (ni la cache de la sesion). Es la marca de un
+        cierre: si cambia entre calcular y escribir los logros, alguien la
+        reabrio o la volvio a cerrar entretanto (revision final, 22 oct 2026).
+        None si no existe.
+        """
+        pass
+
+    @abstractmethod
+    async def find_visibilities(
+        self, competition_ids: list[CompetitionId]
+    ) -> dict[CompetitionId, Visibility]:
+        """
+        La visibilidad de esas competiciones en una sola lectura ligera, sin el
+        agregado: lo que necesita el feed para ocultar los apuntados a torneos
+        que ahora son privados (22 oct 2026). Las que no existen no salen.
+        """
+        pass

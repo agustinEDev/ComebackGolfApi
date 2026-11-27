@@ -1,0 +1,76 @@
+# ==========================================
+# SERVICE - ComebackGolfWeb Frontend
+# ==========================================
+# Service para exponer el frontend EXTERNAMENTE
+# (accesible desde internet o red local)
+# ==========================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: comebackgolf-web-service  # Nombre del Service
+  namespace: comebackgolf # Namespace donde se desplegará el frontend
+  labels:
+    app: comebackgolf
+    component: frontend
+    tier: presentation
+
+spec:
+  # ==========================================
+  # TIPO DE SERVICE - LoadBalancer (acceso externo)
+  # ==========================================
+  type: LoadBalancer             # Exponer externamente
+  # En Kind, LoadBalancer se comporta como NodePort
+  # En cloud (GKE, EKS, AKS), obtiene IP pública automáticamente
+
+  # ==========================================
+  # SELECTOR - Qué Pods gestionar
+  # ==========================================
+  selector:
+    app: comebackgolf
+    component: frontend
+
+  # ==========================================
+  # PUERTOS - Mapeo de puertos
+  # ==========================================
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80                   # Puerto EXTERNO (lo que ven los usuarios)
+      targetPort: 80             # Puerto INTERNO (puerto de nginx)
+      nodePort: 32315            # Puerto fijo en el Node (para kind-config.yaml)
+      # Con Kind: localhost:8080 → Node:32315 → Service:80 → Pod:80
+
+  # ==========================================
+  # SESSION AFFINITY (Opcional)
+  # ==========================================
+  # sessionAffinity: ClientIP  # Mantener usuario en mismo Pod
+  # sessionAffinityConfig:
+  #   clientIP:
+  #     timeoutSeconds: 10800  # 3 horas
+
+# ==========================================
+# CÓMO ACCEDER AL FRONTEND
+# ==========================================
+# 1. Obtener IP externa:
+#    kubectl get svc comebackgolf-web-service
+#
+# 2. Esperar a que EXTERNAL-IP cambie de <pending> a una IP
+#
+# 3. En Kind (local), usar port-forward:
+#    kubectl port-forward svc/comebackgolf-web-service 8080:80
+#    Luego abrir: http://localhost:8080
+#
+# 4. En cloud, usar directamente la IP externa:
+#    http://<EXTERNAL-IP>
+# ==========================================
+
+# ==========================================
+# NOTAS DE SEGURIDAD
+# ==========================================
+# En producción, considera usar:
+# 1. Ingress con TLS/SSL (HTTPS)
+# 2. Cert-manager para certificados automáticos
+# 3. Firewall rules para restringir acceso
+# 4. Rate limiting en nginx
+# ==========================================

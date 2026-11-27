@@ -1,0 +1,272 @@
+"""
+Competition-specific Business Rule Violations.
+
+Type-safe exception subclasses para reemplazar string matching frágil.
+Cada subclase representa una regla de negocio específica violada.
+
+OWASP Coverage:
+- A04: Insecure Design (business logic abuse prevention)
+
+Example:
+    >>> try:
+    ...     CompetitionPolicy.can_enroll(...)
+    ... except DuplicateEnrollmentViolation as e:
+    ...     # Type-safe exception handling
+    ...     raise AlreadyEnrolledError(str(e)) from e
+"""
+
+from src.shared.domain.exceptions.business_rule_violation import BusinessRuleViolation
+
+
+class MaxCompetitionsExceededViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando un usuario excede el límite de competiciones permitidas.
+
+    Business Rule: Un usuario no puede crear más de MAX_COMPETITIONS_PER_CREATOR competiciones.
+
+    Example:
+        >>> raise MaxCompetitionsExceededViolation(
+        ...     "User cannot create more than 50 competitions. Current count: 50."
+        ... )
+    """
+
+    pass
+
+
+class DuplicateEnrollmentViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando un usuario intenta inscribirse en una competición donde ya está inscrito.
+
+    Business Rule: Un usuario solo puede tener una inscripción activa por competición.
+
+    Example:
+        >>> raise DuplicateEnrollmentViolation(
+        ...     "User user123 is already enrolled in competition comp456. "
+        ...     "Existing enrollment: enroll789."
+        ... )
+    """
+
+    pass
+
+
+class MaxEnrollmentsExceededViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando un usuario excede el límite de inscripciones activas permitidas.
+
+    Business Rule: Un usuario no puede tener más de MAX_ENROLLMENTS_PER_USER inscripciones activas.
+
+    Example:
+        >>> raise MaxEnrollmentsExceededViolation(
+        ...     "User cannot enroll in more than 20 competitions. Current enrollments: 20."
+        ... )
+    """
+
+    pass
+
+
+class InvalidCompetitionStatusViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando se intenta realizar una acción en una competición con estado inválido.
+
+    Business Rule: Ciertas operaciones solo están permitidas en estados específicos.
+    Por ejemplo, enrollments solo se permiten en ACTIVE o CLOSED.
+
+    Example:
+        >>> raise InvalidCompetitionStatusViolation(
+        ...     "Competition status is DRAFT. Enrollments only allowed in ACTIVE or CLOSED status."
+        ... )
+    """
+
+    pass
+
+
+class EnrollmentPastStartDateViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando se intenta inscribir en una competición que ya ha comenzado.
+
+    Business Rule: No se pueden aceptar inscripciones después de la fecha de inicio.
+
+    Example:
+        >>> raise EnrollmentPastStartDateViolation(
+        ...     "Competition starts on 2026-06-01. Cannot enroll after start date."
+        ... )
+    """
+
+    pass
+
+
+class CompetitionFullViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando una competición alcanza su capacidad máxima de jugadores.
+
+    Business Rule: No se pueden inscribir más jugadores cuando se alcanza max_players.
+
+    Example:
+        >>> raise CompetitionFullViolation(
+        ...     "Competition comp123 has reached maximum capacity (24 players). "
+        ...     "Current enrollments: 24."
+        ... )
+    """
+
+    # Con codigo, para que la pantalla diga en su idioma por que no se puede
+    # invitar (BE #359)
+    error_code = "COMPETITION_FULL"
+
+
+class InvalidDateRangeViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando el rango de fechas de una competición es inválido.
+
+    Business Rule: start_date debe ser anterior a end_date.
+
+    Example:
+        >>> raise InvalidDateRangeViolation(
+        ...     "Competition 'Test': Start date (2026-06-05) must be before end date (2026-06-03)."
+        ... )
+    """
+
+    pass
+
+
+class MaxDurationExceededViolation(BusinessRuleViolation):
+    """
+    Lanzada cuando la duración de una competición excede el límite permitido.
+
+    Business Rule: Una competición no puede durar más de MAX_COMPETITION_DURATION_DAYS días.
+
+    Example:
+        >>> raise MaxDurationExceededViolation(
+        ...     "Competition 'Test': Duration (400 days) exceeds maximum allowed (365 days)."
+        ... )
+    """
+
+    pass
+
+
+# =============================================================================
+# INVITATION VIOLATIONS
+# =============================================================================
+
+
+class DuplicateInvitationViolation(BusinessRuleViolation):
+    """Lanzada cuando ya existe una invitacion PENDING para ese email+competition."""
+
+    pass
+
+
+class InvitationOnHoldExistsViolation(DuplicateInvitationViolation):
+    """Ya tiene una invitacion en lista de espera a esa competicion: no se manda otra
+    (revision, 15 nov 2026). Hija de la de duplicada, para quien ya la capture."""
+
+    error_code = "INVITATION_ON_HOLD_EXISTS"
+    # Texto pendiente de aprobar por Agustín
+    MENSAJE = "Esa persona ya tiene una invitación en lista de espera."
+
+    def __init__(self) -> None:
+        super().__init__(self.MENSAJE)
+
+
+class InvitationExpiredViolation(BusinessRuleViolation):
+    """Lanzada cuando la invitacion ya ha expirado."""
+
+    pass
+
+
+class InvalidInvitationStatusViolation(BusinessRuleViolation):
+    """Lanzada cuando el estado de la invitacion no permite la operacion."""
+
+    pass
+
+
+class InvitationNoRoomViolation(InvalidInvitationStatusViolation):
+    """La invitacion se quedo sin plaza: al cerrarse la inscripcion (#710) o al
+    ocuparse la ultima plaza (BE #359).
+
+    Reabrir no la revive, asi que el motivo tiene que ser cierto con la
+    competicion cerrada, reabierta o llena: decia «la inscripción está cerrada»
+    con ella ACTIVE otra vez (BE #385), y despues «al cerrarse la inscripción»
+    cuando lo que paso es que se lleno. Hija de la de estado, para que quien ya
+    la capture no note nada.
+    """
+
+    error_code = "INVITATION_NO_ROOM"
+    MENSAJE = "Esta invitación se quedó sin plaza"
+
+    def __init__(self) -> None:
+        super().__init__(self.MENSAJE)
+
+
+class InvitationOnHoldViolation(InvalidInvitationStatusViolation):
+    """La invitacion espera a que se reabra la inscripcion: no se acepta (P1, 15 nov 2026).
+
+    Hija de la de estado, como la de sin plaza: quien ya la capture no nota nada.
+    El texto es el aprobado por Agustín para el invitado.
+    """
+
+    error_code = "INVITATION_ON_HOLD"
+    MENSAJE = (
+        "En lista de espera: la inscripción está cerrada. "
+        "Si el organizador la reabre, podrás aceptarla."
+    )
+
+    def __init__(self) -> None:
+        super().__init__(self.MENSAJE)
+
+
+class InvitationCompetitionStatusViolation(BusinessRuleViolation):
+    """Lanzada cuando el estado de la competicion no permite invitaciones."""
+
+    pass
+
+
+class SelfInvitationViolation(BusinessRuleViolation):
+    """Lanzada cuando el creador intenta invitarse a si mismo."""
+
+    pass
+
+
+class AlreadyEnrolledInvitationViolation(BusinessRuleViolation):
+    """Lanzada cuando el invitado ya esta inscrito en la competicion."""
+
+    pass
+
+
+class InvitationUserRateLimitViolation(BusinessRuleViolation):
+    """Lanzada cuando un organizador pasa de su tope de invitaciones por hora, sumando
+    todas sus competiciones (auditoría de la fase 6, B-03). Con su límite, para que la
+    pantalla lo diga en su idioma."""
+
+    error_code = "INVITATION_USER_RATE_LIMIT"
+
+    def __init__(self, message: str, limit: int) -> None:
+        super().__init__(message)
+        self.limit = limit
+
+
+class InvitationRateLimitViolation(BusinessRuleViolation):
+    """Lanzada cuando se excede el limite de invitaciones por hora para una competicion.
+
+    Con su codigo y el limite que se aplica, para que la pantalla diga cuantas
+    se pueden enviar por hora en su idioma: el 429 generico decia «espera un
+    minuto» con un freno que es de una hora.
+    """
+
+    error_code = "INVITATION_RATE_LIMIT"
+
+    def __init__(self, message: str, limit: int) -> None:
+        super().__init__(message)
+        self.limit = limit
+
+
+class WithdrawalViolation(BusinessRuleViolation):
+    """
+    No se puede retirar a un jugador del fourball, o deshacerlo (25 oct 2026).
+
+    `reason` dice cuál de las reglas, para que el cliente lo explique:
+    NOT_FOURBALL, MATCH_NOT_ACTIVE, NOT_A_PLAYER, ALREADY_WITHDRAWN,
+    LAST_OF_SIDE, SCORECARD_SUBMITTED o NOT_WITHDRAWN.
+    """
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason

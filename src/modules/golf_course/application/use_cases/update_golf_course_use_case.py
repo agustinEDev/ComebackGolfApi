@@ -1,0 +1,158 @@
+"""
+UpdateGolfCourseUseCase - Actualizar campo de golf existente.
+"""
+
+from src.modules.golf_course.application.dtos.golf_course_dtos import (
+    UpdateGolfCourseRequestDTO,
+    UpdateGolfCourseResponseDTO,
+)
+from src.modules.golf_course.application.exceptions import (
+    CountryNotFoundError,
+    GolfCourseEditForbiddenError,
+    GolfCourseMissingError,
+)
+from src.modules.golf_course.application.mappers.golf_course_mapper import GolfCourseMapper
+from src.modules.golf_course.application.ports.timezone_resolver import ITimezoneResolver
+from src.modules.golf_course.domain.repositories.golf_course_unit_of_work_interface import (
+    GolfCourseUnitOfWorkInterface,
+)
+from src.modules.golf_course.domain.value_objects.approval_status import ApprovalStatus
+from src.modules.golf_course.domain.value_objects.course_location import CourseLocation
+from src.modules.golf_course.domain.value_objects.course_provenance import CourseProvenance
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.value_objects.country_code import CountryCode
+
+
+class UpdateGolfCourseUseCase:
+    """
+    Use Case: Actualizar un campo de golf existente.
+
+    Orquesta la actualización delegando la decisión de negocio
+    (in-place vs clone) a GolfCourse.apply_update().
+
+    Authorization:
+        - Admin puede editar cualquier campo (PENDING o APPROVED)
+        - Creator solo puede editar sus propios campos
+        - Campos REJECTED no son editables
+    """
+
+    def __init__(
+        self,
+        uow: GolfCourseUnitOfWorkInterface,
+        timezone_resolver: ITimezoneResolver | None = None,
+    ) -> None:
+        self._uow = uow
+        # El huso sigue a las coordenadas (BE #305): editarlas sin recalcularlo
+        # dejaria la hora vieja —y abriria la anotacion a deshora—, y un campo al
+        # que se le anaden coordenadas no ganaria nunca su apertura automatica
+        self._timezone_resolver = timezone_resolver
+
+    async def execute(
+        self,
+        golf_course_id: GolfCourseId,
+        request: UpdateGolfCourseRequestDTO,
+        user_id: UserId,
+        is_admin: bool,
+        provenance: CourseProvenance | None = None,
+        physical_holes: int | None = None,
+    ) -> UpdateGolfCourseResponseDTO:
+        """
+        Ejecuta el caso de uso.
+
+        Args:
+            golf_course_id: Campo a actualizar
+            request: Datos nuevos
+            user_id: Quien edita
+            is_admin: Si tiene privilegios de administración
+            provenance: Procedencia nueva. Va como parámetro y no en el DTO
+                porque no es un dato que un cliente pueda declarar: solo lo
+                refresca una reimportación. None conserva la actual
+            physical_holes: Hoyos sobre el terreno. None conserva los actuales
+        """
+        async with self._uow:
+            # 1. Buscar campo original
+            original_course = await self._uow.golf_courses.find_by_id(golf_course_id)
+            if original_course is None:
+                raise GolfCourseMissingError(f"Golf course with ID {golf_course_id} not found")
+
+            # 2. Validar permisos
+            if not is_admin and original_course.creator_id != user_id:
+                raise GolfCourseEditForbiddenError(
+                    f"User {user_id} does not have permission to edit golf course {golf_course_id}"
+                )
+
+            # 3. Validar que el país existe
+            country_code = CountryCode(request.country_code)
+            country = await self._uow.countries.find_by_code(country_code)
+            if country is None:
+                raise CountryNotFoundError(f"Country with code '{request.country_code}' not found")
+
+            # 4. Crear Tees y Holes desde DTOs
+            location = GolfCourseMapper.to_domain_location(request.location)
+            tees = GolfCourseMapper.to_domain_tees(request.tees)
+
+            holes = GolfCourseMapper.to_domain_holes(request.holes)
+
+            # 5. Delegar decisión de negocio al dominio
+            # apply_update retorna None (in-place) o GolfCourse clone (proposal)
+            clone = original_course.apply_update(
+                name=request.name,
+                country_code=country_code,
+                course_type=request.course_type,
+                tees=tees,
+                holes=holes,
+                is_admin=is_admin,
+                location=location,
+                timezone=self._zona_de(location, original_course.timezone),
+                provenance=provenance,
+                physical_holes=physical_holes,
+            )
+
+            # 6. Guardar
+            await self._uow.golf_courses.save(original_course)
+
+            if clone is not None:
+                # Creator + APPROVED → clone creado
+                await self._uow.golf_courses.save(clone)
+
+                original_dto = GolfCourseMapper.to_response_dto(original_course)
+                clone_dto = GolfCourseMapper.to_response_dto(clone)
+
+                return UpdateGolfCourseResponseDTO(
+                    golf_course=original_dto,
+                    message="Changes submitted for admin approval. Original golf course remains active.",
+                    pending_update=clone_dto,
+                )
+
+            # In-place update
+            response_dto = GolfCourseMapper.to_response_dto(original_course)
+            message = (
+                "Golf course updated successfully (admin privileges)"
+                if is_admin and original_course.approval_status == ApprovalStatus.APPROVED
+                else "Pending golf course updated successfully"
+            )
+
+            return UpdateGolfCourseResponseDTO(
+                golf_course=response_dto,
+                message=message,
+                pending_update=None,
+            )
+
+    def _zona_de(self, location: CourseLocation | None, actual: str | None) -> str | None:
+        """
+        La zona horaria de las coordenadas nuevas, si las hay.
+
+        Sin ubicación nueva devuelve None, que para `update` significa «deja el
+        huso como está». Con ubicación nueva el huso la sigue, y si no se resuelve
+        el campo se queda sin él: heredar el del emplazamiento anterior abriría la
+        anotación a deshora (CodeRabbit, PR #307).
+
+        Salvo sin resolver inyectado: entonces no es que la zona no se conozca, es
+        que no se puede calcular, así que se conserva la que hubiera.
+        """
+        if location is None:
+            return None
+        if self._timezone_resolver is None:
+            return actual
+        return self._timezone_resolver.for_coordinates(location.latitude, location.longitude)

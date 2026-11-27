@@ -1,0 +1,198 @@
+# ================================
+# WEB FRAMEWORK Y SERVIDOR
+# ================================
+
+# FastAPI - Framework web moderno para crear APIs REST
+# Características: validación automática, documentación auto-generada, type hints
+# Compatible con starlette 1.x
+fastapi==0.162.0
+
+# starlette - ASGI framework (dependencia transitiva de fastapi)
+# Pinado explícitamente (>= 1.3.1) para resolver:
+# - PYSEC-2026-161 (Host header validation, fixed in 1.0.1)
+# - CVE-2026-54282 (fixed in 1.3.1)
+# - CVE-2026-54283 (fixed in 1.3.1)
+starlette==1.10.0
+
+# Uvicorn - Servidor ASGI de alto rendimiento para ejecutar aplicaciones FastAPI
+# [standard] incluye extras: watchfiles (auto-reload), websockets, colorama (logs coloridos)
+uvicorn[standard]==0.54.0
+
+
+# ================================
+# CONFIGURACIÓN Y ENTORNO
+# ================================
+
+# python-dotenv - Utilidad para cargar variables de entorno desde un fichero .env
+# Actualizado a 1.2.2 para resolver CVE-2026-28684 (Symlink Attack)
+python-dotenv==1.2.4
+
+
+# ================================
+# DATABASE & ORM
+# ================================
+
+# SQLAlchemy - El ORM (Object-Relational Mapper) más potente de Python
+# Permite interactuar con la base de datos usando objetos Python en lugar de SQL
+sqlalchemy==2.1.9
+
+# psycopg2-binary - Adaptador (driver) para conectar SQLAlchemy con PostgreSQL
+# Es la librería puente entre nuestra aplicación y la base de datos
+psycopg2-binary==2.9.13
+
+# Alembic - Herramienta para migraciones de bases de datos con SQLAlchemy
+# Permite versionar y aplicar cambios en el esquema de la base de datos
+alembic==1.20.1
+
+# asyncpg - Driver asíncrono para PostgreSQL, necesario para SQLAlchemy en modo async
+# Es la alternativa a psycopg2 para operaciones no bloqueantes con la base de datos
+asyncpg==0.32.0
+
+# greenlet - Librería para concurrencia ligera (micro-hilos)
+# Requerido por SQLAlchemy para puentear sus componentes internos síncronos en un entorno async
+greenlet==3.5.6
+
+
+# ================================
+# SEGURIDAD
+# ================================
+
+# bcrypt - Librería para hashing de contraseñas
+# Implementa el algoritmo bcrypt, un estándar para el almacenamiento seguro de claves
+bcrypt==5.0.0
+
+# PyJWT - Librería para crear y verificar tokens JWT (JSON Web Tokens)
+# Alternativa activamente mantenida a python-jose, elimina dependencias vulnerables
+# (pyasn1, ecdsa). Soporte completo para HS256, RS256, etc.
+# Actualizado a 2.13.0 para resolver:
+# - PYSEC-2026-175, -176, -177, -178, -179 (Improper Verification of Cryptographic Signature)
+PyJWT==2.15.1
+
+# slowapi - Rate limiting para FastAPI
+# Protege contra brute force, DoS y abuso de API limitando peticiones por IP
+# Basado en Flask-Limiter, soporta memoria local y Redis como backend
+slowapi==0.1.10
+
+# secure - Security Headers HTTP para FastAPI
+# Añade automáticamente headers de seguridad (CSP, HSTS, X-Frame-Options, etc.)
+# Protege contra XSS, Clickjacking, MIME-sniffing, MITM attacks
+# Cumple con OWASP Top 10: A02, A03, A04, A05, A07
+secure==2.0.1
+
+# sentry-sdk - Error tracking y performance monitoring
+# Captura automáticamente excepciones, errores y métricas de rendimiento
+# Integraciones: FastAPI, SQLAlchemy, Redis
+# Cumple con OWASP Top 10: A09 (Logging & Monitoring)
+sentry-sdk[fastapi]==2.75.0
+
+# jinja2 - Motor de plantillas (dependencia de RUNTIME, no opcional)
+# NO se usa directamente en el código, y por eso parece prescindible: no lo es.
+# Sentry activa StarletteIntegration a través de FastApiIntegration, y su
+# patch_templates() importa starlette.templating, que exige jinja2. Sin él la
+# aplicacion NO ARRANCA en produccion (v2.18.0, ImportError en el lifespan).
+# En desarrollo no se nota: sin SENTRY_DSN, init_sentry() retorna antes de llegar.
+# Entraba como transitiva de safety hasta que se sacó de la imagen (#289).
+jinja2==3.1.6
+
+# urllib3 - Cliente HTTP de bajo nivel (dependencia transitiva de sentry-sdk)
+# Actualizado a 2.7.0 para resolver:
+# - PYSEC-2026-141, PYSEC-2026-142 (decompression bomb y unlimited decompression chain)
+urllib3==2.8.0
+
+# cryptography - Primitivas criptográficas de bajo nivel (dependencia transitiva)
+# Actualizado a 48.0.1 para resolver:
+# - CVE-2026-26007 (fixed in 46.0.5)
+# - PYSEC-2026-35 (fixed in 46.0.6)
+# - PYSEC-2026-36 (fixed in 46.0.7)
+# - CVE-2026-34180 (Out-of-bounds Read, CVSS 8.7 HIGH, fixed in 48.0.1)
+# - CVE-2026-69247 (fixed in 50.0.0)
+# - CVE-2026-69248 (fixed in 49.0.0)
+# - CVE-2026-69249 (fixed in 49.0.0)
+cryptography==50.0.2
+
+# setuptools - Build system y package installer
+# Nadie lo declara como dependencia en producción: los paquetes que lo piden lo hacen desde
+# extras de test o dev. Se queda aquí a propósito, porque la imagen base de Python lo trae de
+# serie y hay librerías que usan pkg_resources en tiempo de ejecución sin declararlo; el pin
+# garantiza entonces que la versión presente sea una sin CVEs conocidas.
+# Fijada explícitamente para resolver:
+# - CVE-2024-6345 (Code Injection via package_index - CVSS 7.5 HIGH)
+# - CVE-2022-40897 (Regular Expression DoS - CVSS 5.9 MEDIUM)
+# - CVE-2025-47273 (Directory Traversal en _download_url - CVSS 6.8 MEDIUM)
+# - CVE-2026-59890 (Improper Handling of Unicode Encoding - MEDIUM)
+# - GHSA-xmj3-9gf7-h52w (Windows path escape via namespace_packages.txt, 23 oct 2026)
+setuptools==84.2.1
+
+# idna - Internationalized Domain Names in Applications (dependencia transitiva de httpx)
+# Fijada explícitamente para resolver CVE-2026-45409
+idna==3.20
+
+# mako - Template library (dependencia transitiva de alembic)
+# Fijada explícitamente para resolver CVE-2026-44307
+mako==1.4.3
+
+# click - Command line interface creation kit (dependencia transitiva de uvicorn)
+# Fijada explícitamente para resolver SNYK-PYTHON-CLICK-16347201 (Command Injection)
+click==8.5.1
+
+
+# ================================
+# IMÁGENES (Avatar de usuario)
+# ================================
+
+# python-multipart - Requerido por FastAPI para parsear multipart/form-data (UploadFile)
+# Usado en el endpoint de subida de foto de avatar
+python-multipart==0.0.34
+
+# Pillow - Procesado de imágenes (validar formato, recortar a cuadrado, redimensionar,
+# comprimir a JPEG) antes de guardar la foto de avatar subida por el usuario en BD
+Pillow==13.0.0
+
+# pillow-heif - Lector de HEIC/HEIF para Pillow, que no lo trae. Es el formato en
+# el que un iPhone guarda TODAS las fotos de su fototeca, así que sin esto la
+# única forma de poner un avatar desde un iPhone era hacer una foto nueva: la
+# cámara del navegador entrega JPEG y la fototeca entrega HEIC (BE #232)
+pillow-heif==1.8.1
+
+
+# ================================
+# TESTING Y DESARROLLO
+# ================================
+
+# email-validator - Librería robusta para validar direcciones de email
+# Usada en los Value Objects para asegurar la validez de los emails
+email-validator==2.3.0
+
+# httpx - Cliente HTTP asíncrono para testear endpoints de FastAPI
+# Alternativa moderna a `requests` con soporte para async/await
+httpx==0.28.1
+
+# tzdata - Base de datos de zonas horarias para `zoneinfo`
+# La anotación de un partido abre a una hora LOCAL del campo (BE #305), y
+# `ZoneInfo("Europe/Madrid")` la resuelve hoy contra los ficheros del sistema
+# operativo, que nadie declara aquí: adelgazar la imagen podría llevárselos y
+# entonces fallaría hasta construir una competición. Con este paquete la lleva
+# Python, sin depender del sistema
+tzdata==2026.6
+
+# tzfpy - Zona horaria a partir de coordenadas
+# La anotación de un partido abre a una hora LOCAL del campo (BE #305) y el país
+# no basta: España tiene dos husos, y también EEUU, Chile o Australia. Lleva las
+# fronteras de husos del mundo en 3 MB y sin dependencias; la alternativa
+# habitual, `timezonefinder`, arrastra numpy
+tzfpy==2.1.2
+
+# shapely - Geometría (polígonos, líneas, distancias) para el mapa de hoyos (BE #532)
+# Empareja un campo con OpenStreetMap: qué contorno es el nuestro, qué hoyos caen
+# dentro, qué green está al final de cada hoyo y dónde quedan delante y fondo.
+# Monta también los contornos que OSM guarda como relación de varios trozos
+shapely==2.2.0
+
+# numpy - Dependencia de shapely, fijada aquí para auditarla con las demás
+# 2.5.x: pide Python 3.12, la versión más baja que prueba el CI (3.12 y 3.14)
+numpy==2.5.5
+
+# geojson-pydantic - Modelos Pydantic de GeoJSON para el mapa de hoyos (BE #532)
+# El endpoint del mapa devuelve GeoJSON estándar, validado y documentado en
+# OpenAPI: MapLibre o Leaflet lo pintan tal cual en el front
+geojson-pydantic==2.2.0

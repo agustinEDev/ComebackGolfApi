@@ -1,0 +1,125 @@
+# ================================
+# CONFIGURACIÓN DE RUFF
+# ================================
+# Ruff es un linter ultra-rápido para Python que reemplaza múltiples herramientas:
+# - flake8 (linting general)
+# - isort (ordenar imports)
+# - pydocstyle (documentación)
+# - pyupgrade (modernizar sintaxis)
+# - autoflake (remover imports sin usar)
+
+# Versión mínima de Python que soporta el proyecto
+target-version = "py311"  # Sintaxis compatible con 3.11 a propósito (el CI prueba 3.12 y 3.14). Con py312, ruff propondría sintaxis PEP 695 y abriría hallazgos nuevos
+
+# Longitud máxima de línea (PEP 8 recomienda 79, pero 100 es más práctico)
+line-length = 100
+
+# Directorios a excluir del análisis
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "*.egg-info",
+    ".pytest_cache",
+    ".mypy_cache",
+    "alembic/versions",  # Migraciones auto-generadas
+    "build",
+    "dist",
+]
+
+[lint]
+# Reglas activadas (códigos de ruff)
+# Ver: https://docs.astral.sh/ruff/rules/
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort (ordenar imports)
+    "N",      # pep8-naming
+    "UP",     # pyupgrade (modernizar sintaxis)
+    "B",      # flake8-bugbear (errores comunes)
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+    "RET",    # flake8-return
+    "ARG",    # flake8-unused-arguments
+    "PTH",    # flake8-use-pathlib
+    "ERA",    # eradicate (código comentado)
+    "PL",     # pylint
+    "RUF",    # ruff-specific rules
+    "C901",   # complejidad ciclomática (mccabe), tope en [lint.mccabe] (re-auditoría F-05)
+    "DTZ005", # datetime.now() sin zona: da la hora LOCAL de la máquina (re-auditoría F-02)
+    "DTZ011", # date.today(): lo mismo; se usa el reloj de instante_utc
+    "DTZ003", # datetime.utcnow(): obsoleto; el reloj de instante_utc
+    "DTZ006", # fromtimestamp() sin zona: hora local
+    "DTZ002", # datetime.today(): hora local
+    "DTZ007", # strptime() sin zona en el formato
+    "DTZ012", # date.fromtimestamp(): fecha local
+]
+
+# Reglas ignoradas (desactivadas)
+ignore = [
+    "E501",   # line-too-long (ya lo controlamos con line-length)
+    "B008",   # do-not-perform-function-calls-in-argument-defaults (común en FastAPI)
+    "PLR0913", # too-many-arguments (común en casos de uso)
+    "PLR0917", # too-many-positional-arguments: la misma que PLR0913 contada en posicionales (ruff 0.16, 143 avisos)
+    "ARG002", # unused-method-argument (común en interfaces/protocolos)
+    "RET504", # unnecessary-assign (a veces mejora la legibilidad)
+]
+
+# Permitir autofix para estas reglas al ejecutar `ruff check --fix`
+fixable = ["ALL"]
+unfixable = []
+
+[lint.per-file-ignores]
+# Tests pueden tener imports sin usar, funciones largas, etc.
+"tests/**/*.py" = [
+    "ARG",      # unused arguments (fixtures)
+    "PLR2004",  # magic-value-comparison
+    "S101",     # use of assert
+    "PLC0415",  # import-outside-toplevel (lazy imports in fixtures)
+    "E721",     # type-comparison (comparing types in tests)
+    "PTH123",   # open-builtin (Path.open not always needed in tests)
+    "B017",     # assert-raises-exception (pytest.raises patterns)
+    "RUF043",   # implicit-raw-string (regex patterns in pytest.raises)
+    "SIM105",   # suppressible-exception (contextlib.suppress usage)
+    "UP035",    # deprecated-import (typing.AsyncContextManager in tests)
+    "SIM102",   # collapsible-if (nested ifs can be clearer in tests)
+    "RUF003",   # ambiguous-unicode-character (intentional in homograph tests)
+    "PLC0206",  # dict-index-missing-items (intentional in error tests)
+    "N806",     # non-lowercase-variable-in-function (test data naming)
+    "ERA001",   # commented-out-code (example code in docstrings)
+    "E402",     # module-level-import-not-at-top-of-file (setup imports)
+]
+
+# C901 pendiente (re-auditoría F-05): tests con un doble entero definido dentro
+"tests/unit/modules/user/domain/repositories/test_user_repository_interface.py" = ["C901"]  # C901 pendiente (re-auditoría F-05)
+"tests/unit/modules/user/domain/repositories/test_user_unit_of_work_interface.py" = ["C901"]  # C901 pendiente (re-auditoría F-05)
+
+# Archivos de configuración pueden tener imports no ordenados
+"alembic/env.py" = ["I", "ERA001"]
+
+# dev_tests.py puede tener errores de linting (es un script utilitario)
+"dev_tests.py" = ["PTH123", "SIM102", "PLR2004"]
+
+# K8s scripts pueden tener imports después de sys.path setup
+"k8s/scripts/*.py" = ["E402", "PLR2004"]
+
+# Domain entities pueden tener imports locales para evitar circular imports
+"src/modules/golf_course/domain/entities/*.py" = ["PLC0415"]
+"src/modules/golf_course/infrastructure/api/v1/golf_course_routes.py" = ["PLC0415"]
+
+[lint.mccabe]
+# Freno a la complejidad (re-auditoría F-05). Las funciones que lo superen al
+# activarlo van en per-file-ignores con «# C901 pendiente (re-auditoría F-05)»
+max-complexity = 15
+
+[lint.isort]
+# Configuración de ordenamiento de imports (compatible con Black)
+combine-as-imports = true
+force-wrap-aliases = true
+known-first-party = ["src"]
+
+[lint.pydocstyle]
+# Estilo de docstrings (Google style)
+convention = "google"

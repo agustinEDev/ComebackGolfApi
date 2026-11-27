@@ -1,0 +1,965 @@
+"""Tests para QuickMatch Entity."""
+
+from datetime import datetime
+from uuid import uuid4
+
+import pytest
+
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.quick_match.domain.entities.quick_match import QuickMatch
+from src.modules.quick_match.domain.exceptions.quick_match_violations import (
+    CreatorCannotBeRemovedViolation,
+    DuplicateParticipantViolation,
+    IncompleteRosterViolation,
+    InvalidAllowanceViolation,
+    InvalidQuickMatchFormatViolation,
+    InvalidQuickMatchStatusViolation,
+    InvalidScorerConfigurationViolation,
+    InvalidTeamAssignmentViolation,
+    NotQuickMatchParticipantViolation,
+    QuickMatchFullViolation,
+)
+from src.modules.quick_match.domain.value_objects.participant_id import ParticipantId
+from src.modules.quick_match.domain.value_objects.quick_match_id import QuickMatchId
+from src.modules.quick_match.domain.value_objects.quick_match_participant import (
+    QuickMatchParticipant,
+)
+from src.modules.quick_match.domain.value_objects.quick_match_status import QuickMatchStatus
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.value_objects.match_format import MatchFormat
+from src.shared.domain.value_objects.scoring_format import ScoringFormat
+
+
+def _make_quick_match(match_format=MatchFormat.SINGLES, **overrides):
+    defaults = {
+        "id": QuickMatchId.generate(),
+        "creator_id": UserId(uuid4()),
+        "golf_course_id": GolfCourseId(uuid4()),
+        "match_format": match_format,
+    }
+    defaults.update(overrides)
+    return QuickMatch.create(**defaults)
+
+
+def _make_free_play_quick_match(scoring_format=ScoringFormat.STABLEFORD, **overrides):
+    defaults = {
+        "id": QuickMatchId.generate(),
+        "creator_id": UserId(uuid4()),
+        "golf_course_id": GolfCourseId(uuid4()),
+        "match_format": None,
+        "scoring_format": scoring_format,
+    }
+    defaults.update(overrides)
+    return QuickMatch.create(**defaults)
+
+
+def _registered(team=None):
+    return QuickMatchParticipant.for_user(UserId(uuid4()), team=team)
+
+
+def _guest(team=None):
+    return QuickMatchParticipant.for_guest(first_name="Guest", last_name="Player", team=team)
+
+
+class TestQuickMatchCreate:
+    def test_create_sets_pending_status(self):
+        qm = _make_quick_match()
+        assert qm.status == QuickMatchStatus.PENDING
+
+    def test_create_adds_creator_as_first_participant(self):
+        qm = _make_quick_match()
+        assert len(qm.participants) == 1
+        assert qm.participants[0].participant_id == qm.creator_participant_id
+
+    def test_create_singles_creator_has_no_team(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        assert qm.participants[0].team is None
+
+    def test_create_fourball_creator_is_team_a(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        assert qm.participants[0].team == "A"
+
+
+class TestQuickMatchName:
+    def test_create_without_name_defaults_to_none(self):
+        qm = _make_quick_match()
+        assert qm.name is None
+
+    def test_create_with_name_stores_it(self):
+        qm = _make_quick_match(name="Viernes con los del club")
+        assert qm.name == "Viernes con los del club"
+
+    def test_create_trims_surrounding_whitespace(self):
+        qm = _make_quick_match(name="  Revancha  ")
+        assert qm.name == "Revancha"
+
+    def test_create_blank_name_normalizes_to_none(self):
+        qm = _make_quick_match(name="   ")
+        assert qm.name is None
+
+    def test_create_rejects_name_over_max_length(self):
+        with pytest.raises(ValueError, match="cannot exceed 100 characters"):
+            _make_quick_match(name="a" * 101)
+
+    def test_create_accepts_name_at_max_length(self):
+        qm = _make_quick_match(name="a" * 100)
+        assert qm.name == "a" * 100
+
+
+class TestQuickMatchAddParticipant:
+    def test_add_registered_participant_singles_succeeds(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+
+        assert qm.is_participant(other.participant_id)
+        assert qm.is_roster_complete()
+
+    def test_add_guest_participant_succeeds(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        guest = _guest()
+        qm.add_participant(guest)
+
+        assert qm.is_participant(guest.participant_id)
+        assert qm.find_participant(guest.participant_id).is_guest
+
+    def test_add_participant_singles_rejects_team(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        with pytest.raises(InvalidTeamAssignmentViolation):
+            qm.add_participant(_registered(team="A"))
+
+    def test_add_participant_fourball_requires_team(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        with pytest.raises(InvalidTeamAssignmentViolation):
+            qm.add_participant(_registered(team=None))
+
+    def test_add_participant_fourball_fills_teams(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        qm.add_participant(_registered(team="A"))
+        qm.add_participant(_registered(team="B"))
+        qm.add_participant(_guest(team="B"))
+
+        assert qm.is_roster_complete()
+        assert qm._team_count("A") == 2
+        assert qm._team_count("B") == 2
+
+    def test_add_participant_team_full_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        qm.add_participant(_registered(team="A"))
+        with pytest.raises(QuickMatchFullViolation):
+            qm.add_participant(_registered(team="A"))
+
+    def test_add_duplicate_participant_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        creator_participant = QuickMatchParticipant.for_user(qm.creator_id)
+        with pytest.raises(DuplicateParticipantViolation):
+            qm.add_participant(creator_participant)
+
+    def test_add_participant_when_full_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        with pytest.raises(QuickMatchFullViolation):
+            qm.add_participant(_registered())
+
+    def test_add_participant_not_pending_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+        qm.start([qm.creator_participant_id])
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.add_participant(_registered())
+
+
+class TestQuickMatchTeamRosters:
+    def test_singles_falls_back_to_each_participant_as_a_side(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+
+        rosters = qm.team_rosters()
+
+        assert rosters == ({qm.creator_participant_id}, {other.participant_id})
+
+    def test_fourball_derives_rosters_from_team_field(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        partner_a = _registered(team="A")
+        opponent_b1 = _registered(team="B")
+        opponent_b2 = _guest(team="B")
+        qm.add_participant(partner_a)
+        qm.add_participant(opponent_b1)
+        qm.add_participant(opponent_b2)
+
+        team_a_ids, team_b_ids = qm.team_rosters()
+
+        assert team_a_ids == {qm.creator_participant_id, partner_a.participant_id}
+        assert team_b_ids == {opponent_b1.participant_id, opponent_b2.participant_id}
+
+    def test_returns_none_with_fewer_than_two_participants(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        assert qm.team_rosters() is None
+
+    def test_incomplete_fourball_with_two_participants_on_same_team_returns_none(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        qm.add_participant(_registered(team="A"))
+
+        assert qm.team_rosters() is None
+
+
+class TestQuickMatchRemoveParticipant:
+    def test_remove_participant_succeeds(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+
+        qm.remove_participant(other.participant_id)
+
+        assert not qm.is_participant(other.participant_id)
+
+    def test_remove_creator_raises(self):
+        qm = _make_quick_match()
+        with pytest.raises(CreatorCannotBeRemovedViolation):
+            qm.remove_participant(qm.creator_participant_id)
+
+    def test_remove_non_participant_raises(self):
+        qm = _make_quick_match()
+        with pytest.raises(NotQuickMatchParticipantViolation):
+            qm.remove_participant(ParticipantId.generate())
+
+    def test_remove_participant_not_pending_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+        qm.start([qm.creator_participant_id])
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.remove_participant(other.participant_id)
+
+
+def _completed_quick_match():
+    """Partida terminada con dos jugadores: el estado que exige el ojo."""
+    qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+    other = _registered()
+    qm.add_participant(other)
+    qm.start([qm.creator_participant_id])
+    qm.complete()
+    return qm, other
+
+
+class TestQuickMatchStatsExclusion:
+    """
+    El ojo: la partida no cuenta en MIS estadisticas pero sigue en mi historial.
+
+    Es otra marca distinta de ocultar, que si la saca de la lista y es
+    definitiva. Antes las dos cosas eran una sola (BE #242).
+    """
+
+    def test_exclude_from_stats_succeeds_on_a_completed_match(self):
+        qm, _ = _completed_quick_match()
+
+        qm.exclude_from_stats_for(qm.creator_participant_id)
+
+        assert qm.is_stats_excluded_for(qm.creator_participant_id)
+
+    def test_exclude_from_stats_does_not_hide_the_match(self):
+        """Lo que distingue esta marca de ocultar: la partida se sigue viendo."""
+        qm, _ = _completed_quick_match()
+
+        qm.exclude_from_stats_for(qm.creator_participant_id)
+
+        assert not qm.is_hidden_for(qm.creator_participant_id)
+
+    def test_exclude_from_stats_is_personal(self):
+        """Una partida que A excluye sigue contando para B."""
+        qm, other = _completed_quick_match()
+
+        qm.exclude_from_stats_for(other.participant_id)
+
+        assert qm.is_stats_excluded_for(other.participant_id)
+        assert not qm.is_stats_excluded_for(qm.creator_participant_id)
+
+    def test_exclude_from_stats_requires_a_completed_match(self):
+        """
+        Una partida a medias todavia no cuenta en ninguna estadistica, asi que
+        la marca no diria nada: seria una promesa sobre el futuro.
+        """
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        qm.start([qm.creator_participant_id])
+
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.exclude_from_stats_for(qm.creator_participant_id)
+
+    def test_exclude_from_stats_for_non_participant_raises(self):
+        qm, _ = _completed_quick_match()
+        with pytest.raises(NotQuickMatchParticipantViolation):
+            qm.exclude_from_stats_for(ParticipantId.generate())
+
+    def test_exclude_from_stats_is_idempotent(self):
+        qm, _ = _completed_quick_match()
+        qm.exclude_from_stats_for(qm.creator_participant_id)
+
+        qm.exclude_from_stats_for(qm.creator_participant_id)
+
+        assert qm.is_stats_excluded_for(qm.creator_participant_id)
+
+    def test_include_in_stats_reverses_the_exclusion(self):
+        qm, _ = _completed_quick_match()
+        qm.exclude_from_stats_for(qm.creator_participant_id)
+
+        qm.include_in_stats_for(qm.creator_participant_id)
+
+        assert not qm.is_stats_excluded_for(qm.creator_participant_id)
+
+    def test_include_in_stats_does_not_require_a_completed_match(self):
+        """
+        Quitar la marca siempre es seguro, y la migracion que separo ocultar de
+        excluir pudo dejar alguna en una partida sin terminar: exigir COMPLETED
+        aqui la dejaria sin forma de quitarse.
+        """
+        # Se construye la entidad con la marca puesta y la partida sin
+        # terminar, que es justo la fila que puede dejar la migracion: la
+        # marca vieja se traspaso sin mirar el estado.
+        creator = _registered()
+        qm = QuickMatch(
+            id=QuickMatchId.generate(),
+            creator_id=UserId(creator.participant_id.value),
+            golf_course_id=GolfCourseId(uuid4()),
+            match_format=MatchFormat.SINGLES,
+            status=QuickMatchStatus.IN_PROGRESS,
+            participants=[creator],
+            stats_excluded_by_participant_ids=[creator.participant_id],
+        )
+        assert qm.is_stats_excluded_for(creator.participant_id)
+
+        qm.include_in_stats_for(creator.participant_id)
+
+        assert not qm.is_stats_excluded_for(creator.participant_id)
+
+    def test_include_in_stats_for_non_participant_raises(self):
+        qm, _ = _completed_quick_match()
+        with pytest.raises(NotQuickMatchParticipantViolation):
+            qm.include_in_stats_for(ParticipantId.generate())
+
+    def test_include_in_stats_is_idempotent(self):
+        qm, _ = _completed_quick_match()
+
+        qm.include_in_stats_for(qm.creator_participant_id)
+
+        assert not qm.is_stats_excluded_for(qm.creator_participant_id)
+
+    def test_hiding_and_excluding_are_independent_marks(self):
+        """La prueba de que se han separado de verdad."""
+        qm, _ = _completed_quick_match()
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert qm.is_hidden_for(qm.creator_participant_id)
+        assert not qm.is_stats_excluded_for(qm.creator_participant_id)
+
+
+class TestQuickMatchHideForHistory:
+    """
+    La papelera (26 nov 2026): cada jugador la tira para si, y cuando la han
+    tirado todos los que siguen pudiendo tirarla, la partida se borra de verdad.
+
+      #   caso                                        | por que
+      ----|--------------------------------------------|-----------------------------
+      P1  el creador la tira, terminada               | papelera personal
+      P2  otro jugador la tira; el creador no         | cualquiera, y solo para si
+      P3  quien no es de la partida                   | NotQuickMatchParticipant
+      P4  tirarla dos veces                           | idempotente
+      P5  sin empezar (PENDING)                       | no se tira una partida viva
+      P6  en curso (IN_PROGRESS)                      | idem: un toque de mas borraba
+                                                      | una partida en juego
+      P7  cancelada                                   | estado final: si
+      P8  quien no es de la partida, estando viva     | «no eres de aqui», no el estado
+      P9  ya no se puede sacar de la papelera         | es definitiva
+    """
+
+    def test_p1_hide_for_creator_succeeds(self):
+        qm, _ = _completed_quick_match()
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert qm.is_hidden_for(qm.creator_participant_id)
+
+    def test_p2_hide_for_non_creator_participant_only_affects_them(self):
+        qm, other = _completed_quick_match()
+
+        qm.hide_for(other.participant_id)
+
+        assert qm.is_hidden_for(other.participant_id)
+        assert not qm.is_hidden_for(qm.creator_participant_id)
+
+    def test_p3_hide_for_non_participant_raises(self):
+        qm, _ = _completed_quick_match()
+
+        with pytest.raises(NotQuickMatchParticipantViolation):
+            qm.hide_for(ParticipantId.generate())
+
+    def test_p4_hide_for_is_idempotent(self):
+        qm, _ = _completed_quick_match()
+        qm.hide_for(qm.creator_participant_id)
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert qm.hidden_by_participant_ids == [qm.creator_participant_id]
+
+    def test_p5_a_pending_match_cannot_be_hidden(self):
+        qm = _make_quick_match()
+
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.hide_for(qm.creator_participant_id)
+
+        assert not qm.is_hidden_for(qm.creator_participant_id)
+
+    def test_p6_a_match_in_progress_cannot_be_hidden(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+        qm.start([qm.creator_participant_id])
+
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.hide_for(other.participant_id)
+
+        assert not qm.is_hidden_for(other.participant_id)
+
+    def test_p7_a_cancelled_match_can_be_hidden(self):
+        qm = _make_quick_match()
+        qm.cancel()
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert qm.is_hidden_for(qm.creator_participant_id)
+
+    def test_p8_a_stranger_learns_nothing_about_the_status(self):
+        """Antes el estado que «no eres de la partida»: el 409 delataria que existe y esta viva."""
+        qm = _make_quick_match()
+
+        with pytest.raises(NotQuickMatchParticipantViolation):
+            qm.hide_for(ParticipantId.generate())
+
+    def test_p9_there_is_no_way_back_from_the_trash(self):
+        qm, _ = _completed_quick_match()
+
+        assert not hasattr(qm, "unhide_for")
+
+
+class TestQuickMatchTrashedByEveryone:
+    """
+    Cuando se borra de verdad: la han tirado TODOS los que siguen pudiendo
+    tirarla. Es el unico sitio de la regla; el caso de uso solo dice quienes
+    tienen la cuenta activa.
+
+      #   caso                                        | resultado | por que
+      ----|--------------------------------------------|-----------|--------------------
+      T1  dos con cuenta, la tira uno                 | no        | papelera personal
+      T2  dos con cuenta, la tiran los dos            | si        | la regla
+      T3  uno con cuenta y un invitado, la tira el    | si        | el invitado no tiene
+                                                      |           | lista ni papelera
+      T4  un solo jugador, la tira                    | si        | el es «todos»
+      T5  nadie la ha tirado                          | no        | ni aunque no quede
+                                                      |           | nadie activo
+      T6  dos con cuenta, la tira uno y el otro tiene | si        | quien ya no puede
+          la cuenta desactivada o borrada             |           | tirarla no la retiene
+      T7  la tiro quien luego perdio la cuenta, y el  | no        | el activo no la ha
+          activo no                                   |           | tirado
+      T8  activos que no son de la partida            | no cambia | solo cuentan los suyos
+    """
+
+    def test_t1_one_of_two_is_not_everyone(self):
+        qm, other = _completed_quick_match()
+        activos = [qm.creator_participant_id, other.participant_id]
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert not qm.is_trashed_by_everyone(activos)
+
+    def test_t2_both_registered_players_is_everyone(self):
+        qm, other = _completed_quick_match()
+        activos = [qm.creator_participant_id, other.participant_id]
+
+        qm.hide_for(qm.creator_participant_id)
+        qm.hide_for(other.participant_id)
+
+        assert qm.is_trashed_by_everyone(activos)
+
+    def test_t3_guests_do_not_count(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_guest())
+        qm.start([qm.creator_participant_id])
+        qm.complete()
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert qm.is_trashed_by_everyone([qm.creator_participant_id])
+
+    def test_t4_a_single_player_is_everyone(self):
+        qm = _make_free_play_quick_match()
+        qm.start([qm.creator_participant_id])
+        qm.complete()
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert qm.is_trashed_by_everyone([qm.creator_participant_id])
+
+    def test_t5_nobody_trashed_it_is_never_everyone(self):
+        qm, other = _completed_quick_match()
+
+        assert not qm.is_trashed_by_everyone([qm.creator_participant_id, other.participant_id])
+        assert not qm.is_trashed_by_everyone([])
+
+    def test_t6_a_player_without_an_active_account_does_not_hold_it(self):
+        qm, other = _completed_quick_match()
+
+        qm.hide_for(qm.creator_participant_id)
+
+        assert qm.is_trashed_by_everyone([qm.creator_participant_id])
+        assert not qm.is_trashed_by_everyone([qm.creator_participant_id, other.participant_id])
+
+    def test_t7_the_active_player_still_has_to_trash_it(self):
+        qm, other = _completed_quick_match()
+
+        qm.hide_for(other.participant_id)
+
+        assert not qm.is_trashed_by_everyone([qm.creator_participant_id])
+
+    def test_t8_active_strangers_change_nothing(self):
+        qm, other = _completed_quick_match()
+        qm.hide_for(qm.creator_participant_id)
+        qm.hide_for(other.participant_id)
+
+        ajeno = ParticipantId.generate()
+
+        assert qm.is_trashed_by_everyone([qm.creator_participant_id, other.participant_id, ajeno])
+
+
+class TestQuickMatchSetParticipantHandicap:
+    def test_set_registered_participant_handicap_sets_override(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+
+        qm.set_participant_handicap(other.participant_id, 12.3)
+
+        updated = qm.find_participant(other.participant_id)
+        assert updated.custom_handicap == 12.3
+
+    def test_set_guest_participant_handicap_sets_manual_handicap(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        guest = _guest()
+        qm.add_participant(guest)
+
+        qm.set_participant_handicap(guest.participant_id, 24.0)
+
+        assert qm.find_participant(guest.participant_id).handicap == 24.0
+
+    def test_set_participant_handicap_none_clears_it(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        guest = _guest()
+        qm.add_participant(guest)
+        qm.set_participant_handicap(guest.participant_id, 24.0)
+
+        qm.set_participant_handicap(guest.participant_id, None)
+
+        assert qm.find_participant(guest.participant_id).handicap is None
+
+    def test_set_handicap_preserves_other_participant_fields(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        other = _registered(team="B")
+        qm.add_participant(other)
+
+        qm.set_participant_handicap(other.participant_id, 5.0)
+
+        updated = qm.find_participant(other.participant_id)
+        assert updated.team == "B"
+        assert updated.user_id == other.user_id
+
+    def test_set_handicap_for_non_participant_raises(self):
+        qm = _make_quick_match()
+        with pytest.raises(NotQuickMatchParticipantViolation):
+            qm.set_participant_handicap(ParticipantId.generate(), 10.0)
+
+    def test_set_handicap_not_pending_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+        qm.start([qm.creator_participant_id])
+
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.set_participant_handicap(other.participant_id, 10.0)
+
+    def test_set_handicap_out_of_range_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+        with pytest.raises(ValueError, match="custom_handicap debe estar entre"):
+            qm.set_participant_handicap(other.participant_id, 99)
+
+
+class TestQuickMatchStart:
+    def test_start_with_complete_roster_succeeds(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+
+        qm.start([qm.creator_participant_id])
+
+        assert qm.status == QuickMatchStatus.IN_PROGRESS
+        assert qm.scorer_ids == [qm.creator_participant_id]
+
+    def test_start_notes_when_it_started(self):
+        """Para cerrarla sola al acabar el día siguiente (Agustín, 23 oct 2026)."""
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        assert qm.started_at is None
+
+        qm.start([qm.creator_participant_id])
+
+        assert qm.started_at is not None
+        assert qm.started_at == qm.updated_at
+
+    def test_it_is_rebuilt_with_when_it_started(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        empezada = datetime(2026, 10, 18, 7, 0)
+
+        copia = QuickMatch.reconstruct(
+            id=qm.id,
+            creator_id=qm.creator_id,
+            golf_course_id=qm.golf_course_id,
+            match_format=qm.match_format,
+            status=QuickMatchStatus.IN_PROGRESS,
+            participants=qm.participants,
+            started_at=empezada,
+        )
+
+        assert copia.started_at == empezada
+
+    def test_it_was_played_when_it_started(self):
+        """Creada el viernes para el domingo: se jugo el domingo (24 oct 2026)."""
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        qm._created_at = datetime(2026, 10, 16, 18, 0)
+        qm.start([qm.creator_participant_id])
+        qm._started_at = datetime(2026, 10, 18, 7, 0)
+
+        assert qm.played_at == datetime(2026, 10, 18, 7, 0)
+
+    def test_without_starting_it_was_played_when_it_was_created(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+
+        assert qm.played_at == qm.created_at
+
+    def test_start_with_incomplete_roster_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        with pytest.raises(IncompleteRosterViolation):
+            qm.start([qm.creator_participant_id])
+
+    def test_start_when_not_pending_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        qm.start([qm.creator_participant_id])
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.start([qm.creator_participant_id])
+
+    def test_start_without_creator_in_scorers_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        other = _registered()
+        qm.add_participant(other)
+        with pytest.raises(InvalidScorerConfigurationViolation, match="creator"):
+            qm.start([other.participant_id])
+
+    def test_start_with_guest_as_scorer_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        qm.add_participant(_registered(team="A"))
+        qm.add_participant(_registered(team="B"))
+        guest = _guest(team="B")
+        qm.add_participant(guest)
+        with pytest.raises(InvalidScorerConfigurationViolation, match="not a registered"):
+            qm.start([qm.creator_participant_id, guest.participant_id])
+
+    def test_start_with_non_registered_scorer_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        with pytest.raises(
+            InvalidScorerConfigurationViolation, match="not a registered participant"
+        ):
+            qm.start(
+                [qm.creator_participant_id, ParticipantId.generate(), ParticipantId.generate()]
+            )
+
+    def test_start_with_duplicate_scorers_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        with pytest.raises(InvalidScorerConfigurationViolation, match="duplicates"):
+            qm.start([qm.creator_participant_id, qm.creator_participant_id])
+
+
+class TestQuickMatchComplete:
+    def test_complete_from_in_progress_succeeds(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        qm.start([qm.creator_participant_id])
+
+        qm.complete()
+
+        assert qm.status == QuickMatchStatus.COMPLETED
+
+    def test_complete_from_pending_raises(self):
+        qm = _make_quick_match()
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.complete()
+
+
+class TestQuickMatchCancel:
+    def test_cancel_from_pending_succeeds(self):
+        qm = _make_quick_match()
+        qm.cancel()
+        assert qm.status == QuickMatchStatus.CANCELLED
+
+    def test_cancel_from_in_progress_succeeds(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        qm.start([qm.creator_participant_id])
+        qm.cancel()
+        assert qm.status == QuickMatchStatus.CANCELLED
+
+    def test_cancel_from_completed_raises(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        qm.add_participant(_registered())
+        qm.start([qm.creator_participant_id])
+        qm.complete()
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.cancel()
+
+
+class TestQuickMatchQueries:
+    def test_capacity_singles(self):
+        assert _make_quick_match(match_format=MatchFormat.SINGLES).capacity() == 2
+
+    def test_capacity_fourball(self):
+        assert _make_quick_match(match_format=MatchFormat.FOURBALL).capacity() == 4
+
+    def test_registered_participants_excludes_guests(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        guest = _guest()
+        qm.add_participant(guest)
+        registered = qm.registered_participants()
+        assert guest not in registered
+        assert len(registered) == 1
+
+
+class TestQuickMatchFormatExclusivity:
+    def test_create_requires_exactly_one_format(self):
+        with pytest.raises(InvalidQuickMatchFormatViolation):
+            QuickMatch.create(
+                id=QuickMatchId.generate(),
+                creator_id=UserId(uuid4()),
+                golf_course_id=GolfCourseId(uuid4()),
+            )
+
+    def test_create_rejects_both_formats_together(self):
+        with pytest.raises(InvalidQuickMatchFormatViolation):
+            QuickMatch.create(
+                id=QuickMatchId.generate(),
+                creator_id=UserId(uuid4()),
+                golf_course_id=GolfCourseId(uuid4()),
+                match_format=MatchFormat.SINGLES,
+                scoring_format=ScoringFormat.MEDAL,
+            )
+
+    def test_reconstruct_requires_exactly_one_format(self):
+        with pytest.raises(InvalidQuickMatchFormatViolation):
+            QuickMatch.reconstruct(
+                id=QuickMatchId.generate(),
+                creator_id=UserId(uuid4()),
+                golf_course_id=GolfCourseId(uuid4()),
+                match_format=None,
+                status=QuickMatchStatus.PENDING,
+                participants=[],
+            )
+
+
+class TestQuickMatchFreePlay:
+    def test_create_stableford_creator_has_no_team(self):
+        qm = _make_free_play_quick_match(scoring_format=ScoringFormat.STABLEFORD)
+        assert qm.match_format is None
+        assert qm.scoring_format == ScoringFormat.STABLEFORD
+        assert qm.participants[0].team is None
+
+    def test_capacity_is_four(self):
+        assert _make_free_play_quick_match().capacity() == 4
+
+    def test_roster_is_always_complete_solo(self):
+        qm = _make_free_play_quick_match()
+        assert qm.is_roster_complete()
+
+    def test_can_start_solo_with_only_creator(self):
+        qm = _make_free_play_quick_match()
+        qm.start([qm.creator_participant_id])
+        assert qm.status == QuickMatchStatus.IN_PROGRESS
+
+    def test_can_start_with_three_players(self):
+        qm = _make_free_play_quick_match()
+        qm.add_participant(_registered())
+        qm.add_participant(_registered())
+        qm.start([qm.creator_participant_id])
+        assert qm.status == QuickMatchStatus.IN_PROGRESS
+
+    def test_add_participant_rejects_team(self):
+        qm = _make_free_play_quick_match(scoring_format=ScoringFormat.MEDAL)
+        with pytest.raises(InvalidTeamAssignmentViolation):
+            qm.add_participant(_registered(team="A"))
+
+    def test_add_participant_up_to_four_then_full(self):
+        qm = _make_free_play_quick_match()
+        qm.add_participant(_registered())
+        qm.add_participant(_registered())
+        qm.add_participant(_registered())
+        assert len(qm.participants) == 4
+        with pytest.raises(QuickMatchFullViolation):
+            qm.add_participant(_registered())
+
+
+class TestQuickMatchAllowance:
+    def test_default_allowance_singles(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES)
+        assert qm.allowance_percentage is None
+        assert qm.get_effective_allowance() == 100
+
+    def test_default_allowance_fourball(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURBALL)
+        assert qm.get_effective_allowance() == 90
+
+    def test_default_allowance_foursomes(self):
+        qm = _make_quick_match(match_format=MatchFormat.FOURSOMES)
+        assert qm.get_effective_allowance() == 50
+
+    def test_default_allowance_free_play(self):
+        qm = _make_free_play_quick_match()
+        assert qm.get_effective_allowance() == 95
+
+    def test_custom_allowance_overrides_default(self):
+        qm = _make_quick_match(match_format=MatchFormat.SINGLES, allowance_percentage=80)
+        assert qm.allowance_percentage == 80
+        assert qm.get_effective_allowance() == 80
+
+    def test_rejects_allowance_not_multiple_of_five(self):
+        with pytest.raises(InvalidAllowanceViolation):
+            _make_quick_match(allowance_percentage=77)
+
+    def test_rejects_allowance_out_of_range(self):
+        with pytest.raises(InvalidAllowanceViolation):
+            _make_quick_match(allowance_percentage=45)
+
+
+class TestAllowsPickedUpHoles:
+    """
+    Donde vale la raya y donde no.
+
+    En Medal no se puede recoger: el stroke play exige embocar en todos los
+    hoyos y quien no lo hace no entrega tarjeta. En Stableford y en match play
+    si, que es donde recoger forma parte del juego.
+    """
+
+    def _free_play(self, scoring_format):
+        return QuickMatch.create(
+            id=QuickMatchId.generate(),
+            creator_id=UserId.generate(),
+            golf_course_id=GolfCourseId(uuid4()),
+            scoring_format=scoring_format,
+        )
+
+    def test_medal_does_not_allow_a_raya(self):
+        assert self._free_play(ScoringFormat.MEDAL).allows_picked_up_holes() is False
+
+    def test_stableford_allows_a_raya(self):
+        assert self._free_play(ScoringFormat.STABLEFORD).allows_picked_up_holes() is True
+
+    @pytest.mark.parametrize(
+        "match_format",
+        [MatchFormat.SINGLES, MatchFormat.FOURBALL, MatchFormat.FOURSOMES],
+    )
+    def test_match_play_allows_a_raya(self, match_format):
+        """Recoger en match play es conceder el hoyo, que es jugada legitima."""
+        qm = QuickMatch.create(
+            id=QuickMatchId.generate(),
+            creator_id=UserId.generate(),
+            golf_course_id=GolfCourseId(uuid4()),
+            match_format=match_format,
+        )
+
+        assert qm.allows_picked_up_holes() is True
+
+
+class TestQuickMatchFreezeHandicaps:
+    """
+    BE #514: la partida guarda al empezar el índice con el que juega cada uno.
+
+    Sin esto todo se recalculaba con el hándicap del perfil DE HOY: si el de un
+    jugador cambiaba (la actualización de la RFEG está activa en producción),
+    cambiaban los golpes, los puntos y «Tu vuelta» de todas sus partidas.
+    """
+
+    def _empezada(self):
+        """Partida libre empezada con un registrado, uno con personalizado y un invitado."""
+        qm = _make_free_play_quick_match()
+        registrado = _registered()
+        con_personalizado = _registered()
+        invitado = QuickMatchParticipant.for_guest(
+            first_name="Inv", last_name="Itado", handicap=12.3
+        )
+        for p in (registrado, con_personalizado, invitado):
+            qm.add_participant(p)
+        qm.set_participant_handicap(con_personalizado.participant_id, 9.0)
+        qm.start([qm.creator_participant_id])
+        return qm, registrado, con_personalizado, invitado
+
+    def test_cada_uno_juega_con_el_indice_que_tenia_al_empezar(self):
+        """Given fijados When cambia el perfil Then manda lo fijado."""
+        qm, registrado, con_personalizado, invitado = self._empezada()
+
+        qm.freeze_handicaps(
+            {qm.creator_id: 18.5, registrado.user_id: 20.1, con_personalizado.user_id: 30.0}
+        )
+
+        por_id = {p.participant_id: p for p in qm.participants}
+        # Aunque el perfil cambie después, manda lo fijado
+        assert por_id[registrado.participant_id].effective_handicap(profile_handicap=25.0) == 20.1
+        assert por_id[qm.creator_participant_id].effective_handicap(profile_handicap=17.0) == 18.5
+        # El personalizado gana al perfil, como siempre
+        assert (
+            por_id[con_personalizado.participant_id].effective_handicap(profile_handicap=1.0) == 9.0
+        )
+        assert por_id[invitado.participant_id].effective_handicap(profile_handicap=None) == 12.3
+
+    def test_quien_empezo_sin_handicap_sigue_sin_el_aunque_luego_lo_tenga(self):
+        """Given empezó sin hándicap When luego lo tiene Then esa partida sigue sin él."""
+        qm, registrado, _, _ = self._empezada()
+
+        qm.freeze_handicaps({qm.creator_id: 18.5, registrado.user_id: None})
+
+        fijado = next(p for p in qm.participants if p.participant_id == registrado.participant_id)
+        assert fijado.effective_handicap(profile_handicap=15.0) is None
+
+    def test_sin_fijar_sigue_mirando_el_perfil(self):
+        """Las partidas empezadas antes del cambio no tienen nada fijado."""
+        qm, registrado, _, _ = self._empezada()
+
+        participante = next(
+            p for p in qm.participants if p.participant_id == registrado.participant_id
+        )
+        assert participante.effective_handicap(profile_handicap=15.0) == 15.0
+
+    def test_solo_se_fija_una_vez(self):
+        """Given ya fijada When se fija otra vez Then se rechaza."""
+        qm, registrado, _, _ = self._empezada()
+        qm.freeze_handicaps({qm.creator_id: 18.5, registrado.user_id: 20.1})
+
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.freeze_handicaps({qm.creator_id: 1.0, registrado.user_id: 1.0})
+
+    def test_no_se_fija_antes_de_empezar(self):
+        """Given sin empezar When se fija Then se rechaza."""
+        qm = _make_free_play_quick_match()
+
+        with pytest.raises(InvalidQuickMatchStatusViolation):
+            qm.freeze_handicaps({qm.creator_id: 18.5})

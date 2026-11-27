@@ -1,0 +1,302 @@
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from src.modules.user.application.dto.user_dto import RegisterUserRequestDTO
+from src.modules.user.application.use_cases.register_user_use_case import (
+    RegisterUserUseCase,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.modules.user.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork,
+)
+
+# Marcar todos los tests de este fichero para que se ejecuten con asyncio
+pytestmark = pytest.mark.asyncio
+
+
+class TestRegisterUserUseCase:
+    """
+    Suite de tests para el caso de uso RegisterUserUseCase.
+    """
+
+    @pytest.fixture
+    def uow(self) -> InMemoryUnitOfWork:
+        """Fixture que proporciona una Unit of Work en memoria para cada test."""
+        return InMemoryUnitOfWork()
+
+    @pytest.fixture
+    def country_repository(self):
+        """Fixture que proporciona un mock de CountryRepository."""
+        mock_repo = AsyncMock()
+        # Por defecto, todos los country codes son válidos
+        mock_repo.exists.return_value = True
+        return mock_repo
+
+    async def test_should_register_user_successfully(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Verifica que un usuario se registra correctamente cuando los datos son válidos
+        y el email no existe previamente.
+        """
+        # Arrange
+        use_case = RegisterUserUseCase(uow, country_repository, security_audit=MagicMock())
+        request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="test.user@example.com",
+            password="V@l1dP@ss123!",
+            first_name="Test",
+            last_name="User",
+        )
+
+        # Act
+        user_response = await use_case.execute(request_dto)
+
+        # Assert
+        # 1. Verificar que la respuesta del DTO es correcta
+        assert user_response.email == request_dto.email
+        assert user_response.first_name == request_dto.first_name
+        assert user_response.id is not None
+
+        # 2. Verificar que el usuario fue realmente guardado en la persistencia
+        async with uow:
+            user_id_vo = UserId(user_response.id)
+            saved_user = await uow.users.find_by_id(user_id_vo)
+            assert saved_user is not None
+            assert str(saved_user.email) == request_dto.email
+
+    async def test_an_existing_email_gets_the_same_response_and_is_not_touched(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Con un email que ya existe ya no se lanza UserAlreadyExistsError (fase 3, F-01):
+        la misma respuesta que un alta nueva, y la cuenta que ya existe, intacta.
+        """
+        # Arrange: Primero, creamos un usuario existente
+        use_case = RegisterUserUseCase(uow, country_repository, security_audit=MagicMock())
+        existing_user_request = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="existing.user@example.com",
+            password="V@l1dP@ss123!",
+            first_name="Existing",
+            last_name="User",
+        )
+        await use_case.execute(existing_user_request)
+
+        # Ahora, intentamos registrar otro usuario con el MISMO email
+        new_request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="existing.user@example.com",
+            password="An0th3rV@l1dP@ss!",
+            first_name="Another",
+            last_name="User",
+        )
+
+        # Act
+        respuesta = await use_case.execute(new_request_dto)
+
+        # Assert
+        assert respuesta.email == "existing.user@example.com"
+        assert respuesta.first_name == "Another"
+        async with uow:
+            assert len(uow.users._users) == 1
+            (guardado,) = uow.users._users.values()
+            assert guardado.first_name == "Existing"
+
+    async def test_should_register_user_with_manual_handicap_when_rfeg_returns_none(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Verifica que se puede registrar un usuario con hándicap manual
+        cuando RFEG devuelve None.
+        """
+        # Arrange
+        from tests.fakes.mock_handicap_service import (
+            MockHandicapService,
+        )
+
+        # Servicio que siempre devuelve None (usuario no encontrado en RFEG)
+        handicap_service = MockHandicapService(default=None)
+        use_case = RegisterUserUseCase(
+            uow, country_repository, handicap_service, security_audit=MagicMock()
+        )
+
+        request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="test.user@example.com",
+            password="V@l1dP@ss123!",
+            first_name="Test",
+            last_name="User",
+            manual_handicap=15.5,
+        )
+
+        # Act
+        user_response = await use_case.execute(request_dto)
+
+        # Assert
+        assert user_response.handicap == pytest.approx(15.5)
+
+    async def test_should_prefer_rfeg_handicap_over_manual(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Verifica que se prefiere el hándicap de RFEG sobre el manual
+        cuando RFEG devuelve un valor.
+        """
+        # Arrange
+        from tests.fakes.mock_handicap_service import (
+            MockHandicapService,
+        )
+
+        # Servicio que devuelve un hándicap para este usuario
+        handicap_service = MockHandicapService(handicaps={"Test User": 3.5})
+        use_case = RegisterUserUseCase(
+            uow, country_repository, handicap_service, security_audit=MagicMock()
+        )
+
+        request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="test.user@example.com",
+            password="V@l1dP@ss123!",
+            first_name="Test",
+            last_name="User",
+            country_code="ES",  # Usuario español para que RFEG se ejecute
+            manual_handicap=20.0,  # Este será ignorado
+        )
+
+        # Act
+        user_response = await use_case.execute(request_dto)
+
+        # Assert - debe usar el de RFEG (3.5), no el manual (20.0)
+        assert user_response.handicap == pytest.approx(3.5)
+
+    async def test_should_register_without_handicap_when_none_available(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Verifica que se puede registrar un usuario sin hándicap
+        cuando RFEG devuelve None y no se proporciona hándicap manual.
+        """
+        # Arrange
+        from tests.fakes.mock_handicap_service import (
+            MockHandicapService,
+        )
+
+        # Servicio que devuelve None
+        handicap_service = MockHandicapService(default=None)
+        use_case = RegisterUserUseCase(
+            uow, country_repository, handicap_service, security_audit=MagicMock()
+        )
+
+        request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="test.user@example.com",
+            password="V@l1dP@ss123!",
+            first_name="Test",
+            last_name="User",
+            # No manual_handicap
+        )
+
+        # Act
+        user_response = await use_case.execute(request_dto)
+
+        # Assert
+        assert user_response.handicap is None
+
+    async def test_should_search_rfeg_handicap_for_spanish_users(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Verifica que la búsqueda de RFEG se ejecuta SOLO para usuarios españoles.
+        """
+        # Arrange
+        mock_handicap_service = AsyncMock()
+        mock_handicap_service.search_handicap.return_value = 15.4  # Handicap encontrado
+
+        use_case = RegisterUserUseCase(
+            uow, country_repository, mock_handicap_service, security_audit=MagicMock()
+        )
+        request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="spanish.player@example.com",
+            password="V@l1dP@ss123!",
+            first_name="Carlos",
+            last_name="García López",
+            country_code="ES",  # Usuario español
+        )
+
+        # Act
+        user_response = await use_case.execute(request_dto)
+
+        # Assert
+        # 1. Verificar que se llamó al servicio RFEG
+        mock_handicap_service.search_handicap.assert_called_once_with("Carlos García López")
+
+        # 2. Verificar que el handicap se asignó
+        async with uow:
+            user_id_vo = UserId(user_response.id)
+            saved_user = await uow.users.find_by_id(user_id_vo)
+            assert saved_user.handicap.value == 15.4
+
+    async def test_should_not_search_rfeg_handicap_for_non_spanish_users(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Verifica que la búsqueda de RFEG NO se ejecuta para usuarios no españoles.
+        """
+        # Arrange
+        mock_handicap_service = AsyncMock()
+        mock_handicap_service.search_handicap.return_value = 10.0  # No debería usarse
+
+        use_case = RegisterUserUseCase(
+            uow, country_repository, mock_handicap_service, security_audit=MagicMock()
+        )
+        request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="french.player@example.com",
+            password="V@l1dP@ss123!",
+            first_name="Pierre",
+            last_name="Dupont",
+            country_code="FR",  # Usuario francés
+        )
+
+        # Act
+        user_response = await use_case.execute(request_dto)
+
+        # Assert
+        # 1. Verificar que NO se llamó al servicio RFEG
+        mock_handicap_service.search_handicap.assert_not_called()
+
+        # 2. Verificar que el usuario se registró sin handicap
+        async with uow:
+            user_id_vo = UserId(user_response.id)
+            saved_user = await uow.users.find_by_id(user_id_vo)
+            assert saved_user.handicap is None
+
+    async def test_should_not_search_rfeg_handicap_when_no_country_code(
+        self, uow: InMemoryUnitOfWork, country_repository
+    ):
+        """
+        Verifica que la búsqueda de RFEG NO se ejecuta si el usuario no especificó país.
+        """
+        # Arrange
+        mock_handicap_service = AsyncMock()
+
+        use_case = RegisterUserUseCase(
+            uow, country_repository, mock_handicap_service, security_audit=MagicMock()
+        )
+        request_dto = RegisterUserRequestDTO(
+            accept_terms=True,
+            email="no.country@example.com",
+            password="V@l1dP@ss123!",
+            first_name="John",
+            last_name="Doe",
+            country_code=None,  # Sin país especificado
+        )
+
+        # Act
+        _ = await use_case.execute(request_dto)
+
+        # Assert
+        mock_handicap_service.search_handicap.assert_not_called()

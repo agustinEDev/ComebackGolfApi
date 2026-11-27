@@ -1,0 +1,682 @@
+"""
+Quick Match Routes - API REST Layer (Infrastructure).
+
+Endpoints FastAPI para gestion de partidas rapidas siguiendo Clean Architecture.
+"""
+
+import logging
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response, status
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from src.config.dependencies import (
+    get_add_friend_to_quick_match_use_case,
+    get_add_guest_to_quick_match_use_case,
+    get_cancel_quick_match_use_case,
+    get_complete_quick_match_use_case,
+    get_create_and_start_quick_match_use_case,
+    get_create_quick_match_use_case,
+    get_current_user,
+    get_exclude_quick_match_from_stats_use_case,
+    get_get_quick_match_use_case,
+    get_get_shared_quick_match_use_case,
+    get_hide_quick_match_use_case,
+    get_include_quick_match_in_stats_use_case,
+    get_list_my_quick_matches_use_case,
+    get_remove_quick_match_participant_use_case,
+    get_set_quick_match_participant_handicap_use_case,
+    get_start_quick_match_use_case,
+    get_submit_quick_match_hole_score_use_case,
+    get_submit_quick_match_proxy_hole_score_use_case,
+)
+from src.config.rate_limit import limiter
+from src.modules.quick_match.application.dto.quick_match_dto import (
+    MAX_HANDICAP,
+    MAX_NAME_LENGTH,
+    MAX_SCORERS,
+    MIN_HANDICAP,
+    TEE_COLOR_PATTERN,
+    AddGuestParticipantRequestDTO,
+    AddParticipantRequestDTO,
+    CreateAndStartQuickMatchRequestDTO,
+    CreateQuickMatchRequestDTO,
+    HideQuickMatchRequestDTO,
+    HideQuickMatchResponseDTO,
+    HoleScoreResponseDTO,
+    PaginatedQuickMatchResponseDTO,
+    QuickMatchDetailResponseDTO,
+    QuickMatchResponseDTO,
+    QuickStartPlayerDTO,
+    RemoveParticipantRequestDTO,
+    SetParticipantHandicapRequestDTO,
+    SharedQuickMatchDetailResponseDTO,
+    StartQuickMatchRequestDTO,
+    SubmitHoleScoreRequestDTO,
+    SubmitProxyHoleScoreRequestDTO,
+    require_unique,
+)
+from src.modules.quick_match.application.exceptions import (
+    GolfCourseNotApprovedError,
+)
+from src.modules.quick_match.application.use_cases.add_friend_to_quick_match_use_case import (
+    AddFriendToQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.add_guest_to_quick_match_use_case import (
+    AddGuestToQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.cancel_quick_match_use_case import (
+    CancelQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.complete_quick_match_use_case import (
+    CompleteQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.create_and_start_quick_match_use_case import (
+    CreateAndStartQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.create_quick_match_use_case import (
+    CreateQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.exclude_quick_match_from_stats_use_case import (
+    ExcludeQuickMatchFromStatsUseCase,
+)
+from src.modules.quick_match.application.use_cases.get_quick_match_use_case import (
+    GetQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.get_shared_quick_match_use_case import (
+    GetSharedQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.hide_quick_match_use_case import (
+    HideQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.include_quick_match_in_stats_use_case import (
+    IncludeQuickMatchInStatsUseCase,
+)
+from src.modules.quick_match.application.use_cases.list_my_quick_matches_use_case import (
+    ListMyQuickMatchesUseCase,
+)
+from src.modules.quick_match.application.use_cases.remove_participant_use_case import (
+    RemoveParticipantUseCase,
+)
+from src.modules.quick_match.application.use_cases.set_participant_handicap_use_case import (
+    SetParticipantHandicapUseCase,
+)
+from src.modules.quick_match.application.use_cases.start_quick_match_use_case import (
+    StartQuickMatchUseCase,
+)
+from src.modules.quick_match.application.use_cases.submit_hole_score_use_case import (
+    SubmitQuickMatchHoleScoreUseCase,
+)
+from src.modules.quick_match.application.use_cases.submit_proxy_hole_score_use_case import (
+    SubmitProxyHoleScoreUseCase,
+)
+from src.modules.user.application.dto.user_dto import UserResponseDTO
+from src.shared.infrastructure.http.paginacion import parametro_page
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+# ======================================================================================
+# REQUEST BODY MODELS (Presentation Layer)
+# ======================================================================================
+
+
+TEE_GENDER_PATTERN = "^(MALE|FEMALE)$"
+
+
+def _require_tee_color_for_gender(tee_color: str | None, tee_gender: str | None) -> None:
+    """
+    El color y el género van juntos: son las dos mitades de la misma identidad.
+
+    Ni un color suelto ni un género suelto señalan una salida concreta, así que
+    se rechaza cualquiera de las dos mitades por separado antes de que el caso
+    de uso pregunte al campo si esa salida existe.
+    """
+    if (tee_color is None) != (tee_gender is None):
+        raise ValueError("tee_color and tee_gender must be provided together.")
+
+
+class CreateQuickMatchBody(BaseModel):
+    """Body para crear una partida rapida. Exactamente uno de match_format/scoring_format."""
+
+    golf_course_id: UUID
+    match_format: str | None = Field(None, pattern="^(SINGLES|FOURBALL|FOURSOMES)$")
+    scoring_format: str | None = Field(None, pattern="^(MEDAL|STABLEFORD)$")
+    name: str | None = Field(None, max_length=MAX_NAME_LENGTH)
+    allowance_percentage: int | None = Field(None, ge=50, le=100)
+    play_mode: str = Field("HANDICAP", pattern="^(SCRATCH|HANDICAP)$")
+    creator_tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    creator_tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _strip_name(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _exactly_one_format(self) -> "CreateQuickMatchBody":
+        if (self.match_format is None) == (self.scoring_format is None):
+            raise ValueError("Exactly one of match_format or scoring_format must be provided.")
+        return self
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "CreateQuickMatchBody":
+        _require_tee_color_for_gender(self.creator_tee_color, self.creator_tee_gender)
+        return self
+
+
+class AddParticipantBody(BaseModel):
+    """Body para añadir un amigo como participante."""
+
+    friend_user_id: UUID
+    team: str | None = Field(None, pattern="^(A|B)$")
+    tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "AddParticipantBody":
+        _require_tee_color_for_gender(self.tee_color, self.tee_gender)
+        return self
+
+
+class AddGuestParticipantBody(BaseModel):
+    """Body para añadir a mano un jugador invitado (sin cuenta)."""
+
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    handicap: float | None = Field(None, ge=-10.0, le=54.0)
+    team: str | None = Field(None, pattern="^(A|B)$")
+    tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "AddGuestParticipantBody":
+        _require_tee_color_for_gender(self.tee_color, self.tee_gender)
+        return self
+
+
+class SetParticipantHandicapBody(BaseModel):
+    """Body para editar el handicap de un participante (manual u override)."""
+
+    handicap: float | None = Field(None, ge=MIN_HANDICAP, le=MAX_HANDICAP)
+
+
+class StartQuickMatchBody(BaseModel):
+    """Body para iniciar la partida, indicando quien va a anotar (1 a 4)."""
+
+    scorer_ids: list[UUID] = Field(..., min_length=1, max_length=MAX_SCORERS)
+
+    @field_validator("scorer_ids")
+    @classmethod
+    def _unique_scorer_ids(cls, v: list[UUID]) -> list[UUID]:
+        if len(set(v)) != len(v):
+            raise ValueError("scorer_ids must not contain duplicates.")
+        return v
+
+
+class CreateAndStartQuickMatchBody(CreateQuickMatchBody):
+    """
+    Body para crear e iniciar una partida rápida de una vez (FE #848).
+
+    Lo del alta, los jugadores en el orden en que se añadieron, los cambios de
+    hándicap y quién anota (sus UserId: un invitado no anota). El id lo genera
+    el cliente: reintentar devuelve la misma partida.
+    """
+
+    quick_match_id: UUID
+    creator_handicap: float | None = Field(None, ge=MIN_HANDICAP, le=MAX_HANDICAP)
+    # Los mismos jugadores que el DTO, no una copia: si no, un cambio en uno
+    # dejaría pasar en el body lo que el DTO rechaza, y eso es un 500
+    participants: list[QuickStartPlayerDTO] = Field(default_factory=list, max_length=3)
+    scorer_user_ids: list[UUID] = Field(..., min_length=1, max_length=MAX_SCORERS)
+
+    @field_validator("scorer_user_ids")
+    @classmethod
+    def _unique_scorer_user_ids(cls, v: list[UUID]) -> list[UUID]:
+        return require_unique(v, "scorer_user_ids")
+
+
+class SubmitHoleScoreBody(BaseModel):
+    """
+    Body para registrar el score de un hoyo.
+
+    `score: null` es la raya (bola recogida): el hoyo queda anotado sin numero,
+    que no es lo mismo que dejarlo sin anotar. Sigue siendo obligatorio estar
+    presente en el body, para que omitirlo no borre un score ya puesto.
+    """
+
+    score: int | None = Field(..., ge=1, le=15)
+
+
+# ======================================================================================
+# ENDPOINTS
+# ======================================================================================
+
+
+@router.post(
+    "/quick-matches",
+    response_model=QuickMatchResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create quick match",
+    description="Creates a quick match with the current user as creator/first participant.",
+)
+@limiter.limit("20/hour")
+async def create_quick_match(
+    request: Request,  # noqa: ARG001 - Required by SlowAPI for rate limiting
+    body: CreateQuickMatchBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CreateQuickMatchUseCase = Depends(get_create_quick_match_use_case),
+):
+    try:
+        request_dto = CreateQuickMatchRequestDTO(
+            creator_id=current_user.id,
+            golf_course_id=body.golf_course_id,
+            match_format=body.match_format,
+            scoring_format=body.scoring_format,
+            name=body.name,
+            allowance_percentage=body.allowance_percentage,
+            play_mode=body.play_mode,
+            creator_tee_color=body.creator_tee_color,
+            creator_tee_gender=body.creator_tee_gender,
+        )
+        return await use_case.execute(request_dto)
+
+    except GolfCourseNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.post(
+    "/quick-matches/start",
+    response_model=QuickMatchResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create and start quick match",
+    description=(
+        "Creates the quick match with its whole roster, handicap overrides and scorers, "
+        "starts it and freezes the handicaps in a single request. Nothing is saved if "
+        "any part fails."
+    ),
+)
+@limiter.limit("20/hour")
+async def create_and_start_quick_match(
+    request: Request,  # noqa: ARG001 - Required by SlowAPI for rate limiting
+    response: Response,
+    body: CreateAndStartQuickMatchBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CreateAndStartQuickMatchUseCase = Depends(get_create_and_start_quick_match_use_case),
+):
+    request_dto = CreateAndStartQuickMatchRequestDTO(
+        quick_match_id=body.quick_match_id,
+        creator_id=current_user.id,
+        golf_course_id=body.golf_course_id,
+        match_format=body.match_format,
+        scoring_format=body.scoring_format,
+        name=body.name,
+        allowance_percentage=body.allowance_percentage,
+        play_mode=body.play_mode,
+        creator_tee_color=body.creator_tee_color,
+        creator_tee_gender=body.creator_tee_gender,
+        creator_handicap=body.creator_handicap,
+        participants=body.participants,
+        scorer_user_ids=body.scorer_user_ids,
+    )
+    try:
+        result = await use_case.execute(request_dto)
+    except GolfCourseNotApprovedError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+    # Un reintento con el mismo id devuelve la que ya había: 200, no 201
+    if not result.created:
+        response.status_code = status.HTTP_200_OK
+    return result.quick_match
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/participants",
+    response_model=QuickMatchResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add friend to quick match",
+    description="Creator adds an accepted friend directly, without an invitation step.",
+)
+async def add_participant(
+    quick_match_id: UUID,
+    body: AddParticipantBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: AddFriendToQuickMatchUseCase = Depends(get_add_friend_to_quick_match_use_case),
+):
+    request_dto = AddParticipantRequestDTO(
+        quick_match_id=quick_match_id,
+        requester_id=current_user.id,
+        friend_user_id=body.friend_user_id,
+        team=body.team,
+        tee_color=body.tee_color,
+        tee_gender=body.tee_gender,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/participants/guest",
+    response_model=QuickMatchResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add guest to quick match",
+    description=(
+        "Creator adds a guest player (no account) by entering their name and handicap. "
+        "Their scores will be recorded by an assigned scorer once the match starts."
+    ),
+)
+async def add_guest_participant(
+    quick_match_id: UUID,
+    body: AddGuestParticipantBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: AddGuestToQuickMatchUseCase = Depends(get_add_guest_to_quick_match_use_case),
+):
+    request_dto = AddGuestParticipantRequestDTO(
+        quick_match_id=quick_match_id,
+        requester_id=current_user.id,
+        first_name=body.first_name,
+        last_name=body.last_name,
+        handicap=body.handicap,
+        team=body.team,
+        tee_color=body.tee_color,
+        tee_gender=body.tee_gender,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.delete(
+    "/quick-matches/{quick_match_id}/participants/{target_participant_id}",
+    response_model=QuickMatchResponseDTO,
+    summary="Remove participant",
+    description="Removes a participant (self-leave for registered players, or creator kick).",
+)
+async def remove_participant(
+    quick_match_id: UUID,
+    target_participant_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: RemoveParticipantUseCase = Depends(get_remove_quick_match_participant_use_case),
+):
+    request_dto = RemoveParticipantRequestDTO(
+        quick_match_id=quick_match_id,
+        requester_id=current_user.id,
+        target_participant_id=target_participant_id,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/hide",
+    response_model=HideQuickMatchResponseDTO,
+    summary="Hide quick match from my history",
+    description=(
+        "Removes the quick match from the caller's own /quick-matches/me list, for "
+        "good: it cannot be undone. Any participant (not just the creator) can do it "
+        "for themselves, and only once the match is completed or cancelled (409 "
+        "otherwise). It does not affect what other participants see. Once every "
+        "participant who still has an active account has removed it, the match is "
+        "deleted for real, with its scores and the activity it produced: the response "
+        "then carries `deleted: true` and the match answers 404 from then on."
+    ),
+)
+async def hide_quick_match(
+    quick_match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: HideQuickMatchUseCase = Depends(get_hide_quick_match_use_case),
+):
+    request_dto = HideQuickMatchRequestDTO(
+        quick_match_id=quick_match_id,
+        requester_id=current_user.id,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/stats-exclusion",
+    response_model=QuickMatchResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Leave this match out of my statistics",
+    description=(
+        "The match stops counting towards the caller's statistics but STAYS in their "
+        "history, flagged, and the flag can be lifted again (DELETE on the same path). "
+        "Different from hiding it, which removes it from the list for good. "
+        "Self-scoped: any participant can flag it for themselves and it does not affect "
+        "the others. Only on a completed match; anything else returns 409. Idempotent."
+    ),
+    tags=["Quick Matches"],
+)
+async def exclude_quick_match_from_stats(
+    quick_match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ExcludeQuickMatchFromStatsUseCase = Depends(
+        get_exclude_quick_match_from_stats_use_case
+    ),
+):
+    request_dto = HideQuickMatchRequestDTO(
+        quick_match_id=quick_match_id,
+        requester_id=current_user.id,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.delete(
+    "/quick-matches/{quick_match_id}/stats-exclusion",
+    response_model=QuickMatchResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Count this match towards my statistics again",
+    description=(
+        "Reverses the exclusion: the match counts again for the caller. Idempotent, and "
+        "allowed in any status — lifting a flag is always safe."
+    ),
+    tags=["Quick Matches"],
+)
+async def include_quick_match_in_stats(
+    quick_match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: IncludeQuickMatchInStatsUseCase = Depends(get_include_quick_match_in_stats_use_case),
+):
+    request_dto = HideQuickMatchRequestDTO(
+        quick_match_id=quick_match_id,
+        requester_id=current_user.id,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.patch(
+    "/quick-matches/{quick_match_id}/participants/{target_participant_id}/handicap",
+    response_model=QuickMatchResponseDTO,
+    summary="Set participant handicap",
+    description=(
+        "Creator sets/overrides a participant's handicap before starting the match — "
+        "a manual value for guests, or an override for registered players (e.g. one "
+        "without a handicap on their profile). Only allowed while the match is PENDING."
+    ),
+)
+async def set_participant_handicap(
+    quick_match_id: UUID,
+    target_participant_id: UUID,
+    body: SetParticipantHandicapBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: SetParticipantHandicapUseCase = Depends(
+        get_set_quick_match_participant_handicap_use_case
+    ),
+):
+    try:
+        request_dto = SetParticipantHandicapRequestDTO(
+            quick_match_id=quick_match_id,
+            requester_id=current_user.id,
+            target_participant_id=target_participant_id,
+            handicap=body.handicap,
+        )
+        return await use_case.execute(request_dto)
+
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/start",
+    response_model=QuickMatchResponseDTO,
+    summary="Start quick match",
+    description=(
+        "Creator starts the quick match once the roster is complete, choosing between "
+        "1 and 4 registered participants (always including the creator) as scorers."
+    ),
+)
+async def start_quick_match(
+    quick_match_id: UUID,
+    body: StartQuickMatchBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: StartQuickMatchUseCase = Depends(get_start_quick_match_use_case),
+):
+    request_dto = StartQuickMatchRequestDTO(
+        quick_match_id=quick_match_id,
+        requester_id=current_user.id,
+        scorer_ids=body.scorer_ids,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/complete",
+    response_model=QuickMatchResponseDTO,
+    summary="Complete quick match",
+    description="Creator marks the quick match as completed.",
+)
+async def complete_quick_match(
+    quick_match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CompleteQuickMatchUseCase = Depends(get_complete_quick_match_use_case),
+):
+    return await use_case.execute(str(quick_match_id), str(current_user.id))
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/cancel",
+    response_model=QuickMatchResponseDTO,
+    summary="Cancel quick match",
+    description="Creator cancels the quick match.",
+)
+async def cancel_quick_match(
+    quick_match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CancelQuickMatchUseCase = Depends(get_cancel_quick_match_use_case),
+):
+    return await use_case.execute(str(quick_match_id), str(current_user.id))
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/holes/{hole_number}/score",
+    response_model=HoleScoreResponseDTO,
+    summary="Submit own hole score",
+    description="Registers/updates the current user's own score for a hole. Scorers only.",
+)
+async def submit_hole_score(
+    quick_match_id: UUID,
+    hole_number: Annotated[int, Path(ge=1, le=18)],
+    body: SubmitHoleScoreBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: SubmitQuickMatchHoleScoreUseCase = Depends(
+        get_submit_quick_match_hole_score_use_case
+    ),
+):
+    request_dto = SubmitHoleScoreRequestDTO(
+        quick_match_id=quick_match_id,
+        player_user_id=current_user.id,
+        hole_number=hole_number,
+        score=body.score,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.post(
+    "/quick-matches/{quick_match_id}/participants/{target_participant_id}/holes/{hole_number}/score",
+    response_model=HoleScoreResponseDTO,
+    summary="Submit hole score by proxy",
+    description=(
+        "Records a hole score on behalf of another participant (guest, or registered "
+        "player not selected as a scorer). Only the scorer assigned to that "
+        "participant may do this."
+    ),
+)
+async def submit_proxy_hole_score(
+    quick_match_id: UUID,
+    target_participant_id: UUID,
+    hole_number: Annotated[int, Path(ge=1, le=18)],
+    body: SubmitHoleScoreBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: SubmitProxyHoleScoreUseCase = Depends(
+        get_submit_quick_match_proxy_hole_score_use_case
+    ),
+):
+    request_dto = SubmitProxyHoleScoreRequestDTO(
+        quick_match_id=quick_match_id,
+        scorer_user_id=current_user.id,
+        target_participant_id=target_participant_id,
+        hole_number=hole_number,
+        score=body.score,
+    )
+    return await use_case.execute(request_dto)
+
+
+@router.get(
+    "/quick-matches/me",
+    response_model=PaginatedQuickMatchResponseDTO,
+    summary="List my quick matches",
+    description="Lists quick matches the current user participates in.",
+)
+async def list_my_quick_matches(
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ListMyQuickMatchesUseCase = Depends(get_list_my_quick_matches_use_case),
+    status_filter: str | None = Query(None, alias="status"),
+    page: int = parametro_page(),
+    limit: int = Query(20, ge=1, le=100),
+    golf_course_id: UUID | None = Query(
+        None, description="Only matches on this golf course (latest played first)."
+    ),
+):
+    return await use_case.execute(
+        str(current_user.id),
+        status_filter=status_filter,
+        page=page,
+        limit=limit,
+        golf_course_id=golf_course_id,
+    )
+
+
+@router.get(
+    "/quick-matches/{quick_match_id}",
+    response_model=QuickMatchDetailResponseDTO,
+    summary="Get quick match detail",
+    description=(
+        "Returns quick match detail, hole scores, computed match standing, and the "
+        "scorer coverage assignments (who records for whom)."
+    ),
+)
+async def get_quick_match(
+    quick_match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetQuickMatchUseCase = Depends(get_get_quick_match_use_case),
+):
+    return await use_case.execute(str(quick_match_id), str(current_user.id))
+
+
+@router.get(
+    "/quick-matches/{quick_match_id}/shared",
+    response_model=SharedQuickMatchDetailResponseDTO,
+    summary="View a friend's finished quick match (read-only)",
+    description=(
+        "Read-only view of a quick match: same fields as the detail, plus `read_only` "
+        "and `viewer_is_participant`. Open to its players in any status (the client "
+        "sends them to their scoring view) and, once FINISHED, to the friends of any "
+        "registered player who shares activity, is active, has no block with the viewer "
+        "and has not hidden the match. For non-players, the `name` of guests and of "
+        "players blocked with the viewer or deactivated comes as null. Anyone else gets 403."
+    ),
+)
+async def get_shared_quick_match(
+    quick_match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetSharedQuickMatchUseCase = Depends(get_get_shared_quick_match_use_case),
+):
+    return await use_case.execute(str(quick_match_id), str(current_user.id))

@@ -1,0 +1,425 @@
+"""
+SQLAlchemy Mapper for GolfCourse aggregate.
+
+Tablas:
+- golf_courses (agregado raíz)
+- golf_course_tees (value object collection)
+- golf_course_tee_holes (tarjeta de cada salida)
+"""
+
+from typing import Any
+
+import sqlalchemy.types
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Enum as SQLEnum,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Table,
+    UniqueConstraint,
+    event,
+    inspect,
+    text,
+)
+from sqlalchemy.orm import column_property, relationship
+
+from src.modules.golf_course.domain.entities.golf_course import GolfCourse
+from src.modules.golf_course.domain.entities.hole import Hole
+from src.modules.golf_course.domain.entities.tee import Tee
+from src.modules.golf_course.domain.value_objects.approval_status import ApprovalStatus
+from src.modules.golf_course.domain.value_objects.course_source import CourseSource
+from src.modules.golf_course.domain.value_objects.course_type import CourseType
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+from src.shared.domain.value_objects.gender import Gender
+from src.shared.infrastructure.persistence.sqlalchemy.base import mapper_registry, metadata
+from src.shared.infrastructure.persistence.sqlalchemy.tipos_de_id import (
+    tipo_de_codigo_de_pais,
+    tipo_de_id,
+)
+
+# ============================================================================
+# TypeDecorators for Value Objects (MUST be before tables)
+# ============================================================================
+
+
+GolfCourseIdType = tipo_de_id(GolfCourseId, columna="uuid")
+CountryCodeType = tipo_de_codigo_de_pais(columna="varchar")
+UserIdType = tipo_de_id(UserId)
+
+
+class GenderType(sqlalchemy.types.TypeDecorator[Gender]):
+    """TypeDecorator para Gender Value Object (nullable)."""
+
+    impl = String(10)
+    cache_ok = True
+
+    def process_bind_param(self, value: Gender | None, dialect: Any) -> str | None:
+        if value is None:
+            return None
+        return value.value
+
+    def process_result_value(self, value: str | None, dialect: Any) -> Gender | None:
+        if value is None:
+            return None
+        return Gender(value)
+
+
+# ============================================================================
+# Tables
+# ============================================================================
+
+golf_courses_table = Table(
+    "golf_courses",
+    metadata,
+    Column("id", GolfCourseIdType, primary_key=True),
+    Column("name", String(200), nullable=False, comment="Nombre del campo de golf"),
+    Column("country_code", CountryCodeType, ForeignKey("countries.code"), nullable=False),
+    Column(
+        "course_type",
+        SQLEnum(CourseType, name="course_type_enum"),
+        # Sin create_type=False (30 sep 2026): con SQLAlchemy 2.0 el Enum genérico lo
+        # ignoraba y metadata.create_all de los tests creaba el tipo; 2.1 lo respeta y
+        # los tests fallaban con 'type course_type_enum does not exist'. En producción
+        # los tipos los crea Alembic y la app nunca llama a create_all: no cambia nada.
+        nullable=False,
+        comment="Tipo de campo (STANDARD_18, etc.)",
+    ),
+    Column("creator_id", UserIdType, ForeignKey("users.id"), nullable=False),
+    Column(
+        "approval_status",
+        SQLEnum(ApprovalStatus, name="approval_status_enum"),
+        nullable=False,
+        default=ApprovalStatus.PENDING_APPROVAL,
+        comment="Estado de aprobación (PENDING_APPROVAL, APPROVED, REJECTED)",
+    ),
+    Column(
+        "rejection_reason",
+        String(500),
+        nullable=True,
+        comment="Razón de rechazo (solo si REJECTED)",
+    ),
+    Column("created_at", DateTime, nullable=False, default=ahora_utc_sin_zona),
+    Column(
+        "updated_at",
+        DateTime,
+        nullable=False,
+        default=ahora_utc_sin_zona,
+        onupdate=ahora_utc_sin_zona,
+    ),
+    Column(
+        "original_golf_course_id",
+        GolfCourseIdType,
+        ForeignKey("golf_courses.id", ondelete="CASCADE"),
+        nullable=True,
+        comment="If not NULL, this is a clone/update proposal of the original golf course",
+    ),
+    Column(
+        "is_pending_update",
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="TRUE if this golf course has a pending update clone",
+    ),
+    # Ubicación: columnas sueltas y no un Value Object compuesto, porque es
+    # opcional y `composite()` no admite NULL. El VO se recompone en la entidad.
+    # El índice parcial para la búsqueda por cercanía se crea en la migración.
+    Column("latitude", Float, nullable=True, comment="Latitud en grados decimales"),
+    Column("longitude", Float, nullable=True, comment="Longitud en grados decimales"),
+    Column("address", String(300), nullable=True, comment="Dirección postal completa"),
+    Column("city", String(100), nullable=True, comment="Localidad"),
+    Column("province", String(100), nullable=True, comment="Provincia o región"),
+    # Zona horaria IANA del campo, deducida de sus coordenadas al darlo de alta
+    # (BE #305). La anotación de un partido abre a una hora LOCAL, y el país no
+    # basta: España tiene dos husos. NULL cuando no se conoce —un campo sin
+    # coordenadas—, y entonces ese partido solo se abre pulsando START
+    Column("timezone", String(64), nullable=True, comment="Zona horaria IANA del campo"),
+    # Procedencia: de dónde salen los datos. Permite reconocer un campo ya
+    # importado sin comparar nombres, que se rompe en cuanto alguien renombra.
+    Column(
+        "source",
+        SQLEnum(CourseSource, name="course_source_enum"),
+        nullable=False,
+        server_default=CourseSource.MANUAL.value,
+        comment="Origen de los datos (MANUAL, RFEG, ...)",
+    ),
+    Column(
+        "external_id",
+        String(100),
+        nullable=True,
+        comment="Identificador del campo en la fuente externa, si la fuente publica uno",
+    ),
+    Column(
+        "imported_at",
+        DateTime,
+        nullable=True,
+        comment="Cuándo se importó desde la fuente externa",
+    ),
+    Column(
+        "physical_holes",
+        Integer,
+        nullable=True,
+        comment="Hoyos sobre el terreno (9 o 18). NULL si no consta",
+    ),
+    CheckConstraint("LENGTH(name) >= 3", name="ck_golf_courses_name_min_length"),
+    CheckConstraint(
+        "physical_holes IS NULL OR physical_holes IN (9, 18)",
+        name="ck_golf_courses_physical_holes_values",
+    ),
+    # Un campo manual no lo ha importado nadie, así que no puede llevar ni id
+    # externo ni fecha de importación; uno importado sí lleva fecha siempre.
+    CheckConstraint(
+        "(source = 'MANUAL' AND external_id IS NULL AND imported_at IS NULL) "
+        "OR (source <> 'MANUAL' AND imported_at IS NOT NULL)",
+        name="ck_golf_courses_provenance_consistency",
+    ),
+    # Dos campos no pueden ser el mismo recorrido de la misma fuente. Va aquí y
+    # no solo en la migración porque es una regla de corrección, y el esquema
+    # que los tests levantan desde los metadatos tiene que tenerla. Parcial,
+    # porque los campos manuales no llevan id externo y chocarían todos entre
+    # sí en un índice normal.
+    Index(
+        "uq_golf_courses_source_external_id",
+        "source",
+        "external_id",
+        unique=True,
+        postgresql_where=text("external_id IS NOT NULL"),
+    ),
+    CheckConstraint(
+        "latitude IS NULL OR (latitude >= -90 AND latitude <= 90)",
+        name="ck_golf_courses_latitude_range",
+    ),
+    CheckConstraint(
+        "longitude IS NULL OR (longitude >= -180 AND longitude <= 180)",
+        name="ck_golf_courses_longitude_range",
+    ),
+    # Media coordenada no sitúa nada en un mapa: o van las dos o ninguna.
+    CheckConstraint(
+        "(latitude IS NULL) = (longitude IS NULL)",
+        name="ck_golf_courses_coordinates_together",
+    ),
+    CheckConstraint(
+        "(approval_status != 'REJECTED') OR (rejection_reason IS NOT NULL)",
+        name="ck_golf_courses_rejection_reason_required",
+    ),
+    comment="Campos de golf con workflow de aprobación Admin",
+)
+
+golf_course_tees_table = Table(
+    "golf_course_tees",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "golf_course_id",
+        GolfCourseIdType,
+        ForeignKey("golf_courses.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "tee_gender",
+        GenderType,
+        nullable=True,
+        comment="Género del tee (MALE, FEMALE, o NULL para gender-neutral)",
+    ),
+    Column(
+        "color",
+        SQLEnum(TeeColor, name="tee_color_enum"),
+        nullable=False,
+        server_default=TeeColor.OTHER.value,
+        comment="Color de las barras. Independiente de la categoría",
+    ),
+    Column(
+        "identifier",
+        String(50),
+        nullable=True,
+        comment="Nombre libre opcional, para matices como 'azules cortas'",
+    ),
+    Column(
+        "course_rating",
+        Float,
+        nullable=False,
+        comment="Course Rating WHS. El rango estricto por tipo de campo lo valida el dominio",
+    ),
+    Column(
+        "slope_rating",
+        Integer,
+        nullable=False,
+        comment="Slope Rating WHS. El rango estricto por tipo de campo lo valida el dominio",
+    ),
+    # Los rangos aquí son los absolutos, unión de los de todos los tipos de
+    # campo. El rango que corresponde a cada tipo no se puede expresar en un
+    # CHECK porque exigiría consultar golf_courses, así que lo valida el
+    # agregado, que es donde vive esa regla.
+    CheckConstraint(
+        "course_rating >= 45.0 AND course_rating <= 90.0", name="ck_tees_course_rating_range"
+    ),
+    CheckConstraint(
+        "slope_rating >= 40 AND slope_rating <= 160", name="ck_tees_slope_rating_range"
+    ),
+    CheckConstraint(
+        "color <> 'OTHER' OR identifier IS NOT NULL", name="ck_tees_other_color_needs_identifier"
+    ),
+    # Unique index funcional sobre (golf_course_id, color o identifier, género)
+    # creado en la migración de tarjetas por barra
+    # Los dos funcionales de arriba empiezan por golf_course_id pero son PARCIALES, y
+    # Postgres solo usa un índice parcial si la consulta implica su predicado: un
+    # `WHERE golf_course_id = ?` no implica ninguno, así que la tabla se recorría entera
+    # (#284). Este va también en el modelo —y no solo en la migración, como el de
+    # tee_holes— porque es un índice normal de una columna y se expresa sin perder nada:
+    # así el esquema que los tests levantan desde los metadatos es el mismo que el de
+    # producción.
+    Index("ix_golf_course_tees_golf_course_id", "golf_course_id"),
+    comment="Tees (salidas) de campos de golf con ratings WHS",
+)
+
+# Los hoyos cuelgan de la salida, no del campo: el par, el índice de dificultad
+# y la distancia dependen de la barra desde la que se juega. La tarjeta del
+# campo (GolfCourse.reference_card) es derivada: se reconstruye desde la primera salida
+# al cargar el agregado.
+golf_course_tee_holes_table = Table(
+    "golf_course_tee_holes",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column(
+        "tee_id",
+        Integer,
+        ForeignKey("golf_course_tees.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("hole_number", Integer, nullable=False, comment="Número de hoyo (1-18)"),
+    Column("par", Integer, nullable=False, comment="Par del hoyo (3-6)"),
+    Column("stroke_index", Integer, nullable=False, comment="Índice de dificultad (1-18)"),
+    Column("meters", Integer, nullable=True, comment="Distancia desde esta salida, en metros"),
+    CheckConstraint("hole_number >= 1 AND hole_number <= 18", name="ck_tee_holes_number_range"),
+    CheckConstraint("par >= 3 AND par <= 6", name="ck_tee_holes_par_range"),
+    CheckConstraint(
+        "stroke_index >= 1 AND stroke_index <= 18", name="ck_tee_holes_stroke_index_range"
+    ),
+    CheckConstraint(
+        "meters IS NULL OR (meters >= 20 AND meters <= 700)", name="ck_tee_holes_meters_range"
+    ),
+    UniqueConstraint("tee_id", "hole_number", name="uq_tee_holes_number"),
+    UniqueConstraint("tee_id", "stroke_index", name="uq_tee_holes_stroke_index"),
+    comment="Hoyos de cada salida (18 por salida) con par, dificultad y distancia",
+)
+
+# ============================================================================
+# Imperative Mapping
+# ============================================================================
+
+
+def start_golf_course_mappers():
+    """
+    Inicia el mapeo entre entidades de Golf Course y tablas de BD.
+
+    Es idempotente - puede llamarse múltiples veces sin problemas.
+
+    Mapea:
+    - GolfCourse entity → golf_courses table
+    - Tee value object → golf_course_tees table
+    - Hole value object → golf_course_holes table
+    """
+    # Mapear Hole (value object collection) — cuelga de la salida
+    if inspect(Hole, raiseerr=False) is None:
+        mapper_registry.map_imperatively(
+            Hole,
+            golf_course_tee_holes_table,
+            properties={
+                # Map database column hole_number to entity attribute number
+                "number": golf_course_tee_holes_table.c.hole_number,
+            },
+        )
+
+    # Mapear Tee (value object collection)
+    if inspect(Tee, raiseerr=False) is None:
+        mapper_registry.map_imperatively(
+            Tee,
+            golf_course_tees_table,
+            properties={
+                # Map database column tee_gender to entity attribute gender
+                "gender": golf_course_tees_table.c.tee_gender,
+                "holes": relationship(
+                    Hole,
+                    cascade="all, delete-orphan",
+                    lazy="joined",  # Eager loading
+                    order_by=golf_course_tee_holes_table.c.hole_number,
+                ),
+            },
+        )
+
+    # Mapear GolfCourse (aggregate root)
+    if inspect(GolfCourse, raiseerr=False) is None:
+        mapper_registry.map_imperatively(
+            GolfCourse,
+            golf_courses_table,
+            properties={
+                # Value Objects mapping (TypeDecorators en tabla)
+                "_id": column_property(golf_courses_table.c.id),
+                "_country_code": column_property(golf_courses_table.c.country_code),
+                "_creator_id": column_property(golf_courses_table.c.creator_id),
+                "_original_golf_course_id": column_property(
+                    golf_courses_table.c.original_golf_course_id
+                ),
+                # Scalar attributes mapping
+                "_name": column_property(golf_courses_table.c.name),
+                "_course_type": column_property(golf_courses_table.c.course_type),
+                "_approval_status": column_property(golf_courses_table.c.approval_status),
+                "_rejection_reason": column_property(golf_courses_table.c.rejection_reason),
+                "_created_at": column_property(golf_courses_table.c.created_at),
+                "_updated_at": column_property(golf_courses_table.c.updated_at),
+                "_is_pending_update": column_property(golf_courses_table.c.is_pending_update),
+                # Ubicación desglosada (ver comentario en la tabla)
+                "_latitude": column_property(golf_courses_table.c.latitude),
+                "_longitude": column_property(golf_courses_table.c.longitude),
+                "_address": column_property(golf_courses_table.c.address),
+                "_city": column_property(golf_courses_table.c.city),
+                "_province": column_property(golf_courses_table.c.province),
+                # Procedencia desglosada (ver comentario en la tabla)
+                "_source": column_property(golf_courses_table.c.source),
+                "_external_id": column_property(golf_courses_table.c.external_id),
+                "_imported_at": column_property(golf_courses_table.c.imported_at),
+                "_physical_holes": column_property(golf_courses_table.c.physical_holes),
+                "_timezone": column_property(golf_courses_table.c.timezone),
+                # One-to-many relationships with tees and holes
+                "_tees": relationship(
+                    Tee,
+                    cascade="all, delete-orphan",
+                    lazy="joined",  # Eager loading
+                    # No order_by needed - tees don't have a meaningful order
+                ),
+                # _holes NO se persiste: la tarjeta del campo es derivada de la
+                # primera salida y se reconstruye en el listener de carga.
+            },
+        )
+
+        @event.listens_for(GolfCourse, "load")
+        def _init_golf_course_on_load(target, _context):
+            # La tarjeta del campo no se persiste: la propiedad `holes` la
+            # deriva de la primera salida al consultarla. Aquí solo se asegura
+            # que el atributo exista, porque SQLAlchemy hidrata sin pasar por
+            # __init__. No se deriva en este punto a propósito: durante el
+            # evento de carga las relaciones eager aún no están garantizadas.
+            if not hasattr(target, "_holes"):
+                target._holes = []
+
+    # El mapa de hoyos del recorrido (BE #532) vive en su propio módulo; se
+    # importa aquí dentro porque ese módulo importa los TypeDecorators de este
+    from .hole_map_mapper import start_hole_map_mappers  # noqa: PLC0415 - Circular import
+
+    start_hole_map_mappers()
+
+    # Las muestras anónimas de hoyo, los reportes y las líneas guardadas no
+    # mapean entidad: basta con que sus tablas entren en el metadata
+    from . import (  # noqa: F401, PLC0415 - Circular import
+        hole_report_mapper,
+        hole_sample_mapper,
+        saved_hole_mapper,
+    )

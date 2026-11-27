@@ -1,0 +1,490 @@
+"""DTOs para Enrollment - Application Layer."""
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+
+# El patrón sale del enum, no de una lista escrita a mano: añadir un color nuevo
+# no puede dejar la validación de la API por detrás del dominio.
+TEE_COLOR_PATTERN = f"^({'|'.join(TeeColor)})$"
+TEE_COLOR_DESCRIPTION = f"Color de barras ({', '.join(TeeColor)})."
+
+# ======================================================================================
+# Nested DTO para representar datos de usuario
+# ======================================================================================
+
+
+class EnrolledUserDTO(BaseModel):
+    """
+    DTO para representar información básica de un usuario inscrito.
+
+    Se utiliza como objeto nested dentro de EnrollmentResponseDTO
+    para evitar múltiples llamadas API desde el frontend.
+
+    Campos incluidos:
+    - Datos personales: id, first_name, last_name, display_name, email
+    - Datos de juego: handicap, country_code
+    - Personalización: avatar_url (null por ahora)
+    """
+
+    id: UUID = Field(..., description="ID único del usuario")
+    first_name: str = Field(..., description="Nombre del usuario")
+    last_name: str = Field(..., description="Apellido del usuario")
+    display_name: str = Field(
+        ...,
+        description=(
+            "Nombre con el que se debe mostrar a este jugador: su alias si "
+            "tiene, y si no su nombre completo."
+        ),
+    )
+    # Vacío y no None: un null aquí lo marca oasdiff como cambio incompatible
+    email: str = Field(
+        ...,
+        description=(
+            "Email del usuario. Solo para el organizador, los admin y el propio "
+            "jugador; vacío para cualquier otro (BE #531)"
+        ),
+    )
+    handicap: Decimal | None = Field(None, description="Handicap oficial del usuario")
+    country_code: str | None = Field(None, description="Código ISO del país del usuario")
+    avatar_url: str | None = Field(None, description="URL del avatar del usuario (futuro)")
+    alias: str | None = Field(
+        None,
+        description=(
+            "El alias del jugador si tiene, para enseñar pequeño el nombre que no va "
+            "delante (SB-08). Null si no tiene."
+        ),
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Solicitar Inscripción (Request Enrollment)
+# ======================================================================================
+
+
+class RequestEnrollmentRequestDTO(BaseModel):
+    """
+    DTO de entrada para que un jugador solicite inscribirse a una competición.
+    """
+
+    competition_id: UUID = Field(
+        ..., description="ID de la competición a la que se solicita inscripción."
+    )
+    user_id: UUID = Field(..., description="ID del usuario que solicita la inscripción.")
+    tee_color: str | None = Field(
+        None,
+        pattern=TEE_COLOR_PATTERN,
+        description=f"Preferido. {TEE_COLOR_DESCRIPTION}",
+    )
+    round_id: UUID | None = Field(
+        None,
+        description=(
+            "La franja elegida, obligatoria en un stroke play con franjas: se entra "
+            "con plaza en ella o, con `waiting_list`, en su lista de espera."
+        ),
+    )
+    waiting_list: bool = Field(
+        False, description="Entrar en la lista de espera de la franja, que tiene que estar llena."
+    )
+
+
+class RequestEnrollmentResponseDTO(BaseModel):
+    """
+    DTO de salida al apuntarse a una pública: se entra directamente (28 oct 2026).
+    """
+
+    id: UUID = Field(..., description="ID único de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    status: str = Field(..., description="Estado de la inscripción (APPROVED).")
+    created_at: datetime = Field(..., description="Fecha y hora de la inscripción.")
+    round_id: UUID | None = Field(None, description="La franja en la que entró, si la eligió.")
+    waiting: bool = Field(False, description="Si entró en la lista de espera de esa franja.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Manejar Solicitud de Inscripción (Approve/Reject)
+# ======================================================================================
+
+
+class HandleEnrollmentRequestDTO(BaseModel):
+    """
+    DTO de entrada para que el creador apruebe o rechace una solicitud.
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción a procesar.")
+    action: str = Field(..., description="Acción a realizar: 'APPROVE' o 'REJECT'.")
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def uppercase_action(cls, v: Any) -> Any:
+        """Convierte action a mayúsculas."""
+        if v:
+            return v.upper().strip()
+        return v
+
+    def model_post_init(self, __context: Any) -> None:
+        """Validar que action sea válida."""
+        if self.action not in ["APPROVE", "REJECT"]:
+            raise ValueError("action debe ser 'APPROVE' o 'REJECT'")
+
+
+class HandleEnrollmentResponseDTO(BaseModel):
+    """
+    DTO de salida para manejar solicitud de inscripción.
+    """
+
+    id: UUID = Field(..., description="ID de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    status: str = Field(..., description="Nuevo estado (APPROVED o REJECTED).")
+    updated_at: datetime = Field(..., description="Fecha y hora de actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Cancelar Inscripción (Player Cancels)
+# ======================================================================================
+
+
+class CancelEnrollmentRequestDTO(BaseModel):
+    """
+    DTO de entrada para que un jugador cancele su solicitud o decline invitación.
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción a cancelar.")
+    reason: str | None = Field(
+        None, max_length=500, description="Razón de la cancelación (opcional)."
+    )
+
+
+class CancelEnrollmentResponseDTO(BaseModel):
+    """
+    DTO de salida para cancelación de inscripción.
+    """
+
+    id: UUID = Field(..., description="ID de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    status: str = Field(..., description="Estado (CANCELLED).")
+    updated_at: datetime = Field(..., description="Fecha y hora de cancelación.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Retirar Inscripción (Player Withdraws)
+# ======================================================================================
+
+
+class RemoveEnrolledPlayerRequestDTO(BaseModel):
+    """
+    DTO de entrada para que el organizador quite a un inscrito (release social 2).
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción a quitar.")
+
+
+class WithdrawEnrollmentRequestDTO(BaseModel):
+    """
+    DTO de entrada para que un jugador se retire después de estar aprobado.
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción a retirar.")
+    reason: str | None = Field(None, max_length=500, description="Razón del retiro (opcional).")
+
+
+class WithdrawEnrollmentResponseDTO(BaseModel):
+    """
+    DTO de salida para retiro de inscripción.
+    """
+
+    id: UUID = Field(..., description="ID de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    status: str = Field(..., description="Estado (WITHDRAWN).")
+    updated_at: datetime = Field(..., description="Fecha y hora de retiro.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Establecer Hándicap Personalizado
+# ======================================================================================
+
+
+class SetCustomHandicapRequestDTO(BaseModel):
+    """
+    DTO de entrada para que el creador establezca un hándicap personalizado.
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción.")
+    custom_handicap: Decimal = Field(
+        ...,
+        ge=Decimal("-10.0"),
+        le=Decimal("54.0"),
+        description="Hándicap personalizado (override del oficial).",
+    )
+
+
+class SetCustomHandicapResponseDTO(BaseModel):
+    """
+    DTO de salida para establecer hándicap personalizado.
+    """
+
+    id: UUID = Field(..., description="ID de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    status: str = Field(..., description="Estado de la inscripción.")
+    custom_handicap: Decimal = Field(..., description="Nuevo hándicap personalizado.")
+    updated_at: datetime = Field(..., description="Fecha y hora de actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Elegir Alias o Nombre Real en una Competición (BE #254)
+# ======================================================================================
+
+
+class SetNamePreferenceRequestDTO(BaseModel):
+    """
+    DTO de entrada para que un jugador elija cómo se le muestra en esta
+    competición: por su nombre legal (por defecto) o por su alias (BE #254).
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción.")
+    use_real_name: bool = Field(
+        ...,
+        description="True: se muestra el nombre legal en esta competición. False: se muestra el alias.",
+    )
+
+
+class SetNamePreferenceResponseDTO(BaseModel):
+    """DTO de salida para fijar la preferencia de nombre mostrado."""
+
+    id: UUID = Field(..., description="ID de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    status: str = Field(..., description="Estado de la inscripción.")
+    use_real_name: bool = Field(..., description="Preferencia actualizada.")
+    updated_at: datetime = Field(..., description="Fecha y hora de actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Cambiar las barras de una inscripción (BE #912)
+# ======================================================================================
+
+
+class ChangeEnrollmentTeeRequestDTO(BaseModel):
+    """
+    DTO de entrada para cambiar las barras de una inscripción: el propio jugador
+    (antes de empezar), el capitán de su equipo, el organizador o un admin. Sin
+    barras (null) vuelve a las habituales de su género.
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción.")
+    tee_color: TeeColor | None = Field(
+        ..., description="Las barras nuevas, o null para volver a las de por defecto."
+    )
+
+
+class ChangeEnrollmentTeeResponseDTO(BaseModel):
+    """DTO de salida tras cambiar las barras de una inscripción."""
+
+    id: UUID = Field(..., description="ID de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del jugador.")
+    tee_color: str | None = Field(
+        None, description="Las barras elegidas, o null si juega desde las de por defecto."
+    )
+    updated_at: datetime = Field(..., description="Fecha y hora de actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ChangeEnrollmentCourseTeeRequestDTO(BaseModel):
+    """
+    DTO de entrada para el cambio propio de barras de una inscripción en un campo
+    (R1, barras por campo). Sin barras (null) se quita el cambio.
+    """
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción.")
+    golf_course_id: UUID = Field(..., description="ID del campo de la competición.")
+    tee_color: TeeColor | None = Field(
+        ..., description="Las barras en ese campo, o null para quitar el cambio."
+    )
+
+
+class EnrollmentCourseTeeResponseDTO(BaseModel):
+    """DTO de salida del cambio propio de barras en un campo."""
+
+    enrollment_id: UUID = Field(..., description="ID de la inscripción.")
+    golf_course_id: UUID = Field(..., description="ID del campo.")
+    tee_color: str | None = Field(
+        None, description="Su cambio propio en ese campo, o null si no tiene."
+    )
+
+
+class CourseTeesDTO(BaseModel):
+    """Las barras de un jugador en un campo de la competición."""
+
+    golf_course_id: UUID = Field(..., description="ID del campo.")
+    golf_course_name: str = Field(..., description="Nombre del campo.")
+    tee: str | None = Field(
+        None, description="La barra que juega en ese campo, o null si no tiene una válida."
+    )
+    source: Literal["OWN", "COURSE", "GENERAL", "DEFAULT", "NONE", "PLAYED"] = Field(
+        ...,
+        description=(
+            "De dónde sale: su cambio propio (OWN), la del campo para su género (COURSE), "
+            "su barra general (GENERAL), la habitual de su género si no tiene general "
+            "(DEFAULT), o ninguna válida en ese campo (NONE). Con la competición "
+            "terminada o cancelada, la que jugó allí (PLAYED): la de su partido o su "
+            "partida empezados, de la última ronda en ese campo."
+        ),
+    )
+    options: list[str] = Field(
+        ...,
+        description=(
+            "Las barras que se le pueden fijar en ese campo, en orden de color; vacío con "
+            "la competición terminada o cancelada."
+        ),
+    )
+    own_tee: str | None = Field(
+        None,
+        description=(
+            "Su cambio propio en ese campo, aunque ya no valga (entonces la barra sale "
+            "null y NONE), o null si no tiene. También con la competición terminada o "
+            "cancelada."
+        ),
+    )
+
+
+class EnrollmentTeesResponseDTO(BaseModel):
+    """
+    Las barras de una inscripción, campo a campo (barras por campo): las mismas que
+    aceptarían los cambios. No devuelve el género del jugador, pero las opciones
+    (barras de un género o mixtas) lo dejan ver a quien puede cambiar sus barras.
+    """
+
+    general_tee: str | None = Field(None, description="Su barra general, o null.")
+    default_tee: str | None = Field(
+        None, description="La habitual de su género, o null si no se puede saber."
+    )
+    courses: list[CourseTeesDTO] = Field(..., description="Cada campo de la competición.")
+
+
+# ======================================================================================
+# DTO para el Caso de Uso: Eliminar Hándicap Personalizado (revertir al oficial)
+# ======================================================================================
+
+
+class RemoveCustomHandicapResponseDTO(BaseModel):
+    """
+    DTO de salida para eliminar el hándicap personalizado.
+
+    Tras la operación el enrollment vuelve a usar el hándicap oficial del jugador
+    (el de su perfil, actualizado vía RFEG en los flujos ya existentes de login/
+    generación de partidos).
+    """
+
+    id: UUID = Field(..., description="ID de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    status: str = Field(..., description="Estado de la inscripción.")
+    custom_handicap: Decimal | None = Field(
+        None, description="Siempre None tras eliminar el hándicap personalizado."
+    )
+    updated_at: datetime = Field(..., description="Fecha y hora de actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ======================================================================================
+# DTO de Respuesta Genérico para Enrollment
+# ======================================================================================
+
+
+class EnrollmentResponseDTO(BaseModel):
+    """
+    DTO de salida genérico para representar una inscripción.
+    Se utiliza para listar inscripciones y consultas detalladas.
+
+    NOTA: El campo 'user' es calculado dinámicamente en la capa de presentación
+    y NO existe en la entidad de dominio.
+    """
+
+    id: UUID = Field(..., description="ID único de la inscripción.")
+    competition_id: UUID = Field(..., description="ID de la competición.")
+    user_id: UUID = Field(..., description="ID del usuario.")
+    user: EnrolledUserDTO | None = Field(
+        None, description="Información completa del usuario inscrito."
+    )
+    status: str = Field(..., description="Estado actual (REQUESTED, APPROVED, etc.).")
+    team_id: str | None = Field(None, description="ID del equipo asignado (si aplica).")
+    custom_handicap: Decimal | None = Field(None, description="Hándicap personalizado (si aplica).")
+    tee_color: str | None = Field(None, description="Color de barras elegido por el jugador.")
+    fixed_handicap: Decimal | None = Field(
+        None,
+        description=(
+            "Stableford o Medal: el hándicap de todo el torneo, fijado al cerrar las "
+            "inscripciones (el personalizado o el del perfil, #251). Vacío mientras "
+            "están abiertas y en una Ryder Cup."
+        ),
+    )
+    category: int | None = Field(
+        None,
+        description=(
+            "Stableford o Medal: su categoría (1, 2, 3…), del hándicap fijado y los "
+            "límites. Una categoría con menos de 6 jugadores se une a la contigua de "
+            "hándicap más bajo (la 1.ª a la 2.ª), y luego se numeran de nuevo. Vacía "
+            "mientras las inscripciones están abiertas y en una Ryder Cup."
+        ),
+    )
+    use_real_name: bool = Field(
+        True,
+        description="Si esta competición muestra el nombre legal del jugador en vez de su alias.",
+    )
+    created_at: datetime = Field(..., description="Fecha y hora de creación.")
+    updated_at: datetime = Field(..., description="Fecha y hora de última actualización.")
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("tee_color", mode="before")
+    @classmethod
+    def convert_tee_color(cls, v: Any) -> Any:
+        """Convierte TeeColor enum a string."""
+        if hasattr(v, "value"):
+            return v.value
+        return v
+
+    @field_validator("id", "competition_id", "user_id", mode="before")
+    @classmethod
+    def convert_value_objects_uuid(cls, v: Any) -> Any:
+        """Convierte Value Objects UUID a UUID primitivo."""
+        if hasattr(v, "value"):
+            return v.value
+        return v
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def convert_enrollment_status(cls, v: Any) -> Any:
+        """Convierte EnrollmentStatus enum a string."""
+        if hasattr(v, "value"):
+            return v.value
+        return v

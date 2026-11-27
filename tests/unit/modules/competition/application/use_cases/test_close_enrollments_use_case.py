@@ -1,0 +1,318 @@
+"""Tests para CloseEnrollmentsUseCase."""
+
+from datetime import date, timedelta
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+
+from src.modules.competition.application.dto.competition_dto import (
+    CloseEnrollmentsRequestDTO,
+    CreateCompetitionRequestDTO,
+)
+from src.modules.competition.application.use_cases.close_enrollments_use_case import (
+    CloseEnrollmentsUseCase,
+    CompetitionNotFoundError,
+    NotCompetitionCreatorError,
+)
+from src.modules.competition.application.use_cases.create_competition_use_case import (
+    CreateCompetitionUseCase,
+)
+from src.modules.competition.domain.entities.competition import CompetitionStateError
+from src.modules.competition.domain.entities.invitation import Invitation
+from src.modules.competition.domain.services.location_builder import LocationBuilder
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.invitation_id import InvitationId
+from src.modules.competition.domain.value_objects.invitation_status import InvitationStatus
+from src.modules.competition.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+from tests.unit.modules.competition.application.use_cases.helpers import USUARIOS_CON_GENERO
+
+# Marcar todos los tests de este fichero para que se ejecuten con asyncio
+pytestmark = pytest.mark.asyncio
+
+
+class TestCloseEnrollmentsUseCase:
+    """Suite de tests para el caso de uso CloseEnrollmentsUseCase."""
+
+    @pytest.fixture
+    def uow(self) -> InMemoryUnitOfWork:
+        """Fixture que proporciona una Unit of Work en memoria para cada test."""
+        return InMemoryUnitOfWork()
+
+    @pytest.fixture
+    def creator_id(self) -> UserId:
+        """Fixture que proporciona un ID de usuario creador."""
+        return UserId(uuid4())
+
+    @pytest.fixture
+    def other_user_id(self) -> UserId:
+        """Fixture que proporciona un ID de otro usuario (no creador)."""
+        return UserId(uuid4())
+
+    async def test_should_close_enrollments_successfully(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se pueden cerrar inscripciones de una competición ACTIVE.
+
+        Given: Una competición en estado ACTIVE
+        When: El creador solicita cerrar inscripciones
+        Then: Se cierran correctamente y cambia a estado CLOSED
+        """
+        # Arrange: Crear y activar competición
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Activar
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            await uow.competitions.update(competition)
+            await uow.commit()
+
+        # Act: Cerrar inscripciones
+        close_use_case = CloseEnrollmentsUseCase(uow)
+        close_request = CloseEnrollmentsRequestDTO(competition_id=created.id)
+        response = await close_use_case.execute(close_request, creator_id)
+
+        # Assert
+        assert response.id == created.id
+        assert response.status == "CLOSED"
+        assert response.total_enrollments == 1  # Solo el creador (auto-enrolled)
+        assert response.closed_at is not None
+
+        # Verificar que el estado se persistió correctamente
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            assert competition.status.value == "CLOSED"
+
+    async def test_i5_las_invitaciones_pendientes_esperan(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """Desde el 15 nov 2026 (P1): al cerrar, las pendientes esperan (ON_HOLD) a que
+        se reabra; hasta entonces se quedaban sin plaza (#710). Solo las de esta, y
+        la caducada, caducada."""
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        crear = lambda nombre: CreateCompetitionRequestDTO(  # noqa: E731
+            name=nombre,
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        esta = await create_use_case.execute(crear("Esta"), creator_id)
+        otra = await create_use_case.execute(crear("Otra"), creator_id)
+
+        def invitacion(competicion, email):
+            return Invitation.create(
+                id=InvitationId.generate(),
+                competition_id=CompetitionId(competicion.id),
+                inviter_id=creator_id,
+                invitee_email=email,
+            )
+
+        pendientes = [invitacion(esta, f"p{i}@test.com") for i in range(2)]
+        # Caducada sin que nadie la pasara a EXPIRED: caducada, no «sin plaza»
+        caducada = invitacion(esta, "c@test.com")
+        caducada._expires_at = ahora_utc_sin_zona() - timedelta(days=1)
+        aceptada = invitacion(esta, "a@test.com")
+        aceptada.accept()
+        de_otra = invitacion(otra, "o@test.com")
+        async with uow:
+            for inv in [*pendientes, caducada, aceptada, de_otra]:
+                await uow.invitations.add(inv)
+
+        await CloseEnrollmentsUseCase(uow).execute(
+            CloseEnrollmentsRequestDTO(competition_id=esta.id), creator_id
+        )
+
+        async with uow:
+            estados = {
+                inv.id: (await uow.invitations.find_by_id(inv.id)).status
+                for inv in [*pendientes, caducada, aceptada, de_otra]
+            }
+        assert [estados[p.id] for p in pendientes] == [InvitationStatus.ON_HOLD] * 2
+        assert estados[caducada.id] == InvitationStatus.EXPIRED
+        assert estados[aceptada.id] == InvitationStatus.ACCEPTED
+        assert estados[de_otra.id] == InvitationStatus.PENDING
+
+    async def test_should_raise_error_when_competition_not_found(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se lanza excepción si la competición no existe.
+
+        Given: Un ID de competición inexistente
+        When: Se intenta cerrar inscripciones
+        Then: Se lanza CompetitionNotFoundError
+        """
+        # Arrange
+        close_use_case = CloseEnrollmentsUseCase(uow)
+        fake_id = uuid4()
+        close_request = CloseEnrollmentsRequestDTO(competition_id=fake_id)
+
+        # Act & Assert
+        with pytest.raises(CompetitionNotFoundError) as exc_info:
+            await close_use_case.execute(close_request, creator_id)
+
+        assert "No existe competición" in str(exc_info.value)
+
+    async def test_should_raise_error_when_user_is_not_creator(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        """
+        Verifica que solo el creador puede cerrar inscripciones.
+
+        Given: Una competición en estado ACTIVE
+        When: Un usuario que NO es el creador intenta cerrar inscripciones
+        Then: Se lanza NotCompetitionCreatorError
+        """
+        # Arrange: Crear y activar competición
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Activar
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            await uow.competitions.update(competition)
+            await uow.commit()
+
+        # Act: Intentar cerrar con otro usuario
+        close_use_case = CloseEnrollmentsUseCase(uow)
+        close_request = CloseEnrollmentsRequestDTO(competition_id=created.id)
+
+        # Assert
+        with pytest.raises(NotCompetitionCreatorError) as exc_info:
+            await close_use_case.execute(close_request, other_user_id)
+
+        assert "Solo el creador puede cerrar las inscripciones" in str(exc_info.value)
+
+    async def test_should_raise_error_when_competition_is_draft(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que no se pueden cerrar inscripciones si está en DRAFT.
+
+        Given: Una competición en estado DRAFT
+        When: Se intenta cerrar inscripciones
+        Then: Se lanza CompetitionStateError
+        """
+        # Arrange: Crear competición (queda en DRAFT)
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+            # Programada: desde BE #332 es la única que nace en DRAFT, que es el
+            # estado que este test quiere probar
+            enrollment_opens_days_before=5,
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Act: Intentar cerrar inscripciones en DRAFT
+        close_use_case = CloseEnrollmentsUseCase(uow)
+        close_request = CloseEnrollmentsRequestDTO(competition_id=created.id)
+
+        # Assert
+        with pytest.raises(CompetitionStateError) as exc_info:
+            await close_use_case.execute(close_request, creator_id)
+
+        assert "No se pueden cerrar inscripciones en estado DRAFT" in str(exc_info.value)
+
+    async def test_should_raise_error_when_already_closed(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que no se pueden cerrar inscripciones si ya están cerradas.
+
+        Given: Una competición en estado CLOSED
+        When: Se intenta cerrar inscripciones nuevamente
+        Then: Se lanza CompetitionStateError
+        """
+        # Arrange: Crear, activar y cerrar competición
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Activar y cerrar
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            competition.close_enrollments()
+            await uow.competitions.update(competition)
+            await uow.commit()
+
+        # Act: Intentar cerrar nuevamente
+        close_use_case = CloseEnrollmentsUseCase(uow)
+        close_request = CloseEnrollmentsRequestDTO(competition_id=created.id)
+
+        # Assert
+        with pytest.raises(CompetitionStateError) as exc_info:
+            await close_use_case.execute(close_request, creator_id)
+
+        assert "No se pueden cerrar inscripciones en estado CLOSED" in str(exc_info.value)
+
+
+# ==================== Con la fila bloqueada (#710, CodeRabbit en la #380) ====================
+# Sin bloqueo, aceptar leía la competición ABIERTA, cerrar confirmaba CLOSED y
+# las invitaciones sin plaza, y la aceptación se confirmaba después: entraba
+# alguien con la inscripción ya cerrada
+
+
+async def test_cerrar_bloquea_la_fila_de_la_competicion():
+    uow = InMemoryUnitOfWork()
+    creator_id = UserId(uuid4())
+    create_use_case = CreateCompetitionUseCase(
+        uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+    )
+    creada = await create_use_case.execute(
+        CreateCompetitionRequestDTO(
+            name="Bloqueo",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        ),
+        creator_id,
+    )
+    uow.competitions.find_by_id_for_update = AsyncMock(wraps=uow.competitions.find_by_id_for_update)
+
+    await CloseEnrollmentsUseCase(uow).execute(
+        CloseEnrollmentsRequestDTO(competition_id=creada.id), creator_id
+    )
+
+    uow.competitions.find_by_id_for_update.assert_awaited()

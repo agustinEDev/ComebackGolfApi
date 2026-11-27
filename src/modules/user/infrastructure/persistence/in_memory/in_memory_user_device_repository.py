@@ -1,0 +1,197 @@
+"""
+Implementación en memoria del repositorio de dispositivos de usuario.
+
+Este módulo implementa UserDeviceRepositoryInterface para tests unitarios.
+Los datos se almacenan en diccionarios Python en memoria.
+"""
+
+from datetime import datetime
+
+from src.modules.user.domain.entities.user_device import UserDevice
+from src.modules.user.domain.repositories.user_device_repository_interface import (
+    UserDeviceRepositoryInterface,
+)
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class InMemoryUserDeviceRepository(UserDeviceRepositoryInterface):
+    """
+    Implementación en memoria del repositorio de dispositivos.
+
+    Almacena dispositivos en diccionarios Python para tests unitarios.
+    NO usar en producción (sin persistencia real).
+    """
+
+    def __init__(self):
+        """Inicializa el repositorio en memoria vacío."""
+        self._devices: dict[str, UserDevice] = {}
+
+    async def save(self, device: UserDevice) -> None:
+        """
+        Guarda dispositivo en memoria.
+
+        Args:
+            device: UserDevice a guardar
+
+        Note:
+            Si el ID ya existe, sobrescribe (upsert behavior).
+        """
+        device_key = str(device.id.value)
+        self._devices[device_key] = device
+
+    async def add_unless_registered(self, device: UserDevice) -> UserDevice:
+        """El que ya está activo con esa huella, o el nuevo, guardado (BE #692)."""
+        ya = await self.find_by_user_and_fingerprint(device.user_id, device.fingerprint_hash)
+        if ya is not None:
+            return ya
+        await self.save(device)
+        return device
+
+    async def find_by_id(self, device_id: UserDeviceId) -> UserDevice | None:
+        """
+        Busca dispositivo por ID.
+
+        Args:
+            device_id: ID del dispositivo
+
+        Returns:
+            Optional[UserDevice]: Dispositivo si existe, None si no
+
+        """
+        device_key = str(device_id.value)
+        return self._devices.get(device_key)
+
+    async def find_by_id_and_user(
+        self, device_id: UserDeviceId, user_id: UserId
+    ) -> UserDevice | None:
+        """
+        Busca dispositivo activo por ID validando ownership.
+
+        Args:
+            device_id: ID del dispositivo (desde cookie)
+            user_id: ID del usuario (desde JWT)
+
+        Returns:
+            Optional[UserDevice]: Dispositivo si existe, pertenece al usuario,
+                                 y está activo. None en caso contrario.
+
+        Note:
+            Cookie-based device identification con ownership validation.
+        """
+        device = await self.find_by_id(device_id)
+        if device and device.user_id == user_id and device.is_active:
+            return device
+        return None
+
+    async def find_active_ids_of_user(
+        self, device_ids: list[UserDeviceId], user_id: UserId
+    ) -> list[UserDeviceId]:
+        """De estos ids, los de dispositivos activos de este usuario."""
+        return [
+            d.id
+            for i in device_ids
+            if (d := await self.find_by_id(i)) and d.user_id == user_id and d.is_active
+        ]
+
+    async def find_by_user_and_fingerprint(
+        self, user_id: UserId, fingerprint_hash: str
+    ) -> UserDevice | None:
+        """
+        Busca dispositivo activo por usuario y fingerprint hash.
+
+        Args:
+            user_id: ID del usuario
+            fingerprint_hash: Hash SHA256 del fingerprint del dispositivo
+
+        Returns:
+            Optional[UserDevice]: Dispositivo activo si existe, None si no
+
+        Note:
+            Solo retorna dispositivos activos (is_active=TRUE).
+        """
+        for device in self._devices.values():
+            if (
+                device.user_id == user_id
+                and device.fingerprint_hash == fingerprint_hash
+                and device.is_active
+            ):
+                return device
+        return None
+
+    async def find_by_id_for_update(self, device_id: UserDeviceId) -> UserDevice | None:
+        """En memoria no hay transacciones: igual que find_by_id."""
+        return await self.find_by_id(device_id)
+
+    async def find_active_by_user_for_update(self, user_id: UserId) -> list[UserDevice]:
+        """En memoria no hay bloqueos: los activos, por id."""
+        activos = await self.find_active_by_user(user_id)
+        return sorted(activos, key=lambda d: str(d.id.value))
+
+    async def find_active_by_user(self, user_id: UserId) -> list[UserDevice]:
+        """
+        Lista todos los dispositivos activos de un usuario.
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            List[UserDevice]: Lista de dispositivos activos
+
+        Note:
+            Solo retorna dispositivos activos (is_active=TRUE).
+        """
+        active_devices = [
+            device
+            for device in self._devices.values()
+            if device.user_id == user_id and device.is_active
+        ]
+        return active_devices
+
+    async def find_last_login_map(self, user_ids: list[UserId]) -> dict[str, datetime]:
+        """
+        Agrega el last_used_at más reciente por usuario entre todos sus dispositivos.
+
+        Args:
+            user_ids: IDs de usuario a consultar
+
+        Returns:
+            dict[str, datetime]: user_id (str) -> última conexión. Usuarios sin
+            dispositivos no aparecen en el dict.
+        """
+        target_ids = {str(uid.value) for uid in user_ids}
+        result: dict[str, datetime] = {}
+        for device in self._devices.values():
+            key = str(device.user_id.value)
+            if key not in target_ids:
+                continue
+            if key not in result or device.last_used_at > result[key]:
+                result[key] = device.last_used_at
+        return result
+
+    async def revoke(self, device_id: UserDeviceId) -> None:
+        """
+        Revoca un dispositivo (soft delete).
+
+        Args:
+            device_id: ID del dispositivo a revocar
+
+        Raises:
+            ValueError: Si el dispositivo no existe
+
+        Note:
+            Marca is_active=FALSE en lugar de eliminar.
+        """
+        device = await self.find_by_id(device_id)
+        if not device:
+            raise ValueError(f"Dispositivo {device_id} no encontrado")
+
+        device.revoke()
+        await self.save(device)  # Update in memory
+
+    async def delete_unused_since(self, antes: datetime) -> int:
+        """Borra los dispositivos sin usar desde antes de `antes`."""
+        viejos = [clave for clave, d in self._devices.items() if d.last_used_at < antes]
+        for clave in viejos:
+            del self._devices[clave]
+        return len(viejos)

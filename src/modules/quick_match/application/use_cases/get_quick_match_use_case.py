@@ -1,0 +1,332 @@
+"""Caso de Uso: Obtener el detalle de una Partida Rapida (con scores y standing)."""
+
+from collections.abc import Sequence
+from decimal import Decimal
+
+from src.modules.golf_course.domain.repositories.golf_course_unit_of_work_interface import (
+    GolfCourseUnitOfWorkInterface,
+)
+from src.modules.quick_match.application.dto.quick_match_dto import (
+    HoleScoreResponseDTO,
+    ParticipantStrokesDTO,
+    QuickMatchDetailResponseDTO,
+    QuickMatchStandingResponseDTO,
+    ScoringAssignmentDTO,
+)
+from src.modules.quick_match.application.exceptions import (
+    NotQuickMatchParticipantError,
+    QuickMatchNotFoundError,
+)
+from src.modules.quick_match.application.mappers.quick_match_mapper import QuickMatchDTOMapper
+from src.modules.quick_match.application.services.course_context import course_context_for
+from src.modules.quick_match.domain.entities.quick_match import QuickMatch
+from src.modules.quick_match.domain.entities.quick_match_hole_score import QuickMatchHoleScore
+from src.modules.quick_match.domain.repositories.quick_match_unit_of_work_interface import (
+    QuickMatchUnitOfWorkInterface,
+)
+from src.modules.quick_match.domain.services.hole_completion_service import (
+    hole_is_complete,
+)
+from src.modules.quick_match.domain.services.scoring_coverage_service import (
+    ScoringCoverageService,
+)
+from src.modules.quick_match.domain.services.stroke_allocation_service import (
+    ParticipantStrokes,
+    StrokeAllocationService,
+)
+from src.modules.quick_match.domain.value_objects.participant_id import ParticipantId
+from src.modules.quick_match.domain.value_objects.quick_match_id import QuickMatchId
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.match_play_scoring import MatchPlayScoring
+
+TOTAL_HOLES = 18
+
+
+class GetQuickMatchUseCase:
+    """Obtiene el detalle de una partida rapida: datos, scores, standing y reparto de anotacion."""
+
+    def __init__(
+        self,
+        uow: QuickMatchUnitOfWorkInterface,
+        user_uow: UserUnitOfWorkInterface,
+        scoring_service: MatchPlayScoring,
+        coverage_service: ScoringCoverageService,
+        golf_course_uow: GolfCourseUnitOfWorkInterface,
+        stroke_allocation_service: StrokeAllocationService | None = None,
+    ):
+        self._uow = uow
+        self._user_uow = user_uow
+        self._scoring_service = scoring_service
+        self._coverage_service = coverage_service
+        self._golf_course_uow = golf_course_uow
+        self._stroke_allocation_service = stroke_allocation_service or StrokeAllocationService()
+
+    async def execute(
+        self, quick_match_id_raw: str, current_user_id_raw: str
+    ) -> QuickMatchDetailResponseDTO:
+        current_participant_id = ParticipantId(UserId(current_user_id_raw).value)
+
+        async with self._uow:
+            quick_match = await self._uow.quick_matches.find_by_id(QuickMatchId(quick_match_id_raw))
+            if not quick_match:
+                raise QuickMatchNotFoundError(f"Quick match not found: {quick_match_id_raw}")
+
+            if not quick_match.is_participant(current_participant_id):
+                raise NotQuickMatchParticipantError(
+                    "You are not a participant of this quick match."
+                )
+
+            # Para quien la tiro a la papelera, ya no existe (26 nov 2026): lo
+            # mismo que si se hubiera borrado, que es lo que pasara cuando la
+            # tiren todos
+            if quick_match.is_hidden_for(current_participant_id):
+                raise QuickMatchNotFoundError(f"Quick match not found: {quick_match_id_raw}")
+
+            hole_scores = await self._uow.quick_match_hole_scores.find_by_match(quick_match.id)
+
+        registered_ids = [p.user_id for p in quick_match.participants if p.user_id is not None]
+        async with self._user_uow:
+            users_by_id = {}
+            for user_id in registered_ids:
+                user = await self._user_uow.users.find_by_id(user_id)
+                if user:
+                    users_by_id[user_id] = user
+
+        return await self.build_detail(
+            quick_match, hole_scores, users_by_id, UserId(current_user_id_raw)
+        )
+
+    async def build_detail(
+        self,
+        quick_match: QuickMatch,
+        hole_scores: Sequence[QuickMatchHoleScore],
+        users_by_id: dict[UserId, User],
+        requester_id: UserId,
+    ) -> QuickMatchDetailResponseDTO:
+        """
+        El detalle de una partida ya leida: datos, scores, standing y reparto.
+
+        Aparte de `execute` para que la vista de solo lectura de un amigo
+        (bloque K) pinte exactamente lo mismo sin copiar el calculo: decide
+        quien entra por su cuenta y luego pide esto.
+        """
+        base_dto = await QuickMatchDTOMapper.to_response_dto(
+            quick_match,
+            self._user_uow,
+            users_by_id=users_by_id,
+            requester_id=requester_id,
+        )
+
+        hole_scores_dto = [
+            HoleScoreResponseDTO(
+                hole_number=hs.hole_number,
+                participant_id=hs.participant_id.value,
+                score=hs.score,
+                recorded_by_participant_id=hs.recorded_by_participant_id.value,
+            )
+            for hs in sorted(hole_scores, key=lambda h: h.hole_number)
+        ]
+
+        strokes_by_participant = await self._allocate_strokes(quick_match, users_by_id)
+        standing_dto = self._compute_standing(quick_match, hole_scores, strokes_by_participant)
+        assignments_dto = self._build_assignments(quick_match, users_by_id)
+
+        return QuickMatchDetailResponseDTO(
+            **base_dto.model_dump(),
+            hole_scores=hole_scores_dto,
+            standing=standing_dto,
+            scoring_assignments=assignments_dto,
+            participant_strokes=[
+                ParticipantStrokesDTO(
+                    participant_id=ps.participant_id.value,
+                    playing_handicap=ps.playing_handicap,
+                    strokes_by_hole=dict(ps.strokes_by_hole),
+                )
+                for ps in strokes_by_participant.values()
+            ],
+        )
+
+    async def _allocate_strokes(
+        self, quick_match: QuickMatch, users_by_id: dict[UserId, User]
+    ) -> dict[ParticipantId, ParticipantStrokes]:
+        """
+        Reparte los golpes de handicap de la partida.
+
+        En una partida scratch se sale sin tocar la base de datos: nadie recibe
+        golpes, asi que cargar el campo seria trabajo tirado. Importa porque el
+        detalle se pide cada 10 segundos mientras se juega.
+
+        Si el campo no se puede cargar se devuelve un reparto vacio en vez de
+        fallar: perder los puntitos de la tarjeta es mucho menos grave que dejar
+        la partida inaccesible mientras se esta jugando.
+        """
+        if not quick_match.uses_handicap():
+            return {
+                p.participant_id: ParticipantStrokes(p.participant_id, 0, {})
+                for p in quick_match.participants
+            }
+
+        async with self._golf_course_uow:
+            golf_course = await self._golf_course_uow.golf_courses.find_by_id(
+                quick_match.golf_course_id
+            )
+
+        if golf_course is None:
+            return {
+                p.participant_id: ParticipantStrokes(p.participant_id, 0, {})
+                for p in quick_match.participants
+            }
+
+        context = course_context_for(golf_course)
+        return self._stroke_allocation_service.allocate(
+            participants=quick_match.participants,
+            handicaps=self._resolve_handicaps(quick_match, users_by_id),
+            tee_ratings=context.tee_ratings,
+            holes_by_stroke_index=context.holes_by_stroke_index,
+            holes_by_stroke_index_by_tee=context.holes_by_tee,
+            match_format=quick_match.match_format,
+            allowance_percentage=quick_match.get_effective_allowance(),
+            play_mode=quick_match.play_mode,
+        )
+
+    @staticmethod
+    def _resolve_handicaps(
+        quick_match: QuickMatch, users_by_id: dict[UserId, User]
+    ) -> dict[ParticipantId, Decimal | None]:
+        """
+        Handicap Index efectivo de cada participante.
+
+        La decide el participante (`effective_handicap`), igual que en el mapper
+        de presentación: el fijado al empezar (BE #514) o, en partidas de antes,
+        el manual del invitado, el personalizado o el del perfil.
+        """
+        handicaps: dict[ParticipantId, Decimal | None] = {}
+        for p in quick_match.participants:
+            user = users_by_id.get(p.user_id) if p.user_id else None
+            raw = p.effective_handicap(user.handicap.value if user and user.handicap else None)
+            handicaps[p.participant_id] = None if raw is None else Decimal(str(raw))
+        return handicaps
+
+    def _build_assignments(
+        self, quick_match: QuickMatch, users_by_id: dict[UserId, User]
+    ) -> list[ScoringAssignmentDTO]:
+        if not quick_match.scorer_ids:
+            return []
+
+        assignments = self._coverage_service.compute_assignments(
+            participants=quick_match.participants,
+            scorer_ids=quick_match.scorer_ids,
+            creator_participant_id=quick_match.creator_participant_id,
+            match_format=quick_match.match_format,
+        )
+
+        result = []
+        for scorer_id, covered_ids in assignments.items():
+            scorer = quick_match.find_participant(scorer_id)
+            # Un anotador invitado no tiene cuenta (`.get(None)` daba None igual)
+            user = (
+                users_by_id.get(scorer.user_id)
+                if scorer is not None and scorer.user_id is not None
+                else None
+            )
+            # `display_name`: el alias de quien lo tenga, y si no su nombre
+            # completo (BE #239). Este campo ya era «nombre para enseñar»
+            scorer_name = user.display_name if user else "Unknown"
+            result.append(
+                ScoringAssignmentDTO(
+                    scorer_participant_id=scorer_id.value,
+                    scorer_name=scorer_name,
+                    covered_participant_ids=[cid.value for cid in covered_ids],
+                )
+            )
+        return result
+
+    def _compute_standing(
+        self,
+        quick_match: QuickMatch,
+        hole_scores: Sequence[QuickMatchHoleScore],
+        strokes_by_participant: dict[ParticipantId, ParticipantStrokes],
+    ) -> QuickMatchStandingResponseDTO | None:
+        if quick_match.match_format is None:
+            # Partido libre (MEDAL/STABLEFORD): sin equipos, no hay standing A-vs-B.
+            # La clasificacion individual se calcula en el frontend a partir de hole_scores.
+            return None
+
+        rosters = quick_match.team_rosters()
+        if rosters is None:
+            return None
+        team_a_ids, team_b_ids = rosters
+
+        scores_by_hole: dict[int, dict[ParticipantId, int | None]] = {}
+        for hs in hole_scores:
+            scores_by_hole.setdefault(hs.hole_number, {})[hs.participant_id] = hs.score
+
+        results_by_hole: dict[int, str] = {}
+        for hole_number in range(1, TOTAL_HOLES + 1):
+            scores = scores_by_hole.get(hole_number)
+            if not scores:
+                continue
+            if not hole_is_complete(scores, team_a_ids, team_b_ids, quick_match.match_format):
+                continue
+
+            # `calculate_hole_winner` compara scores NETOS. Pasarle el bruto hacia
+            # que un match play se resolviese siempre a scratch, por mucho
+            # handicap que tuviesen los jugadores.
+            team_a_scores = [
+                self._net(scores[pid], pid, hole_number, strokes_by_participant)
+                for pid in team_a_ids
+                if pid in scores
+            ]
+            team_b_scores = [
+                self._net(scores[pid], pid, hole_number, strokes_by_participant)
+                for pid in team_b_ids
+                if pid in scores
+            ]
+            results_by_hole[hole_number] = self._scoring_service.calculate_hole_winner(
+                team_a_scores, team_b_scores, quick_match.match_format
+            )
+
+        if not results_by_hole:
+            return None
+
+        # Decidido en el orden de los hoyos, el estado es el del hoyo en que se
+        # decidio: lo anotado despues no lo mueve y el front pinta «10&8», no
+        # «18UP» (Agustin, 25 oct 2026). Con un hueco antes, sigue en juego
+        hasta_la_decision = self._scoring_service.holes_until_decided(results_by_hole)
+        standing = self._scoring_service.calculate_match_standing(
+            hasta_la_decision or list(results_by_hole.values())
+        )
+        return QuickMatchStandingResponseDTO(
+            status=standing["status"],
+            leading_team=standing["leading_team"],
+            holes_played=standing["holes_played"],
+            holes_remaining=standing["holes_remaining"],
+            is_decided=hasta_la_decision is not None,
+        )
+
+    @staticmethod
+    def _net(
+        gross_score: int | None,
+        participant_id: ParticipantId,
+        hole_number: int,
+        strokes_by_participant: dict[ParticipantId, ParticipantStrokes],
+    ) -> int | None:
+        """
+        Score neto del hoyo, o None si el jugador recogio la bola.
+
+        La raya se propaga tal cual en vez de convertirse en un numero: asi
+        `MatchPlayScoring.calculate_hole_winner` la ve como bando sin bola y le
+        da el hoyo al rival, que es la regla de match play. Ese servicio ya
+        trabaja con `list[int | None]` porque competicion lo necesitaba, asi
+        que aqui no hay nada que anadirle.
+        """
+        if gross_score is None:
+            return None
+        strokes = strokes_by_participant.get(participant_id)
+        if strokes is None:
+            return gross_score
+        return strokes.net_score(hole_number, gross_score)

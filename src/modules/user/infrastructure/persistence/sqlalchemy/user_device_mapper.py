@@ -1,0 +1,107 @@
+# src/modules/user/infrastructure/persistence/sqlalchemy/user_device_mapper.py
+"""
+User Device Mapper - Infrastructure Layer
+
+Mapeo imperativo entre la entidad UserDevice y la tabla user_devices.
+"""
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Table,
+    Text,
+    inspect,
+    text,
+)
+
+from src.modules.user.domain.entities.user_device import UserDevice
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.infrastructure.persistence.sqlalchemy.base import (
+    mapper_registry,
+    metadata,
+)
+from src.shared.infrastructure.persistence.sqlalchemy.tipos_de_id import tipo_de_id
+
+# --- TypeDecorators ---
+
+
+UserDeviceIdDecorator = tipo_de_id(UserDeviceId)
+UserIdDecorator = tipo_de_id(UserId)
+
+
+# --- Tabla ---
+
+user_devices_table = Table(
+    "user_devices",
+    metadata,
+    Column("id", UserDeviceIdDecorator, primary_key=True),
+    Column(
+        "user_id",
+        UserIdDecorator,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("device_name", String(200), nullable=False),
+    Column("user_agent", Text, nullable=False),
+    Column("ip_address", String(45), nullable=False),
+    Column("fingerprint_hash", String(64), nullable=False),
+    Column("is_active", Boolean, nullable=False, server_default="true"),
+    Column("last_used_at", DateTime, nullable=False),
+    Column("created_at", DateTime, nullable=False),
+    # La app instalada y el país de la última conexión (BE #737, migración c5e7a9b1d3f6)
+    Column("installed_app", Boolean, nullable=False, server_default="false"),
+    Column("country_code", String(2), nullable=True),
+    # Cuándo avisó de un nuevo inicio de sesión: el tope de uno por hora (BE #737)
+    Column("new_login_notice_at", DateTime, nullable=True),
+    # Cuándo se cerraron sus sesiones (cierre de sesión o cambio de contraseña): los
+    # accesos emitidos antes no valen (auditoría de la fase 6, B-05). Con zona: se
+    # compara con el `iat` del token, que es UTC
+    Column("session_closed_at", DateTime(timezone=True), nullable=True),
+    # El de la migración 50ccf425ff32, también aquí: sin él los tests no ven
+    # el choque de dos altas a la vez (BE #692)
+    Index(
+        "ix_user_devices_unique_active_fingerprint",
+        "user_id",
+        "fingerprint_hash",
+        unique=True,
+        postgresql_where=text("is_active = true"),
+    ),
+)
+
+
+# --- Mapper ---
+
+
+def start_user_device_mappers():
+    """Inicia el mapper imperativo de UserDevice → user_devices. Idempotente.
+
+    Se pregunta con `inspect(..., raiseerr=False)` en vez de tragarse cualquier
+    excepción: así un error de mapeo de verdad no pasa desapercibido (#565).
+    """
+    if inspect(UserDevice, raiseerr=False) is None:
+        mapper_registry.map_imperatively(
+            UserDevice,
+            user_devices_table,
+            properties={
+                "_id": user_devices_table.c.id,
+                "_user_id": user_devices_table.c.user_id,
+                # Fingerprint se almacena como columnas individuales
+                # y se reconstruye en el repository usando reconstitute()
+                "_device_name": user_devices_table.c.device_name,
+                "_user_agent": user_devices_table.c.user_agent,
+                "_ip_address": user_devices_table.c.ip_address,
+                "_fingerprint_hash": user_devices_table.c.fingerprint_hash,
+                "_is_active": user_devices_table.c.is_active,
+                "_last_used_at": user_devices_table.c.last_used_at,
+                "_created_at": user_devices_table.c.created_at,
+                "_installed_app": user_devices_table.c.installed_app,
+                "_country_code": user_devices_table.c.country_code,
+                "_new_login_notice_at": user_devices_table.c.new_login_notice_at,
+                "_session_closed_at": user_devices_table.c.session_closed_at,
+            },
+        )

@@ -1,0 +1,105 @@
+"""
+Application Settings
+
+Configuración centralizada de la aplicación usando variables de entorno.
+"""
+
+import os
+from typing import ClassVar
+
+from dotenv import load_dotenv
+
+# Cargar variables de entorno desde .env
+load_dotenv()
+
+
+class Settings:
+    """
+    Configuración de la aplicación.
+
+    Todas las configuraciones se cargan desde variables de entorno
+    con valores por defecto razonables para desarrollo.
+    """
+
+    # JWT Configuration
+    # Fuera de desarrollo, la app no arranca con esta de ejemplo (arranque_seguro.py)
+    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    # Fijo: leído del entorno, un ALGORITHM cambiado aceptaría otro algoritmo (F-12)
+    ALGORITHM: ClassVar[str] = "HS256"
+
+    # Session Timeout (v1.8.0)
+    # Access Token: Corto (15 min) para operaciones frecuentes
+    # Refresh Token: Largo (7 días) para renovación sin re-login
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(
+        os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15")
+    )  # Reducido de 60 a 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+
+    # Swagger/Docs HTTP Basic Auth (sin defaults - DEBE estar en .env)
+    DOCS_USERNAME: str | None = os.getenv("DOCS_USERNAME")
+    DOCS_PASSWORD: str | None = os.getenv("DOCS_PASSWORD")
+
+    # Database Configuration
+    DATABASE_URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://postgres:postgres@localhost:5432/comebackgolf",
+    )
+
+    # Mailgun Configuration
+    MAILGUN_API_KEY: str = os.getenv("MAILGUN_API_KEY", "")
+    MAILGUN_DOMAIN: str = os.getenv("MAILGUN_DOMAIN", "comebackgolf.com")
+    MAILGUN_FROM_EMAIL: str = os.getenv(
+        "MAILGUN_FROM_EMAIL", "Comeback Golf <noreply@comebackgolf.com>"
+    )
+    MAILGUN_API_URL: str = os.getenv("MAILGUN_API_URL", "https://api.eu.mailgun.net/v3")
+    # Frontend URL - Cambia según el entorno:
+    # - Local (directo): http://localhost:5173 (Vite default)
+    # - Local (K8s): http://localhost:8080 (port-forward)
+    # - Producción: https://www.comebackgolf.com (Render.com)
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+    # Sentry Configuration
+    # Error tracking y performance monitoring
+    # Configuración:
+    # - SENTRY_DSN: URL de proyecto Sentry (obligatorio para habilitar Sentry)
+    # - SENTRY_ENVIRONMENT: Entorno actual (development, staging, production)
+    # - SENTRY_TRACES_SAMPLE_RATE: % de transacciones a capturar (0.0-1.0)
+    # - SENTRY_PROFILES_SAMPLE_RATE: % de perfiles a capturar (0.0-1.0)
+    SENTRY_DSN: str = os.getenv("SENTRY_DSN", "")
+    SENTRY_ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
+    SENTRY_TRACES_SAMPLE_RATE: float = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1"))
+    SENTRY_PROFILES_SAMPLE_RATE: float = float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.1"))
+
+    # Trusted Proxies Configuration (v1.13.1, CIDR support v2.0.7)
+    # Lista de IPs o rangos CIDR de proxies/load balancers confiables
+    # Formato: Lista separada por comas (IPs exactas o notación CIDR)
+    # - Ejemplo exacta: 10.0.0.1
+    # - Ejemplo CIDR: 10.0.0.0/8 (confía en toda la red 10.x.x.x)
+    # - Local: Vacío (no usar headers de proxy)
+    # - Producción (Render): 10.0.0.0/8 (load balancers internos)
+    # Si está vacío, get_trusted_client_ip() NO confiará en X-Forwarded-For/X-Real-IP
+    TRUSTED_PROXIES: ClassVar[list[str]] = [
+        ip.strip() for ip in os.getenv("TRUSTED_PROXIES", "").split(",") if ip.strip()
+    ]
+
+    # Cloudflare Headers Trust (v2.0.4)
+    # - True: Confiar en CF-Connecting-IP y True-Client-IP headers
+    # - False: Ignorar headers de Cloudflare (más seguro si no estás detrás de Cloudflare)
+    # SECURITY: Solo activar si la app está desplegada detrás de Cloudflare proxy
+    TRUST_CLOUDFLARE_HEADERS: ClassVar[bool] = os.getenv(
+        "TRUST_CLOUDFLARE_HEADERS", "false"
+    ).lower() in ("true", "1", "yes")
+
+    # Formulario de contacto: el buzón al que llegan los mensajes (6 nov 2026), y
+    # a quién escribir en los correos; el de los textos legales (27 nov 2026)
+    CONTACT_EMAIL: str = os.getenv("CONTACT_EMAIL", "hola@comebackgolf.com")
+
+    # Google OAuth Configuration (Sprint 3)
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    GOOGLE_REDIRECT_URI: str = os.getenv(
+        "GOOGLE_REDIRECT_URI", "http://localhost:5173/auth/google/callback"
+    )
+
+
+settings = Settings()

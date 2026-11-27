@@ -1,0 +1,253 @@
+"""
+Tests del mapper del listado de inscripciones (BE #314).
+
+Sin el límite oculto de 100, el listado devuelve todas las filas de la
+competición: buscar a cada usuario por separado eran cientos de consultas
+seguidas. Los usuarios se leen ahora en bloque, en UNA consulta.
+"""
+
+from uuid import uuid4
+
+import pytest
+
+from src.modules.competition.domain.entities.enrollment import Enrollment
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.enrollment_id import EnrollmentId
+from src.modules.competition.domain.value_objects.visibility import Visibility
+from src.modules.competition.infrastructure.api.v1.enrollment_routes import EnrollmentDTOMapper
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.modules.user.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork,
+)
+
+pytestmark = pytest.mark.asyncio
+
+
+class _UoWQueCuenta(InMemoryUnitOfWork):
+    """UoW de usuarios en memoria que cuenta cuántas veces se abre y se consulta."""
+
+    def __init__(self):
+        super().__init__()
+        self.aperturas = 0
+        self.por_id = 0
+        self.en_bloque: list[list[UserId]] = []
+        repo = self._users
+        original_por_id = repo.find_by_id
+        original_en_bloque = repo.find_by_ids
+
+        async def por_id(user_id):
+            self.por_id += 1
+            return await original_por_id(user_id)
+
+        async def en_bloque(user_ids):
+            self.en_bloque.append(list(user_ids))
+            return await original_en_bloque(user_ids)
+
+        repo.find_by_id = por_id  # type: ignore[method-assign]
+        repo.find_by_ids = en_bloque  # type: ignore[method-assign]
+
+    async def __aenter__(self):
+        self.aperturas += 1
+        return await super().__aenter__()
+
+
+async def _usuario(uow: InMemoryUnitOfWork, nombre: str, alias: str | None = None) -> User:
+    user = User.create(
+        nombre, "Pérez", f"{nombre.lower()}-{uuid4().hex[:6]}@test.com", "P@ssw0rd123!"
+    )
+    if alias:
+        user.update_profile(alias=alias)
+    await uow.users.save(user)
+    return user
+
+
+def _inscripcion(competition_id: CompetitionId, user: User, use_real_name: bool = True):
+    enrollment = Enrollment.direct_enroll(
+        id=EnrollmentId.generate(), competition_id=competition_id, user_id=user.id
+    )
+    enrollment.set_name_preference(use_real_name)
+    return enrollment
+
+
+@pytest.fixture
+def competition_id() -> CompetitionId:
+    return CompetitionId(uuid4())
+
+
+async def test_reads_every_user_in_one_query(competition_id):
+    """Tres inscritos: una sola apertura del UoW y una sola consulta en bloque, ninguna por id."""
+    uow = _UoWQueCuenta()
+    usuarios = [await _usuario(uow, n) for n in ("Ana", "Bea", "Carla")]
+    inscripciones = [_inscripcion(competition_id, u) for u in usuarios]
+
+    await EnrollmentDTOMapper.to_response_dtos(inscripciones, uow, visibility=Visibility.PRIVATE)
+
+    assert uow.aperturas == 1
+    assert uow.por_id == 0
+    assert len(uow.en_bloque) == 1
+    assert sorted(map(str, uow.en_bloque[0])) == sorted(str(u.id) for u in usuarios)
+
+
+async def test_a_user_with_several_rows_is_asked_for_once(competition_id):
+    """Quien se dio de alta otra vez tiene varias filas: su id va una sola vez a la consulta."""
+    uow = _UoWQueCuenta()
+    ana = await _usuario(uow, "Ana")
+    inscripciones = [_inscripcion(competition_id, ana), _inscripcion(competition_id, ana)]
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        inscripciones, uow, visibility=Visibility.PRIVATE
+    )
+
+    assert uow.en_bloque == [[ana.id]]
+    assert [d.user.first_name for d in dtos] == ["Ana", "Ana"]
+
+
+async def test_keeps_the_order_of_the_enrollments_and_pairs_each_with_its_user(competition_id):
+    uow = _UoWQueCuenta()
+    usuarios = [await _usuario(uow, n) for n in ("Ana", "Bea", "Carla")]
+    inscripciones = [_inscripcion(competition_id, u) for u in reversed(usuarios)]
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        inscripciones, uow, visibility=Visibility.PRIVATE
+    )
+
+    assert [d.id for d in dtos] == [e.id.value for e in inscripciones]
+    assert [d.user.id for d in dtos] == [e.user_id.value for e in inscripciones]
+    assert [d.user.first_name for d in dtos] == ["Carla", "Bea", "Ana"]
+
+
+async def test_an_enrollment_whose_user_no_longer_exists_comes_without_user(competition_id):
+    """Como antes: `user` a None para esa fila, y las demás intactas."""
+    uow = _UoWQueCuenta()
+    ana = await _usuario(uow, "Ana")
+    fantasma = User.create("Fantasma", "Nadie", "fantasma@test.com", "P@ssw0rd123!")
+    inscripciones = [_inscripcion(competition_id, fantasma), _inscripcion(competition_id, ana)]
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        inscripciones, uow, visibility=Visibility.PRIVATE
+    )
+
+    assert dtos[0].user is None
+    assert dtos[0].user_id == fantasma.id.value
+    assert dtos[1].user.first_name == "Ana"
+
+
+async def test_the_name_follows_the_preference_of_each_enrollment(competition_id):
+    """El alias o el nombre legal lo decide SU inscripción, no el perfil (BE #254)."""
+    uow = _UoWQueCuenta()
+    con_nombre = await _usuario(uow, "Ana", alias="Anita")
+    con_alias = await _usuario(uow, "Bea", alias="Beíta")
+    inscripciones = [
+        _inscripcion(competition_id, con_nombre, use_real_name=True),
+        _inscripcion(competition_id, con_alias, use_real_name=False),
+    ]
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        inscripciones, uow, visibility=Visibility.PRIVATE
+    )
+
+    assert [d.user.display_name for d in dtos] == ["Ana Pérez", "Beíta"]
+
+
+async def test_no_enrollments_no_query():
+    uow = _UoWQueCuenta()
+
+    assert await EnrollmentDTOMapper.to_response_dtos([], uow, visibility=Visibility.PRIVATE) == []
+    assert uow.en_bloque == []
+    assert uow.por_id == 0
+
+
+async def test_categories_reach_each_enrollment(competition_id):
+    """Con la categoría fijada, cada fila lleva la suya y su hándicap fijado (#251)."""
+    uow = _UoWQueCuenta()
+    ana = await _usuario(uow, "Ana")
+    bea = await _usuario(uow, "Bea")
+    inscripciones = [_inscripcion(competition_id, ana), _inscripcion(competition_id, bea)]
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        inscripciones, uow, categorias={ana.id: 1, bea.id: 2}, visibility=Visibility.PRIVATE
+    )
+
+    assert [d.category for d in dtos] == [1, 2]
+
+
+async def test_without_saying_whose_email_goes_no_email_goes(competition_id):
+    """Por defecto, ningún correo: abrirlo tiene que ser explícito (BE #531)."""
+    uow = _UoWQueCuenta()
+    ana = await _usuario(uow, "Ana")
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        [_inscripcion(competition_id, ana)], uow, visibility=Visibility.PRIVATE
+    )
+
+    assert dtos[0].user.email == ""
+
+
+async def test_only_the_viewer_email_goes(competition_id):
+    """Sin ver todos, la fila de quien pide lleva su correo y las demás no (BE #531)."""
+    uow = _UoWQueCuenta()
+    ana = await _usuario(uow, "Ana")
+    bea = await _usuario(uow, "Bea")
+    inscripciones = [_inscripcion(competition_id, ana), _inscripcion(competition_id, bea)]
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        inscripciones, uow, viewer_id=bea.id, visibility=Visibility.PRIVATE
+    )
+
+    assert [d.user.email for d in dtos] == ["", str(bea.email)]
+
+
+async def test_seeing_every_email_sends_them_all(competition_id):
+    """El organizador o un admin: van todos los correos (BE #531)."""
+    uow = _UoWQueCuenta()
+    ana = await _usuario(uow, "Ana")
+    bea = await _usuario(uow, "Bea")
+    inscripciones = [_inscripcion(competition_id, ana), _inscripcion(competition_id, bea)]
+
+    dtos = await EnrollmentDTOMapper.to_response_dtos(
+        inscripciones, uow, ve_todos_los_correos=True, visibility=Visibility.PRIVATE
+    )
+
+    assert [d.user.email for d in dtos] == [str(ana.email), str(bea.email)]
+
+
+# SB-08 (decidido por Agustín el 17 nov 2026): delante va el nombre real en una pública
+# y lo que eligió el jugador en una privada. Nombre, apellidos y alias van siempre: el
+# alias es un apodo, no un dato oculto.
+
+
+@pytest.mark.parametrize(
+    "visibility, use_real_name, delante",
+    [
+        (Visibility.PUBLIC, True, "Agustin Pérez"),
+        (Visibility.PUBLIC, False, "Agustin Pérez"),
+        (Visibility.PRIVATE, True, "Agustin Pérez"),
+        (Visibility.PRIVATE, False, "Trinx"),
+    ],
+    ids=["publica-nombre", "publica-alias", "privada-nombre", "privada-alias"],
+)
+async def test_the_name_in_front_follows_the_rule_and_everything_goes(
+    competition_id, visibility, use_real_name, delante
+):
+    """
+    Given: Un jugador con alias que eligió su nombre o su alias
+    When: Otro jugador mira la lista de una pública o una privada
+    Then: Delante, el que toca; nombre, apellidos y alias, siempre
+    """
+    uow = InMemoryUnitOfWork()
+    trinx = await _usuario(uow, "Agustin", alias="Trinx")
+
+    [dto] = await EnrollmentDTOMapper.to_response_dtos(
+        [_inscripcion(competition_id, trinx, use_real_name=use_real_name)],
+        uow,
+        visibility=visibility,
+        viewer_id=UserId(uuid4()),
+    )
+
+    assert dto.user.display_name == delante
+    assert (dto.user.first_name, dto.user.last_name, dto.user.alias) == (
+        "Agustin",
+        "Pérez",
+        "Trinx",
+    )

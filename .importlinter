@@ -1,0 +1,309 @@
+# ================================
+# CONTRATOS DE ARQUITECTURA (import-linter)
+# ================================
+# Se comprueban en el CI (workflow "Architecture & API Contract") y en local con:
+#   lint-imports
+#
+# Qué protegen, y de dónde sale cada regla:
+# - Capas: dentro de cada módulo, infrastructure puede importar application y
+#   domain; application solo domain; domain nada de las otras dos. La regla es que
+#   los casos de uso nunca importan de infrastructure (refactor del 16 nov 2025);
+#   hasta ahora solo se comprobaba en revisión y la vigila el contrato `layers`.
+# - Dominio puro: el dominio no conoce FastAPI, SQLAlchemy ni Pydantic.
+# - Entre módulos se comparte dominio (p. ej. MatchFormat), nunca infraestructura:
+#   cada módulo define sus propios decoradores de persistencia. Los imports
+#   INDIRECTOS se permiten porque todos pasan por src.config.dependencies, la
+#   composition root, que es el único sitio donde se ensambla todo.
+# - Dominio y aplicación no importan nada de src.config: ni esa composition
+#   root ni la configuración (settings, csrf_config, env). Lo que necesiten de
+#   ahí les llega por constructor desde src.config.dependencies, como valor o
+#   como puerto (auditoría de arquitectura del 9 nov 2026).
+#
+# Si un contrato falla, la salida dice qué import lo rompe. No se relaja el
+# contrato sin decidirlo: añadir una excepción es una decisión de arquitectura.
+
+[importlinter]
+root_packages =
+    src
+include_external_packages = True
+
+[importlinter:contract:layers]
+name = Capas: infrastructure > application > domain, en cada módulo y en shared
+type = layers
+layers =
+    infrastructure
+    application
+    domain
+containers =
+    src.modules.competition
+    src.modules.golf_course
+    src.modules.quick_match
+    src.modules.social
+    src.modules.support
+    src.modules.user
+    src.shared
+
+[importlinter:contract:domain-pure]
+name = El dominio no depende de frameworks
+type = forbidden
+source_modules =
+    src.modules.competition.domain
+    src.modules.golf_course.domain
+    src.modules.quick_match.domain
+    src.modules.social.domain
+    src.modules.support.domain
+    src.modules.user.domain
+    src.shared.domain
+forbidden_modules =
+    fastapi
+    starlette
+    sqlalchemy
+    pydantic
+    asyncpg
+    bcrypt
+    jwt
+    httpx
+    PIL
+    sentry_sdk
+    alembic
+
+[importlinter:contract:competition-no-foreign-infra]
+name = competition no importa la infraestructura de otro módulo
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    src.modules.competition
+forbidden_modules =
+    src.modules.golf_course.infrastructure
+    src.modules.quick_match.infrastructure
+    src.modules.social.infrastructure
+    src.modules.support.infrastructure
+    src.modules.user.infrastructure
+
+[importlinter:contract:golf_course-no-foreign-infra]
+name = golf_course no importa la infraestructura de otro módulo
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    src.modules.golf_course
+forbidden_modules =
+    src.modules.competition.infrastructure
+    src.modules.quick_match.infrastructure
+    src.modules.social.infrastructure
+    src.modules.support.infrastructure
+    src.modules.user.infrastructure
+
+[importlinter:contract:quick_match-no-foreign-infra]
+name = quick_match no importa la infraestructura de otro módulo
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    src.modules.quick_match
+forbidden_modules =
+    src.modules.competition.infrastructure
+    src.modules.golf_course.infrastructure
+    src.modules.social.infrastructure
+    src.modules.support.infrastructure
+    src.modules.user.infrastructure
+
+[importlinter:contract:social-no-foreign-infra]
+name = social no importa la infraestructura de otro módulo
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    src.modules.social
+forbidden_modules =
+    src.modules.competition.infrastructure
+    src.modules.golf_course.infrastructure
+    src.modules.quick_match.infrastructure
+    src.modules.support.infrastructure
+    src.modules.user.infrastructure
+
+[importlinter:contract:support-no-foreign-infra]
+name = support no importa la infraestructura de otro módulo
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    src.modules.support
+forbidden_modules =
+    src.modules.competition.infrastructure
+    src.modules.golf_course.infrastructure
+    src.modules.quick_match.infrastructure
+    src.modules.social.infrastructure
+    src.modules.user.infrastructure
+
+[importlinter:contract:user-no-foreign-infra]
+name = user no importa la infraestructura de otro módulo
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    src.modules.user
+forbidden_modules =
+    src.modules.competition.infrastructure
+    src.modules.golf_course.infrastructure
+    src.modules.quick_match.infrastructure
+    src.modules.social.infrastructure
+    src.modules.support.infrastructure
+
+[importlinter:contract:shared-domain-no-modules]
+name = El dominio compartido no depende de ningún módulo
+type = forbidden
+# Las reglas de golf que usan varios módulos viven aquí (BE #165): si
+# una de ellas importara de un módulo, ese módulo volvería a ser el dueño
+source_modules =
+    src.shared.domain
+forbidden_modules =
+    src.modules
+
+[importlinter:contract:quick_match-not-competition]
+name = quick_match no importa nada de competition
+type = forbidden
+allow_indirect_imports = True
+# Lo que comparten (hándicap, formatos, reglas del match play y del stableford)
+# vive en src.shared.domain. Quedaron independientes el 2 oct 2026 (#165)
+source_modules =
+    src.modules.quick_match
+forbidden_modules =
+    src.modules.competition
+
+[importlinter:contract:competition-not-quick_match]
+name = competition no importa nada de quick_match
+type = forbidden
+allow_indirect_imports = True
+source_modules =
+    src.modules.competition
+forbidden_modules =
+    src.modules.quick_match
+
+[importlinter:contract:no-config]
+name = Dominio y aplicación no importan src.config (ni la composition root ni la configuración)
+type = forbidden
+# Antes solo se prohibía src.config.dependencies, y los casos de uso leían
+# settings, csrf_config y env directamente: probarlos o moverlos exigía la
+# configuración real. Ahora se les inyecta lo que necesitan
+source_modules =
+    src.modules.competition.domain
+    src.modules.competition.application
+    src.modules.golf_course.domain
+    src.modules.golf_course.application
+    src.modules.quick_match.domain
+    src.modules.quick_match.application
+    src.modules.social.domain
+    src.modules.social.application
+    src.modules.support.domain
+    src.modules.support.application
+    src.modules.user.domain
+    src.modules.user.application
+    src.shared.domain
+    src.shared.application
+forbidden_modules =
+    src.config
+
+[importlinter:contract:application-no-infrastructure]
+name = La aplicación (de cualquier módulo y la compartida) no importa infraestructura (#750)
+type = forbidden
+source_modules =
+    src.modules.competition.application
+    src.modules.golf_course.application
+    src.modules.quick_match.application
+    src.modules.social.application
+    src.modules.support.application
+    src.modules.user.application
+    src.shared.application
+forbidden_modules =
+    src.shared.infrastructure
+    src.modules.competition.infrastructure
+    src.modules.golf_course.infrastructure
+    src.modules.quick_match.infrastructure
+    src.modules.social.infrastructure
+    src.modules.support.infrastructure
+    src.modules.user.infrastructure
+
+[importlinter:contract:application-no-frameworks]
+name = La aplicación no depende de frameworks ni de librerías de infraestructura (auditoría 9 nov 2026)
+type = forbidden
+# Un caso de uso que conoce SQLAlchemy (o bcrypt, o httpx) ya no se puede probar ni
+# cambiar sin su infraestructura. Pydantic sí está permitido: los DTOs son Pydantic
+# por decisión del proyecto. La lista completa de lo permitido por capa está en
+# tests/unit/architecture/test_imports_permitidos_por_capa.py, que es más estricto
+source_modules =
+    src.modules.competition.application
+    src.modules.golf_course.application
+    src.modules.quick_match.application
+    src.modules.social.application
+    src.modules.support.application
+    src.modules.user.application
+    src.shared.application
+forbidden_modules =
+    fastapi
+    starlette
+    sqlalchemy
+    asyncpg
+    bcrypt
+    jwt
+    httpx
+    PIL
+    sentry_sdk
+    alembic
+
+[importlinter:contract:shared-no-modules]
+name = src.shared no importa de los módulos (revisión de la fase 2, 9 nov 2026)
+type = forbidden
+source_modules =
+    src.shared
+forbidden_modules =
+    src.modules
+allow_indirect_imports = True
+# Sin excepciones desde la fase 5: la autorización vive en el módulo de usuarios, las rutas de
+# países leen del repositorio de países compartido, y los servicios de tokens y de correo cumplen
+# los puertos de los módulos (Protocol) sin importarlos
+
+[importlinter:contract:dependencias-por-contexto]
+name = Los proveedores de cada contexto solo comparten src.config.dependencies.comun (fase 5)
+type = independence
+modules =
+    src.config.dependencies.usuarios
+    src.config.dependencies.competicion
+    src.config.dependencies.competicion_juego
+    src.config.dependencies.campos
+    src.config.dependencies.partida_rapida
+    src.config.dependencies.social
+    src.config.dependencies.soporte
+
+[importlinter:contract:dominio-de-usuarios-por-capas]
+name = El dominio de usuarios va en una dirección: servicios > repositorios > entidades > errores, excepciones y valores > puertos (B10, fase 5)
+type = layers
+containers =
+    src.modules.user.domain
+exhaustive = true
+layers =
+    services
+    repositories
+    entities
+    errors | exceptions | value_objects
+    ports
+
+[importlinter:contract:dominio-de-competiciones-por-capas]
+name = El dominio de competiciones va en una dirección: repositorios > servicios > entidades > reglas > excepciones y valores (B10, fase 5)
+type = layers
+containers =
+    src.modules.competition.domain
+exhaustive = true
+layers =
+    repositories
+    services
+    entities
+    policies
+    exceptions | value_objects
+
+[importlinter:contract:aplicacion-de-competiciones-por-capas]
+name = La aplicación de competiciones va en una dirección: casos de uso > mappers > servicios > DTO, excepciones y puertos (B10, fase 5)
+type = layers
+containers =
+    src.modules.competition.application
+exhaustive = true
+layers =
+    use_cases
+    mappers
+    services
+    dto | exceptions | ports

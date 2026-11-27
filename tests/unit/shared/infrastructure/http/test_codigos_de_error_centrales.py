@@ -1,0 +1,538 @@
+"""
+Los errores de dominio se traducen a su código HTTP en un solo sitio (fase 5).
+
+Antes, cada ruta repetía `except X as e: raise HTTPException(código, str(e))`: 292
+cláusulas para 123 excepciones. Ahora cada módulo declara su mapa y la app los registra.
+La respuesta no cambia: mismo código y el mismo `{"detail": str(e)}`.
+"""
+
+import ast
+import importlib
+import json
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
+
+from main import app
+from src.config.codigos_de_error import todos_los_codigos
+from src.shared.infrastructure.http.codigos_de_error import registra_los_codigos
+
+RAIZ = Path(__file__).resolve().parents[5]
+
+# El código que daba cada excepción en develop (12 nov 2026, tras la #809): en sus rutas o,
+# las dos de los torneos sin equipos (#251), en exception_handlers.py de competición
+CODIGOS_DE_DEVELOP = {
+    # Un enlace en el mensaje de una invitación (SB-05, 17 nov 2026)
+    "src.modules.competition.domain.entities.invitation.InvitationMessageWithLinkError": 400,
+    "src.modules.competition.domain.entities.competition.TournamentTypeError": 400,
+    "src.modules.competition.domain.value_objects.stroke_play_setup.StrokePlaySettingsError": 400,
+    "src.modules.competition.application.exceptions.AgendaNotEditableError": 400,
+    "src.modules.competition.application.exceptions.CompetitionAlreadyExistsError": 409,
+    "src.modules.competition.application.exceptions.CompetitionFullError": 400,
+    "src.modules.competition.application.exceptions.CompetitionNotClosedError": 400,
+    "src.modules.competition.application.exceptions.CompetitionNotDraftError": 400,
+    "src.modules.competition.application.exceptions.CompetitionNotFoundError": 404,
+    "src.modules.competition.application.exceptions.DateOutOfRangeError": 400,
+    "src.modules.competition.application.exceptions.EnrollmentNotFoundError": 404,
+    "src.modules.competition.application.exceptions.FranjaInvalidaError": 400,
+    "src.modules.competition.application.exceptions.GolfCourseHasRoundsError": 400,
+    "src.modules.competition.application.exceptions.HandicapEditNotAllowedError": 400,
+    "src.modules.competition.application.exceptions.InvalidHoleNumberError": 400,
+    "src.modules.competition.application.exceptions.InvalidTeeColorError": 400,
+    "src.modules.competition.application.exceptions.InvitationNotFoundError": 404,
+    "src.modules.competition.application.exceptions.InviteeNotFoundError": 404,
+    "src.modules.competition.application.exceptions.MatchNotFoundError": 404,
+    "src.modules.competition.application.exceptions.MatchNotScoringError": 409,
+    "src.modules.competition.application.exceptions.NotCompetitionCreatorError": 403,
+    "src.modules.competition.application.exceptions.NotCompetitionParticipantError": 403,
+    "src.modules.competition.application.exceptions.NotCreatorError": 403,
+    "src.modules.competition.application.exceptions.NotInviteeError": 403,
+    "src.modules.competition.application.exceptions.NotMatchPlayerError": 403,
+    "src.modules.competition.application.exceptions.PartidaNotFoundError": 404,
+    "src.modules.competition.application.exceptions.PlazaEnFranjaError": 400,
+    "src.modules.competition.application.exceptions.RoundNotFoundError": 404,
+    "src.modules.competition.application.exceptions.RoundNotModifiableError": 400,
+    "src.modules.competition.application.exceptions.ScheduleAlreadyInPlayError": 400,
+    "src.modules.competition.application.exceptions.ScorecardAlreadySubmittedError": 400,
+    "src.modules.competition.application.exceptions.ScorecardNotReadyError": 400,
+    "src.modules.competition.application.services.envelope_pairings.EnvelopesDecideThePairingsError": 400,
+    "src.modules.competition.application.services.envelope_pairings.EnvelopesNotRevealedError": 400,
+    "src.modules.competition.application.services.genero_obligatorio.PerfilIncompletoError": 400,
+    "src.modules.competition.application.services.jugadores_del_partido.PlayerNotEnrolledError": 400,
+    "src.modules.competition.application.services.match_players_builder.TeeColorNotFoundError": 400,
+    # Nuevo con el plazo de inscripción (15 nov 2026, C2): con `error_code`
+    "src.modules.competition.application.services.plazo_de_inscripcion.EnrollmentDeadlinePassedError": 400,
+    "src.modules.competition.application.use_cases.add_golf_course_use_case.GolfCourseNotFoundError": 404,
+    "src.modules.competition.application.use_cases.cancel_enrollment_use_case.NotOwnerError": 403,
+    "src.modules.competition.application.use_cases.configure_schedule_use_case.NoGolfCoursesError": 400,
+    "src.modules.competition.application.use_cases.create_round_use_case.DuplicateSessionError": 400,
+    "src.modules.competition.application.use_cases.create_round_use_case.GolfCourseNotInCompetitionError": 400,
+    "src.modules.competition.application.use_cases.declare_walkover_use_case.CompetitionNotInProgressError": 400,
+    "src.modules.competition.application.use_cases.declare_walkover_use_case.InvalidWalkoverError": 400,
+    "src.modules.competition.application.use_cases.generate_matches_use_case.RoundNotPendingMatchesError": 400,
+    "src.modules.competition.application.use_cases.name_vice_captain_use_case.NotCaptainOrCreatorError": 403,
+    "src.modules.competition.application.use_cases.reassign_match_players_use_case.MatchNotScheduledError": 400,
+    "src.modules.competition.application.use_cases.reassign_match_players_use_case.NoTeamAssignmentError": 400,
+    "src.modules.competition.application.use_cases.reassign_match_players_use_case.PlayerNotInTeamError": 400,
+    "src.modules.competition.application.use_cases.reassign_match_players_use_case.WrongNumberOfPlayersError": 400,
+    "src.modules.competition.application.use_cases.remove_golf_course_use_case.GolfCourseNotAssignedError": 400,
+    "src.modules.competition.application.use_cases.reorder_golf_courses_use_case.InvalidReorderError": 400,
+    "src.modules.competition.application.use_cases.request_enrollment_use_case.AlreadyEnrolledError": 409,
+    "src.modules.competition.application.use_cases.request_enrollment_use_case.CompetitionIsPrivateError": 403,
+    "src.modules.competition.application.use_cases.request_enrollment_use_case.CompetitionNotActiveError": 400,
+    "src.modules.competition.application.use_cases.request_enrollment_use_case.EnrollmentClosedError": 400,
+    "src.modules.competition.application.use_cases.request_enrollment_use_case.TooManyEnrollmentsError": 400,
+    "src.modules.competition.application.use_cases.reset_envelopes_use_case.NothingToResetError": 400,
+    "src.modules.competition.application.use_cases.reset_envelopes_use_case.SessionAlreadyPlayedError": 400,
+    "src.modules.competition.application.use_cases.reveal_envelopes_use_case.EarlyRevealNeedsBothCaptainsError": 409,
+    "src.modules.competition.application.use_cases.set_name_preference_use_case.NotOwnerError": 403,
+    "src.modules.competition.application.use_cases.submit_envelope_use_case.NotATeamCaptainError": 403,
+    "src.modules.competition.application.use_cases.update_match_status_use_case.CompetitionNotInProgressError": 400,
+    "src.modules.competition.application.use_cases.update_match_status_use_case.InvalidActionError": 400,
+    "src.modules.competition.application.use_cases.update_round_use_case.DuplicateSessionError": 400,
+    "src.modules.competition.application.use_cases.update_round_use_case.GolfCourseNotInCompetitionError": 400,
+    "src.modules.competition.application.use_cases.withdraw_enrollment_use_case.NotOwnerError": 403,
+    "src.modules.competition.domain.entities.draft.NotYourTurnError": 409,
+    "src.modules.competition.domain.entities.enrollment.EnrollmentStateError": 400,
+    "src.modules.competition.domain.exceptions.competition_violations.AlreadyEnrolledInvitationViolation": 409,
+    "src.modules.competition.domain.exceptions.competition_violations.CompetitionFullViolation": 422,
+    "src.modules.competition.domain.exceptions.competition_violations.DuplicateInvitationViolation": 409,
+    "src.modules.competition.domain.exceptions.competition_violations.InvalidInvitationStatusViolation": 409,
+    "src.modules.competition.domain.exceptions.competition_violations.InvitationCompetitionStatusViolation": 422,
+    "src.modules.competition.domain.exceptions.competition_violations.InvitationExpiredViolation": 409,
+    # 15 nov 2026: la invitación en espera (P1) y la sala de draft abierta al invitar o
+    # aceptar (B3), con su código
+    "src.modules.competition.domain.exceptions.competition_violations.InvitationOnHoldViolation": 409,
+    "src.modules.competition.domain.exceptions.competition_violations.InvitationOnHoldExistsViolation": 409,
+    "src.modules.competition.application.services.baja_de_la_competicion.DraftInProgressError": 409,
+    "src.modules.competition.domain.exceptions.competition_violations.SelfInvitationViolation": 400,
+    "src.modules.competition.domain.services.location_builder.InvalidCountryError": 400,
+    "src.modules.competition.domain.value_objects.location.InvalidLocationError": 400,
+    # Campos (re-auditoría F-04): los mismos códigos que daban sus rutas
+    "src.modules.golf_course.application.exceptions.GolfCourseEditForbiddenError": 403,
+    "src.modules.golf_course.application.exceptions.GolfCourseMissingError": 404,
+    "src.modules.quick_match.application.exceptions.FriendUserNotFoundError": 404,
+    "src.modules.quick_match.application.exceptions.GolfCourseNotFoundError": 404,
+    "src.modules.quick_match.application.exceptions.InvalidParticipantError": 422,
+    "src.modules.quick_match.application.exceptions.InvalidTeeSelectionError": 422,
+    "src.modules.quick_match.application.exceptions.NotAScorerError": 403,
+    "src.modules.quick_match.application.exceptions.NotAuthorizedToRemoveError": 403,
+    "src.modules.quick_match.application.exceptions.NotFriendsError": 403,
+    "src.modules.quick_match.application.exceptions.NotQuickMatchCreatorError": 403,
+    "src.modules.quick_match.application.exceptions.NotQuickMatchParticipantError": 403,
+    "src.modules.quick_match.application.exceptions.QuickMatchIdTakenError": 409,
+    "src.modules.quick_match.application.exceptions.QuickMatchNotFoundError": 404,
+    "src.modules.quick_match.application.exceptions.QuickMatchNotSharedError": 403,
+    "src.modules.quick_match.application.exceptions.TargetParticipantNotFoundError": 404,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.CreatorCannotBeRemovedViolation": 400,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.DuplicateParticipantViolation": 409,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.IncompleteRosterViolation": 422,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.InvalidAllowanceViolation": 422,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.InvalidHoleScoreViolation": 400,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.InvalidQuickMatchStatusViolation": 409,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.InvalidScorerConfigurationViolation": 422,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.InvalidTeamAssignmentViolation": 422,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.NotAssignedScorerViolation": 403,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.NotQuickMatchParticipantViolation": 404,
+    "src.modules.quick_match.domain.exceptions.quick_match_violations.QuickMatchFullViolation": 422,
+    "src.modules.social.application.exceptions.ActivityNotVisibleError": 403,
+    "src.modules.social.application.exceptions.AddresseeNotFoundError": 404,
+    "src.modules.social.application.exceptions.FriendshipNotFoundError": 404,
+    "src.modules.social.application.exceptions.GamesTogetherNotVisibleError": 403,
+    "src.modules.social.application.exceptions.NotAddresseeError": 403,
+    "src.modules.social.application.exceptions.NotFriendshipParticipantError": 403,
+    "src.modules.social.application.exceptions.PhotoNotFoundError": 404,
+    "src.modules.social.application.exceptions.ProfileGalleryFullError": 409,
+    "src.modules.social.domain.exceptions.social_violations.BlockedUserViolation": 403,
+    "src.modules.social.domain.exceptions.social_violations.DuplicateFriendRequestViolation": 409,
+    # Nuevo tras la fase 5 (13 nov 2026): el choque con uq_friendship_pair que se escapa
+    # de un caso de uso era un 500; ahora el 409 de los demás conflictos sociales
+    "src.modules.social.domain.exceptions.social_violations.DuplicateFriendshipViolation": 409,
+    "src.modules.social.domain.exceptions.social_violations.InvalidFriendshipStatusViolation": 409,
+    "src.modules.social.domain.exceptions.social_violations.SelfFriendRequestViolation": 400,
+    "src.modules.user.domain.errors.handicap_errors.HandicapNotFoundError": 404,
+    "src.modules.user.domain.errors.user_errors.AliasAlreadyTakenError": 409,
+    "src.modules.user.domain.errors.user_errors.AvatarUploadNotFoundError": 404,
+    "src.modules.user.domain.errors.user_errors.AvatarUploadTooLargeError": 413,
+    # Nuevo (SB-01): la imagen lleva demasiado rato esperando su turno; puede reintentarse
+    "src.modules.user.domain.errors.user_errors.ImageProcessingBusyError": 503,
+    "src.modules.user.domain.errors.user_errors.InvalidAvatarImageError": 400,
+    "src.modules.user.domain.errors.user_errors.TermsAcceptanceRequiredError": 422,
+    "src.modules.user.domain.errors.user_errors.UserNotFoundError": 404,
+    "src.modules.user.domain.exceptions.user_has_activity_exception.UserHasActivityException": 409,
+    "src.shared.domain.value_objects.country_code.InvalidCountryCodeError": 400,
+    "src.shared.infrastructure.http.upload_reader.UploadTooLargeError": 413,
+}
+
+# Las que dan códigos distintos según la ruta: siguen traduciéndose en cada ruta
+CONFLICTOS = {"GolfCourseNotApprovedError", "InvalidAvatarPresetError"}
+
+# Except triviales que se quedan a propósito, por fichero y función: en
+# reassign_match_players los sigue un `except Exception` que, sin ellos, convertiría
+# esos errores en un 500
+SE_QUEDAN_A_PROPOSITO = {("round_match_routes.py", "reassign_match_players")}
+
+
+def _nombre(cls: type) -> str:
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def test_the_central_map_gives_each_error_the_code_it_had_in_the_routes():
+    """
+    Given: El código que daba cada error de dominio en las rutas de develop
+    When: Se lee el mapa central de todos los módulos
+    Then: Están todos, con el mismo código, y ninguno más
+    """
+    assert {_nombre(c): s for c, s in todos_los_codigos().items()} == CODIGOS_DE_DEVELOP
+
+
+def test_registering_the_central_map_gives_every_error_its_handler():
+    """
+    Given: El mapa central
+    When: Se mira qué manejadores tiene la app
+    Then: Cada error del mapa tiene el suyo
+    """
+    sin_manejador = [_nombre(c) for c in todos_los_codigos() if c not in app.exception_handlers]
+
+    assert sin_manejador == []
+
+
+def test_reading_the_map_with_conflicting_errors_leaves_them_to_their_routes():
+    """
+    Given: Los dos errores que dan códigos distintos según la ruta
+    When: Se mira el mapa central
+    Then: No están: cada ruta sigue dando el suyo
+    """
+    assert not {c.__name__ for c in todos_los_codigos()} & CONFLICTOS
+
+
+class _PadreError(Exception):
+    pass
+
+
+class _HijaError(_PadreError):
+    pass
+
+
+class _NietaError(_HijaError):
+    pass
+
+
+class _HermanaError(_PadreError):
+    pass
+
+
+@pytest.fixture
+def cliente():
+    mini = FastAPI()
+    registra_los_codigos(mini, {_PadreError: 400, _HijaError: 404})
+
+    @mini.get("/lanza/{cual}")
+    async def lanza(cual: str):
+        raise {
+            "padre": _PadreError,
+            "hija": _HijaError,
+            "nieta": _NietaError,
+            "hermana": _HermanaError,
+        }[cual](f"motivo de {cual}")
+
+    @mini.get("/como-antes")
+    async def como_antes():
+        raise HTTPException(status_code=404, detail="motivo de hija")
+
+    return TestClient(mini)
+
+
+def test_a_mapped_error_answers_its_code_with_its_message_as_detail(cliente):
+    """
+    Given: Un error registrado con 404
+    When: Una ruta lo lanza sin capturarlo
+    Then: 404 con {"detail": str(e)}, igual que el HTTPException de antes
+    """
+    nueva = cliente.get("/lanza/hija")
+    antes = cliente.get("/como-antes")
+
+    assert nueva.status_code == antes.status_code == 404
+    assert nueva.json() == antes.json() == {"detail": "motivo de hija"}
+    assert nueva.headers["content-type"] == antes.headers["content-type"]
+
+
+@pytest.mark.parametrize(
+    ("cual", "codigo"), [("padre", 400), ("hija", 404), ("nieta", 404), ("hermana", 400)]
+)
+def test_a_subclass_gets_the_code_of_its_closest_mapped_class(cliente, cual, codigo):
+    """
+    Given: Padre con 400 e Hija con 404
+    When: Se lanza cada una, y también una nieta y una hermana sin código propio
+    Then: Cada una recibe el de su clase registrada más cercana
+    """
+    assert cliente.get(f"/lanza/{cual}").status_code == codigo
+
+
+def _except_triviales():
+    """
+    Los `except X as e: raise HTTPException(status_code=..., detail=str(e))` de las rutas,
+    con cada X resuelta a su clase (las rutas importan algunas con otro nombre).
+    """
+    for ruta in sorted((RAIZ / "src" / "modules").glob("*/infrastructure/api/v1/*.py")):
+        modulo = vars(
+            importlib.import_module(".".join(ruta.relative_to(RAIZ).with_suffix("").parts))
+        )
+        funciones = [
+            f
+            for f in ast.walk(ast.parse(ruta.read_text(encoding="utf-8")))
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for funcion, nodo in ((f, n) for f in funciones for n in ast.walk(f)):
+            if not (isinstance(nodo, ast.ExceptHandler) and nodo.type is not None and nodo.name):
+                continue
+            cuerpo = nodo.body
+            if not (
+                len(cuerpo) == 1
+                and isinstance(cuerpo[0], ast.Raise)
+                and isinstance(cuerpo[0].exc, ast.Call)
+                and ast.unparse(cuerpo[0].exc.func) == "HTTPException"
+            ):
+                continue
+            argumentos = {k.arg: ast.unparse(k.value) for k in cuerpo[0].exc.keywords}
+            if argumentos != {
+                "status_code": argumentos.get("status_code"),
+                "detail": f"str({nodo.name})",
+            }:
+                continue
+            clases = []
+            for tipo in nodo.type.elts if isinstance(nodo.type, ast.Tuple) else [nodo.type]:
+                valor = eval(compile(ast.Expression(tipo), ruta.name, "eval"), modulo)
+                clases.extend(valor if isinstance(valor, tuple) else [valor])
+            codigo = next(k.value for k in cuerpo[0].exc.keywords if k.arg == "status_code")
+            yield (
+                ruta.name,
+                funcion.name,
+                clases,
+                eval(compile(ast.Expression(codigo), ruta.name, "eval"), modulo),
+            )
+
+
+def test_no_route_translates_by_hand_an_error_the_central_map_already_translates():
+    """
+    Given: Las rutas y el mapa central
+    When: Se busca, clase a clase (también dentro de una tupla), un except trivial que le
+          da el mismo código que el mapa, contando el que hereda de su clase registrada
+    Then: No queda ninguno, salvo los que se quedan a propósito (una ruta que quiera
+          otro código para un error del mapa sí puede traducirlo ella)
+    """
+    mapa = todos_los_codigos()
+
+    def codigo_del_mapa(clase: type) -> int | None:
+        # El que le daría la app: el de su clase registrada más cercana
+        return next((mapa[c] for c in clase.__mro__ if c in mapa), None)
+
+    repetidos = [
+        (fichero, funcion, clase.__name__)
+        for fichero, funcion, clases, codigo in _except_triviales()
+        for clase in clases
+        if codigo_del_mapa(clase) == codigo and (fichero, funcion) not in SE_QUEDAN_A_PROPOSITO
+    ]
+
+    assert repetidos == []
+
+
+class _ConCodigoError(Exception):
+    error_code = "CON_CODIGO"
+
+
+class _CodigoQueNoEsTextoError(Exception):
+    error_code = 7
+
+
+class _ConCodigoSinPedirloError(Exception):
+    error_code = "SIN_PEDIRLO"
+
+
+@pytest.fixture
+def cliente_con_codigo():
+    mini = FastAPI()
+    registra_los_codigos(
+        mini,
+        {_ConCodigoError: 400, _CodigoQueNoEsTextoError: 409, _ConCodigoSinPedirloError: 422},
+        {_ConCodigoError, _CodigoQueNoEsTextoError},
+    )
+
+    @mini.get("/lanza/{cual}")
+    async def lanza(cual: str):
+        raise {
+            "con-codigo": _ConCodigoError("La inscripción está cerrada."),
+            "raro": _CodigoQueNoEsTextoError("raro"),
+            "sin-pedirlo": _ConCodigoSinPedirloError("sin pedirlo"),
+        }[cual]
+
+    return TestClient(mini)
+
+
+def test_an_error_with_its_code_answers_it_in_the_root(cliente_con_codigo):
+    """
+    C2 (plazo de inscripción, 15 nov 2026).
+    Given: Un error del mapa que lleva su `error_code`
+    When: Una ruta lo lanza
+    Then: Su código HTTP, su texto y el `error_code` en la raíz, para que la app lo traduzca
+    """
+    respuesta = cliente_con_codigo.get("/lanza/con-codigo")
+
+    assert respuesta.status_code == 400
+    assert respuesta.json() == {
+        "detail": "La inscripción está cerrada.",
+        "error_code": "CON_CODIGO",
+    }
+
+
+def test_a_code_that_is_not_text_is_left_out(cliente_con_codigo):
+    """Given: Un `error_code` que no es texto / Then: Solo el `detail`, como siempre."""
+    assert cliente_con_codigo.get("/lanza/raro").json() == {"detail": "raro"}
+
+
+def test_an_error_with_a_code_not_asked_for_answers_as_always(cliente_con_codigo):
+    """Given: Un error con `error_code` que no se pidió / Then: Solo el `detail`, como siempre."""
+    respuesta = cliente_con_codigo.get("/lanza/sin-pedirlo")
+
+    assert respuesta.status_code == 422
+    assert respuesta.json() == {"detail": "sin pedirlo"}
+
+
+def test_only_the_deadline_on_hold_draft_and_images_busy_errors_bring_their_code():
+    """
+    Given: El mapa central
+    When: Se miran las que llevan su `error_code`
+    Then: Solo la del plazo, la de la invitación en espera y la de la sala de draft, y
+    están en el mapa: a las demás no les cambia la respuesta
+    """
+    from src.config.codigos_de_error import los_que_llevan_su_codigo
+
+    con_codigo = {_nombre(c) for c in los_que_llevan_su_codigo()}
+
+    assert con_codigo == {
+        "src.modules.competition.application.services.plazo_de_inscripcion."
+        "EnrollmentDeadlinePassedError",
+        "src.modules.competition.domain.exceptions.competition_violations."
+        "InvitationOnHoldViolation",
+        "src.modules.competition.domain.exceptions.competition_violations."
+        "InvitationOnHoldExistsViolation",
+        "src.modules.competition.application.services.baja_de_la_competicion.DraftInProgressError",
+        # Imágenes ocupadas (SB-01): el front lo traduce por su código
+        "src.modules.user.domain.errors.user_errors.ImageProcessingBusyError",
+        # Un enlace en el mensaje de una invitación (SB-05): ídem
+        "src.modules.competition.domain.entities.invitation.InvitationMessageWithLinkError",
+    }
+    assert los_que_llevan_su_codigo() <= todos_los_codigos().keys()
+
+
+def test_images_busy_answers_503_with_its_code_and_the_approved_text():
+    """
+    Given: Una subida de imagen que lleva demasiado rato esperando su turno (SB-01)
+    When: La app la traduce con el mapa central
+    Then: 503 con el texto aprobado y `error_code` IMAGES_BUSY en la raíz
+    """
+    from src.config.codigos_de_error import los_que_llevan_su_codigo
+    from src.modules.user.domain.errors.user_errors import ImageProcessingBusyError
+
+    texto = "Ahora mismo se están procesando otras imágenes. Inténtalo de nuevo en unos segundos."
+    app_de_prueba = FastAPI()
+    registra_los_codigos(app_de_prueba, todos_los_codigos(), los_que_llevan_su_codigo())
+
+    @app_de_prueba.get("/subida")
+    async def subida():
+        raise ImageProcessingBusyError(texto)
+
+    respuesta = TestClient(app_de_prueba).get("/subida")
+
+    assert respuesta.status_code == 503
+    assert respuesta.json() == {"detail": texto, "error_code": "IMAGES_BUSY"}
+
+
+def test_the_app_answers_the_deadline_with_its_code():
+    """
+    C2. Given: La app de verdad
+    When: Una petición acaba en ENROLLMENT_DEADLINE_PASSED
+    Then: 400, «La inscripción está cerrada.» y el `error_code`
+    """
+    import asyncio
+
+    from src.modules.competition.application.services.plazo_de_inscripcion import (
+        EnrollmentDeadlinePassedError,
+    )
+
+    manejador = app.exception_handlers[EnrollmentDeadlinePassedError]
+    respuesta = asyncio.run(manejador(None, EnrollmentDeadlinePassedError()))
+
+    assert respuesta.status_code == 400
+    assert (
+        respuesta.body
+        == (
+            '{"detail":"La inscripción está cerrada.","error_code":"ENROLLMENT_DEADLINE_PASSED"}'
+        ).encode()
+    )
+
+
+def test_the_app_answers_an_invitation_on_hold_with_its_code():
+    """
+    P1. Given: La app de verdad
+    When: Se acepta una invitación en espera (INVITATION_ON_HOLD)
+    Then: 409, el texto aprobado y el `error_code`
+    """
+    import asyncio
+
+    from src.modules.competition.domain.exceptions.competition_violations import (
+        InvitationOnHoldViolation,
+    )
+
+    manejador = app.exception_handlers[InvitationOnHoldViolation]
+    respuesta = asyncio.run(manejador(None, InvitationOnHoldViolation()))
+
+    assert respuesta.status_code == 409
+    assert json.loads(respuesta.body) == {
+        "detail": "En lista de espera: la inscripción está cerrada. "
+        "Si el organizador la reabre, podrás aceptarla.",
+        "error_code": "INVITATION_ON_HOLD",
+    }
+
+
+def test_the_app_answers_a_draft_in_progress_with_its_code():
+    """
+    B3. Given: La app de verdad
+    When: Se invita o se acepta con la sala de draft abierta
+    Then: 409 y DRAFT_IN_PROGRESS
+    """
+    import asyncio
+
+    from src.modules.competition.application.services.baja_de_la_competicion import (
+        DraftInProgressError,
+    )
+
+    manejador = app.exception_handlers[DraftInProgressError]
+    respuesta = asyncio.run(manejador(None, DraftInProgressError("Espera a que termine el draft")))
+
+    assert respuesta.status_code == 409
+    assert json.loads(respuesta.body)["error_code"] == "DRAFT_IN_PROGRESS"
+
+
+def test_the_app_answers_an_invitation_on_hold_that_exists_with_its_code():
+    """
+    D1. Given: La app de verdad
+    When: Se vuelve a invitar a quien tiene una invitación en espera
+    Then: 409, el texto y INVITATION_ON_HOLD_EXISTS
+    """
+    import asyncio
+
+    from src.modules.competition.domain.exceptions.competition_violations import (
+        InvitationOnHoldExistsViolation,
+    )
+
+    manejador = app.exception_handlers[InvitationOnHoldExistsViolation]
+    respuesta = asyncio.run(manejador(None, InvitationOnHoldExistsViolation()))
+
+    assert respuesta.status_code == 409
+    assert json.loads(respuesta.body) == {
+        "detail": "Esa persona ya tiene una invitación en lista de espera.",
+        "error_code": "INVITATION_ON_HOLD_EXISTS",
+    }

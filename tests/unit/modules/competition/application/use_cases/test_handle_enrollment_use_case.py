@@ -1,0 +1,391 @@
+"""Tests para HandleEnrollmentUseCase."""
+
+import copy
+from datetime import date
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from src.modules.competition.application.dto.competition_dto import (
+    CreateCompetitionRequestDTO,
+)
+from src.modules.competition.application.dto.enrollment_dto import (
+    HandleEnrollmentRequestDTO,
+)
+from src.modules.competition.application.exceptions import CompetitionFullError
+from src.modules.competition.application.services.genero_obligatorio import GenderRequiredError
+from src.modules.competition.application.use_cases.create_competition_use_case import (
+    CreateCompetitionUseCase,
+)
+from src.modules.competition.application.use_cases.handle_enrollment_use_case import (
+    CompetitionNotFoundError,
+    EnrollmentNotFoundError,
+    HandleEnrollmentUseCase,
+    NotCreatorError,
+)
+from src.modules.competition.domain.entities.enrollment import (
+    Enrollment,
+    EnrollmentStateError,
+)
+from src.modules.competition.domain.services.location_builder import LocationBuilder
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.enrollment_id import EnrollmentId
+from src.modules.competition.domain.value_objects.enrollment_status import EnrollmentStatus
+from src.modules.competition.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.value_objects.gender import Gender
+from tests.unit.modules.competition.application.use_cases.helpers import USUARIOS_CON_GENERO
+
+pytestmark = pytest.mark.asyncio
+
+
+class _Usuarios:
+    """Todos con género, salvo los que se digan."""
+
+    def __init__(self, sin_genero=()):
+        self._sin_genero = set(sin_genero)
+
+    async def find_by_id(self, user_id):
+        genero = None if user_id in self._sin_genero else Gender.MALE
+        return SimpleNamespace(id=user_id, gender=genero)
+
+
+class TestHandleEnrollmentUseCase:
+    """Suite de tests para el caso de uso HandleEnrollmentUseCase."""
+
+    @pytest.fixture
+    def uow(self) -> InMemoryUnitOfWork:
+        return InMemoryUnitOfWork()
+
+    @pytest.fixture
+    def creator_id(self) -> UserId:
+        return UserId(uuid4())
+
+    @pytest.fixture
+    def other_user_id(self) -> UserId:
+        return UserId(uuid4())
+
+    @pytest.fixture
+    def admin_user_id(self) -> UserId:
+        return UserId(uuid4())
+
+    async def _create_active_competition(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, max_players: int = 24
+    ):
+        """Helper: crea y activa una competición."""
+        create_uc = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        request = CreateCompetitionRequestDTO(
+            name="Test Cup",
+            start_date=date(2026, 6, 1),
+            end_date=date(2026, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+            max_players=max_players,
+        )
+        created = await create_uc.execute(request, creator_id)
+
+        return created
+
+    async def _create_requested_enrollment(
+        self, uow: InMemoryUnitOfWork, competition_id, user_id: UserId
+    ) -> Enrollment:
+        """Helper: crea un enrollment en estado REQUESTED."""
+        enrollment = Enrollment.request(
+            id=EnrollmentId.generate(),
+            competition_id=CompetitionId(competition_id),
+            user_id=user_id,
+        )
+        async with uow:
+            await uow.enrollments.add(enrollment)
+            await uow.commit()
+        return enrollment
+
+    async def test_should_approve_enrollment_successfully(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        """
+        Given: Un enrollment en estado REQUESTED
+        When: El creador lo aprueba
+        Then: El enrollment pasa a APPROVED
+        """
+        created = await self._create_active_competition(uow, creator_id)
+        enrollment = await self._create_requested_enrollment(uow, created.id, other_user_id)
+
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        request = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment.id.value,
+            action="APPROVE",
+        )
+        response = await use_case.execute(request, creator_id)
+
+        assert response.status == "APPROVED"
+        assert response.user_id == other_user_id.value
+
+    async def test_h1_sin_genero_no_se_aprueba_y_lo_dice(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        """Una solicitud de antes de la regla, o de quien luego borró su género (#710)."""
+        created = await self._create_active_competition(uow, creator_id)
+        enrollment = await self._create_requested_enrollment(uow, created.id, other_user_id)
+
+        with pytest.raises(GenderRequiredError, match="no tiene el género"):
+            await HandleEnrollmentUseCase(uow, _Usuarios(sin_genero=[other_user_id])).execute(
+                HandleEnrollmentRequestDTO(enrollment_id=enrollment.id.value, action="APPROVE"),
+                creator_id,
+            )
+
+        async with uow:
+            guardada = await uow.enrollments.find_by_id(enrollment.id)
+        assert guardada.status == EnrollmentStatus.REQUESTED
+
+    async def test_h2_sin_genero_se_puede_rechazar(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        created = await self._create_active_competition(uow, creator_id)
+        enrollment = await self._create_requested_enrollment(uow, created.id, other_user_id)
+
+        respuesta = await HandleEnrollmentUseCase(
+            uow, _Usuarios(sin_genero=[other_user_id])
+        ).execute(
+            HandleEnrollmentRequestDTO(enrollment_id=enrollment.id.value, action="REJECT"),
+            creator_id,
+        )
+
+        assert respuesta.status == "REJECTED"
+
+    async def test_should_reject_enrollment_successfully(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        """
+        Given: Un enrollment en estado REQUESTED
+        When: El creador lo rechaza
+        Then: El enrollment pasa a REJECTED
+        """
+        created = await self._create_active_competition(uow, creator_id)
+        enrollment = await self._create_requested_enrollment(uow, created.id, other_user_id)
+
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        request = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment.id.value,
+            action="REJECT",
+        )
+        response = await use_case.execute(request, creator_id)
+
+        assert response.status == "REJECTED"
+        assert response.user_id == other_user_id.value
+
+    async def test_should_raise_enrollment_not_found(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Given: Un enrollment_id que no existe
+        When: Se intenta manejar
+        Then: Se lanza EnrollmentNotFoundError
+        """
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        request = HandleEnrollmentRequestDTO(
+            enrollment_id=uuid4(),
+            action="APPROVE",
+        )
+
+        with pytest.raises(EnrollmentNotFoundError):
+            await use_case.execute(request, creator_id)
+
+    async def test_should_raise_not_creator_error(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        """
+        Given: Un enrollment válido
+        When: Un usuario que NO es el creador intenta aprobar
+        Then: Se lanza NotCreatorError
+        """
+        created = await self._create_active_competition(uow, creator_id)
+        enrollment = await self._create_requested_enrollment(uow, created.id, other_user_id)
+
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        request = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment.id.value,
+            action="APPROVE",
+        )
+
+        with pytest.raises(NotCreatorError):
+            await use_case.execute(request, other_user_id)
+
+    async def test_should_succeed_when_admin_not_creator(
+        self,
+        uow: InMemoryUnitOfWork,
+        creator_id: UserId,
+        other_user_id: UserId,
+        admin_user_id: UserId,
+    ):
+        """
+        Given: Un enrollment válido en una competición ajena
+        When: Un admin (no creador) lo aprueba con is_admin=True
+        Then: El enrollment pasa a APPROVED sin lanzar NotCreatorError
+        """
+        created = await self._create_active_competition(uow, creator_id)
+        enrollment = await self._create_requested_enrollment(uow, created.id, other_user_id)
+
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        request = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment.id.value,
+            action="APPROVE",
+        )
+
+        response = await use_case.execute(request, admin_user_id, is_admin=True)
+
+        assert response.status == "APPROVED"
+
+    async def test_should_raise_validation_error_for_invalid_action(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        """
+        Given: Un enrollment válido
+        When: Se crea el DTO con una acción inválida
+        Then: Se lanza ValidationError en el DTO (Pydantic)
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            HandleEnrollmentRequestDTO(
+                enrollment_id=uuid4(),
+                action="INVALID",
+            )
+
+    async def test_should_raise_competition_full_when_approving_at_capacity(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Given: Una competición con max_players=2 y ya 2 aprobados (creator + 1)
+        When: El creador intenta aprobar otro enrollment
+        Then: Se lanza CompetitionFullViolation
+        """
+        # max_players=2, el creador ya ocupa 1 plaza (auto-enroll)
+        created = await self._create_active_competition(uow, creator_id, max_players=2)
+
+        # Crear un segundo jugador y aprobarlo para llenar la competición
+        player2_id = UserId(uuid4())
+        enrollment2 = await self._create_requested_enrollment(uow, created.id, player2_id)
+
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        approve_request = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment2.id.value,
+            action="APPROVE",
+        )
+        # Aprobar al segundo jugador (ahora hay 2 de 2)
+        response = await use_case.execute(approve_request, creator_id)
+        assert response.status == "APPROVED"
+
+        # Crear un tercer jugador e intentar aprobar
+        player3_id = UserId(uuid4())
+        enrollment3 = await self._create_requested_enrollment(uow, created.id, player3_id)
+
+        approve_request3 = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment3.id.value,
+            action="APPROVE",
+        )
+
+        # Traducida: la violación pelada llegaba como un 500 mudo (BE #372)
+        with pytest.raises(CompetitionFullError, match="completa"):
+            await use_case.execute(approve_request3, creator_id)
+
+    async def test_should_allow_reject_when_competition_is_full(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Given: Una competición llena (2/2)
+        When: El creador rechaza un enrollment pendiente
+        Then: Se rechaza correctamente (reject no verifica capacidad)
+        """
+        created = await self._create_active_competition(uow, creator_id, max_players=2)
+
+        # Llenar la competición: aprobar a un segundo jugador
+        player2_id = UserId(uuid4())
+        enrollment2 = await self._create_requested_enrollment(uow, created.id, player2_id)
+
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        approve_req = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment2.id.value,
+            action="APPROVE",
+        )
+        await use_case.execute(approve_req, creator_id)
+
+        # Crear un tercer jugador pendiente
+        player3_id = UserId(uuid4())
+        enrollment3 = await self._create_requested_enrollment(uow, created.id, player3_id)
+
+        # Rechazar debería funcionar aunque la competición esté llena
+        reject_req = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment3.id.value,
+            action="REJECT",
+        )
+        response = await use_case.execute(reject_req, creator_id)
+        assert response.status == "REJECTED"
+
+    async def test_should_raise_competition_not_found(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Given: Un enrollment cuya competición no existe
+        When: Se intenta manejar
+        Then: Se lanza CompetitionNotFoundError
+        """
+        # Crear enrollment con competition_id que no existe
+        fake_comp_id = CompetitionId(uuid4())
+        enrollment = Enrollment.request(
+            id=EnrollmentId.generate(),
+            competition_id=fake_comp_id,
+            user_id=UserId(uuid4()),
+        )
+        async with uow:
+            await uow.enrollments.add(enrollment)
+            await uow.commit()
+
+        use_case = HandleEnrollmentUseCase(uow, _Usuarios())
+        request = HandleEnrollmentRequestDTO(
+            enrollment_id=enrollment.id.value,
+            action="APPROVE",
+        )
+
+        with pytest.raises(CompetitionNotFoundError):
+            await use_case.execute(request, creator_id)
+
+    @pytest.mark.parametrize("accion", ["APPROVE", "REJECT"])
+    async def test_decide_con_el_estado_de_despues_del_bloqueo(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId, accion
+    ):
+        """Si la competición empieza mientras espera el bloqueo, la solicitud ya está
+        rechazada: aprobarla la pisaría (21 oct)."""
+        created = await self._create_active_competition(uow, creator_id)
+        enrollment = await self._create_requested_enrollment(uow, created.id, other_user_id)
+        bloquear = uow.competitions.find_by_id_for_update
+        leer = uow.enrollments.find_by_id
+
+        async def _otra_transaccion_la_rechaza_antes(competition_id):
+            # Lo que otra transacción guardó: un objeto nuevo con el estado nuevo
+            rechazada = copy.deepcopy(enrollment)
+            rechazada.reject()
+            await uow.enrollments.update(rechazada)
+            return await bloquear(competition_id)
+
+        async def _la_que_la_sesion_ya_tenia(_enrollment_id):
+            # Como el mapa de identidad de SQLAlchemy: sin relectura, la de antes
+            return enrollment
+
+        uow.competitions.find_by_id_for_update = _otra_transaccion_la_rechaza_antes
+        uow.enrollments.find_by_id = _la_que_la_sesion_ya_tenia
+
+        with pytest.raises(EnrollmentStateError):
+            await HandleEnrollmentUseCase(uow, _Usuarios()).execute(
+                HandleEnrollmentRequestDTO(enrollment_id=enrollment.id.value, action=accion),
+                creator_id,
+            )
+
+        async with uow:
+            guardada = await leer(enrollment.id)
+        assert guardada.status == EnrollmentStatus.REJECTED

@@ -1,0 +1,783 @@
+"""Competition State Transition Routes - activate, close, start, complete, cancel."""
+
+from typing import Literal
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+
+from src.config.dependencies import (
+    get_activate_competition_use_case,
+    get_actualizar_handicaps_use_case,
+    get_anular_programacion_use_case,
+    get_cancel_competition_use_case,
+    get_close_enrollments_use_case,
+    get_complete_competition_use_case,
+    get_current_user,
+    get_fill_captain_use_case,
+    get_list_my_handicaps_not_updated_use_case,
+    get_name_captains_use_case,
+    get_name_vice_captain_use_case,
+    get_programar_actualizacion_use_case,
+    get_reopen_enrollments_use_case,
+    get_revert_competition_status_use_case,
+    get_revert_competition_to_in_progress_use_case,
+    get_start_competition_use_case,
+    get_vista_de_competicion_use_case,
+)
+from src.config.rate_limit import limiter
+from src.modules.competition.application.dto.competition_dto import (
+    ActivateCompetitionRequestDTO,
+    CancelCompetitionRequestDTO,
+    CaptaincyResponseDTO,
+    CloseEnrollmentsRequestDTO,
+    CompetitionResponseDTO,
+    CompleteCompetitionRequestDTO,
+    FillCaptainRequestDTO,
+    HandicapUpdateLaunchedDTO,
+    HandicapUpdateRefusedDTO,
+    MyHandicapsNotUpdatedDTO,
+    NameCaptainsBodyDTO,
+    NameCaptainsRequestDTO,
+    NameCaptainsResponseDTO,
+    NameViceCaptainRequestDTO,
+    ReopenEnrollmentsRequestDTO,
+    RevertCompetitionStatusRequestDTO,
+    RevertCompetitionToInProgressRequestDTO,
+    ScheduledHandicapUpdateDTO,
+    ScheduleHandicapUpdateRequestDTO,
+    StartCompetitionRequestDTO,
+    TeamPlayerBodyDTO,
+)
+from src.modules.competition.application.dto.match_generation_block_dto import BlockedPlayerDTO
+from src.modules.competition.application.exceptions import (
+    ActualizacionEnCursoError,
+    ActualizacionNoPermitidaError,
+    CompetitionNotFoundError,
+    NotCompetitionCreatorError,
+    PendingGamesError,
+    RefrescoDesactivadoError,
+)
+from src.modules.competition.application.services.franjas_al_cerrar import (
+    PlayersWithoutTeeWindowError,
+)
+from src.modules.competition.application.services.handicaps_al_cerrar import (
+    PlayersWithoutHandicapError,
+)
+from src.modules.competition.application.use_cases.activate_competition_use_case import (
+    ActivateCompetitionUseCase,
+)
+from src.modules.competition.application.use_cases.actualizar_handicaps_use_case import (
+    ActualizarHandicapsUseCase,
+)
+from src.modules.competition.application.use_cases.cancel_competition_use_case import (
+    CancelCompetitionUseCase,
+)
+from src.modules.competition.application.use_cases.close_enrollments_use_case import (
+    CloseEnrollmentsUseCase,
+)
+from src.modules.competition.application.use_cases.complete_competition_use_case import (
+    CompleteCompetitionUseCase,
+)
+from src.modules.competition.application.use_cases.fill_captain_use_case import (
+    FillCaptainUseCase,
+)
+from src.modules.competition.application.use_cases.list_my_handicaps_not_updated_use_case import (
+    ListMyHandicapsNotUpdatedUseCase,
+)
+from src.modules.competition.application.use_cases.name_captains_use_case import (
+    NameCaptainsUseCase,
+)
+from src.modules.competition.application.use_cases.name_vice_captain_use_case import (
+    NameViceCaptainUseCase,
+)
+from src.modules.competition.application.use_cases.programar_actualizacion_use_case import (
+    AnularProgramacionUseCase,
+    ProgramarActualizacionUseCase,
+)
+from src.modules.competition.application.use_cases.reopen_enrollments_use_case import (
+    ReopenEnrollmentsUseCase,
+)
+from src.modules.competition.application.use_cases.revert_competition_status_use_case import (
+    RevertCompetitionStatusUseCase,
+)
+from src.modules.competition.application.use_cases.revert_competition_to_in_progress_use_case import (
+    RevertCompetitionToInProgressUseCase,
+)
+from src.modules.competition.application.use_cases.start_competition_use_case import (
+    StartCompetitionUseCase,
+)
+from src.modules.competition.application.use_cases.vista_de_competicion_use_case import (
+    VistaDeCompeticionUseCase,
+)
+from src.modules.competition.domain.entities.competition import (
+    CaptainNotEnrolledError,
+    CaptainsLockedError,
+    CompetitionStateError,
+    TeamsNotAssignedError,
+)
+from src.modules.competition.domain.services.ventana_de_actualizacion import (
+    MOTIVOS,
+    MOTIVOS_DE_LA_VENTANA,
+    MOTIVOS_SIN_VENTANA,
+    PREFIJO_A_ESA_HORA,
+    CodigoDeVentana,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.ryder_cup_setup import (
+    CaptainOnWrongTeamError,
+)
+from src.modules.user.application.dto.user_dto import UserResponseDTO
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.infrastructure.api.respuesta_con_codigo import respuesta_con_codigo
+
+# Aliases for shared exceptions
+CompleteNotFoundError = CompetitionNotFoundError
+CompleteNotCreatorError = NotCompetitionCreatorError
+RevertNotFoundError = CompetitionNotFoundError
+RevertNotCreatorError = NotCompetitionCreatorError
+RevertToInProgressNotFoundError = CompetitionNotFoundError
+RevertToInProgressNotCreatorError = NotCompetitionCreatorError
+ReopenNotFoundError = CompetitionNotFoundError
+ReopenNotCreatorError = NotCompetitionCreatorError
+
+router = APIRouter()
+
+
+# ======================================================================================
+# STATE TRANSITION ENDPOINTS
+# ======================================================================================
+
+
+@router.post(
+    "/{competition_id}/activate",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Activar competición (DRAFT → ACTIVE)",
+    description="Activa una competición para abrir inscripciones. Solo el creador.",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def activate_competition(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ActivateCompetitionUseCase = Depends(get_activate_competition_use_case),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """Transición de estado: DRAFT → ACTIVE."""
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = ActivateCompetitionRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/{competition_id}/close-enrollments",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Cerrar inscripciones (ACTIVE → CLOSED)",
+    description="Cierra las inscripciones de una competición. Solo el creador.",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def close_enrollments(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CloseEnrollmentsUseCase = Depends(get_close_enrollments_use_case),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """Transición de estado: ACTIVE → CLOSED."""
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = CloseEnrollmentsRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except PlayersWithoutTeeWindowError as e:
+        return respuesta_sin_franja(e)
+    except PlayersWithoutHandicapError as e:
+        return respuesta_sin_handicap(e)
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/{competition_id}/start",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Iniciar competición (CLOSED → IN_PROGRESS)",
+    description="Inicia el torneo. Solo el creador.",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def start_competition(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: StartCompetitionUseCase = Depends(get_start_competition_use_case),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """Transición de estado: CLOSED → IN_PROGRESS."""
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = StartCompetitionRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except PlayersWithoutTeeWindowError as e:
+        return respuesta_sin_franja(e)
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/{competition_id}/complete",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Completar competición (IN_PROGRESS → COMPLETED)",
+    description=(
+        "Finaliza el torneo. Solo el creador. 409 PENDING_GAMES si queda algún partido o "
+        "partida sin terminar."
+    ),
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def complete_competition(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CompleteCompetitionUseCase = Depends(get_complete_competition_use_case),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """
+    Transición de estado: IN_PROGRESS → COMPLETED.
+
+    409 `PENDING_GAMES` si queda algún partido de la Ryder o partida de stroke play
+    sin terminar (I1, 22 nov 2026), con cuántos de cada en `pending_matches` y
+    `pending_groups`; no se toca nada.
+    """
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = CompleteCompetitionRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except PendingGamesError as e:
+        # Texto fijo con cuántos, sin ids ni el de la excepción
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": (
+                    f"Finish or close what is still pending first: {e.partidos} Ryder "
+                    f"match(es) and {e.partidas} stroke play group(s)."
+                ),
+                "error_code": e.error_code,
+                "pending_matches": e.partidos,
+                "pending_groups": e.partidas,
+            },
+        )
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.put(
+    "/{competition_id}/revert-status",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Revertir competición a CLOSED (IN_PROGRESS → CLOSED)",
+    description="Revierte una competición para corregir el schedule. Solo el creador.",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def revert_competition_status(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: RevertCompetitionStatusUseCase = Depends(get_revert_competition_status_use_case),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """Transición de estado: IN_PROGRESS → CLOSED."""
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = RevertCompetitionStatusRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.put(
+    "/{competition_id}/revert-to-in-progress",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Revertir competición a IN_PROGRESS (COMPLETED → IN_PROGRESS)",
+    description="Reabre un torneo finalizado, p.ej. para añadir una ronda más. Solo el creador.",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def revert_competition_to_in_progress(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: RevertCompetitionToInProgressUseCase = Depends(
+        get_revert_competition_to_in_progress_use_case
+    ),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """Transición de estado: COMPLETED → IN_PROGRESS. No modifica rounds/matches existentes."""
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = RevertCompetitionToInProgressRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/{competition_id}/reopen-enrollments",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Reabrir inscripciones (CLOSED → ACTIVE)",
+    description="Reabre inscripciones para añadir o modificar jugadores. Solo el creador.",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def reopen_enrollments(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ReopenEnrollmentsUseCase = Depends(get_reopen_enrollments_use_case),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """Transición de estado: CLOSED → ACTIVE."""
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = ReopenEnrollmentsRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.post(
+    "/{competition_id}/cancel",
+    response_model=CompetitionResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Cancelar competición (cualquier estado → CANCELLED)",
+    description="Cancela una competición. Solo el creador.",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def cancel_competition(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CancelCompetitionUseCase = Depends(get_cancel_competition_use_case),
+    vista: VistaDeCompeticionUseCase = Depends(get_vista_de_competicion_use_case),
+):
+    """Transición de estado: cualquier estado → CANCELLED."""
+    try:
+        current_user_id = UserId(str(current_user.id))
+
+        request_dto = CancelCompetitionRequestDTO(competition_id=competition_id)
+        await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+        return await vista.de(
+            CompetitionId(competition_id), current_user_id, es_admin=current_user.is_admin
+        )
+
+    except (CompetitionStateError, ValueError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.put(
+    "/{competition_id}/captains",
+    response_model=NameCaptainsResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Nombrar a los capitanes (cierra las inscripciones)",
+    description=(
+        "Nombra a los dos capitanes, uno por equipo: dos inscritos aprobados, y "
+        "el organizador puede ser uno. Con las inscripciones abiertas, las cierra "
+        "(ACTIVE → CLOSED). Ya cerradas, los cambia mientras no haya equipos "
+        "repartidos. Con un número impar de inscritos responde `uneven_teams: "
+        "true`: es un aviso, no un bloqueo. Solo el creador o un administrador."
+    ),
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def name_captains(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    body: NameCaptainsBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: NameCaptainsUseCase = Depends(get_name_captains_use_case),
+):
+    """Nombra a los capitanes (BE #320)."""
+    try:
+        request_dto = NameCaptainsRequestDTO(
+            competition_id=competition_id,
+            team_a_captain_id=body.team_a_captain_id,
+            team_b_captain_id=body.team_b_captain_id,
+        )
+        return await use_case.execute(
+            request_dto, UserId(str(current_user.id)), is_admin=current_user.is_admin
+        )
+    except (
+        CaptainNotEnrolledError,
+        CaptainsLockedError,
+        CompetitionStateError,
+        ValueError,
+    ) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+# Errores de las dos rutas de capitanía de un equipo que son del que pide, no del
+# servidor: un equipo sin repartir, alguien de otro equipo, un puesto ocupado
+_ERRORES_DE_CAPITANIA = (
+    TeamsNotAssignedError,
+    CaptainOnWrongTeamError,
+    CaptainsLockedError,
+    CompetitionStateError,
+    ValueError,
+)
+
+
+@router.put(
+    "/{competition_id}/teams/{team}/vice-captain",
+    response_model=CaptaincyResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Nombrar al subcapitán de un equipo",
+    description=(
+        "Tras el draft, el capitán de un equipo elige a su subcapitán entre los "
+        "jugadores de ese equipo que siguen inscritos. También el organizador o un "
+        "administrador. Si el capitán se da de baja, asciende el subcapitán."
+    ),
+    tags=["Competitions - Teams"],
+)
+@limiter.limit("10/minute")
+async def name_vice_captain(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    team: Literal["A", "B"],
+    body: TeamPlayerBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: NameViceCaptainUseCase = Depends(get_name_vice_captain_use_case),
+):
+    """Nombra al subcapitán (BE #320)."""
+    try:
+        request_dto = NameViceCaptainRequestDTO(
+            competition_id=competition_id, team=team, player_id=body.player_id
+        )
+        return await use_case.execute(
+            request_dto, UserId(str(current_user.id)), is_admin=current_user.is_admin
+        )
+    except _ERRORES_DE_CAPITANIA as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+@router.put(
+    "/{competition_id}/teams/{team}/captain",
+    response_model=CaptaincyResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Cubrir el puesto de capitán de un equipo",
+    description=(
+        "Para cuando un capitán se da de baja tras el draft sin subcapitán que "
+        "ascienda: el organizador nombra a otro jugador de ese equipo. Solo cubre "
+        "un puesto vacío; no cambia a un capitán que sigue. Solo el creador o un "
+        "administrador."
+    ),
+    tags=["Competitions - Teams"],
+)
+@limiter.limit("10/minute")
+async def fill_captain(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    team: Literal["A", "B"],
+    body: TeamPlayerBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: FillCaptainUseCase = Depends(get_fill_captain_use_case),
+):
+    """Cubre el puesto vacío de capitán (BE #320)."""
+    try:
+        request_dto = FillCaptainRequestDTO(
+            competition_id=competition_id, team=team, player_id=body.player_id
+        )
+        return await use_case.execute(
+            request_dto, UserId(str(current_user.id)), is_admin=current_user.is_admin
+        )
+    except _ERRORES_DE_CAPITANIA as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+
+def respuesta_sin_franja(error: PlayersWithoutTeeWindowError) -> JSONResponse:
+    """Stableford o Medal con aprobados sin franja (#251): 400 con la lista."""
+    return respuesta_con_jugadores("PLAYERS_WITHOUT_TEE_WINDOW", error.players)
+
+
+# Genérico por código: los nombres van solo en `players`, que la pantalla pinta
+# (CodeQL, BE #562). Antes el detail era el mensaje de la excepción, con ellos
+_DETALLE_CON_JUGADORES: dict[str, str] = {
+    "PLAYERS_WITHOUT_TEE": "Hay jugadores sin barra asignada.",
+    "PLAYERS_WITHOUT_HANDICAP": "Hay jugadores sin hándicap.",
+    "PLAYERS_WITHOUT_TEE_WINDOW": "Hay jugadores sin franja.",
+}
+
+
+def respuesta_con_jugadores(codigo: str, jugadores) -> JSONResponse:
+    """El formato de «jugadores sin barras»: `error_code` en la raíz y la lista."""
+    return respuesta_con_codigo(
+        status.HTTP_400_BAD_REQUEST,
+        _DETALLE_CON_JUGADORES,
+        codigo,
+        players=[
+            BlockedPlayerDTO(
+                user_id=p.user_id.value, name=p.name, missing=p.missing, tee_color=p.tee_color
+            ).model_dump(mode="json")
+            for p in jugadores
+        ],
+    )
+
+
+def respuesta_sin_handicap(error: PlayersWithoutHandicapError) -> JSONResponse:
+    """
+    Stableford o Medal con inscritos sin hándicap (#251): 400 con la lista.
+
+    En el mismo formato que «jugadores sin barras»: claves y no frases (24 sep),
+    `error_code` en la raíz y `detail` para quien aún no lo lee.
+    """
+    return respuesta_con_jugadores("PLAYERS_WITHOUT_HANDICAP", error.players)
+
+
+# ======================================================================================
+# ACTUALIZAR HÁNDICAPS (#251)
+# ======================================================================================
+
+
+@router.post(
+    "/{competition_id}/handicap-updates",
+    response_model=HandicapUpdateLaunchedDTO,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Actualizar los hándicaps con la RFEG",
+    description=(
+        "El organizador pide a la RFEG los hándicaps de sus jugadores, en segundo plano. "
+        "Si la última quedó a medias, termina solo lo que falta. Desde el cierre de "
+        "inscripciones hasta 10 s por jugador antes de la siguiente salida, nunca con una "
+        "jornada en marcha; en una Ryder, hasta iniciar."
+    ),
+    tags=["Competitions - State Transitions"],
+    responses={
+        400: {
+            "model": HandicapUpdateRefusedDTO,
+            "description": (
+                "Fuera de la ventana. Lleva `error_code` HANDICAP_UPDATE_NOT_ALLOWED y "
+                "`reason_code` (#541): STATUS, NO_WINDOWS, RYDER, DAY_IN_PLAY, NO_DAYS_LEFT, "
+                "TOO_CLOSE, NO_TIMEZONE y, al programar, IN_THE_PAST o TOO_TIGHT. "
+                "El 409 lleva RUNNING (ya en marcha) o DISABLED (apagada)."
+            ),
+        },
+        409: {
+            "model": HandicapUpdateRefusedDTO,
+            "description": "Ya en marcha (reason_code RUNNING) o apagada (DISABLED).",
+        },
+    },
+)
+@limiter.limit("10/minute")
+async def update_handicaps(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ActualizarHandicapsUseCase = Depends(get_actualizar_handicaps_use_case),
+):
+    """202 con la actualización lanzada; cómo va se ve en la ficha (`handicap_update`)."""
+    try:
+        actualizacion, reanudada = await use_case.execute(
+            CompetitionId(competition_id),
+            UserId(str(current_user.id)),
+            is_admin=current_user.is_admin,
+        )
+    except ActualizacionNoPermitidaError as e:
+        return _no_permitida(e)
+    except (ActualizacionEnCursoError, RefrescoDesactivadoError) as e:
+        return _conflicto(e)
+    return HandicapUpdateLaunchedDTO(
+        id=actualizacion.id,
+        origin=actualizacion.origen.value,
+        started_at=actualizacion.creada,
+        resumed=reanudada,
+    )
+
+
+@router.put(
+    "/{competition_id}/handicap-updates/schedule",
+    response_model=ScheduledHandicapUpdateDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Programar la actualización de hándicaps",
+    description=(
+        "Una por competición: programar otra vez la sustituye. Futura y dentro de la "
+        "ventana del botón en esa hora. Si al llegar la ventana está cerrada, no se lanza "
+        "y se avisa al organizador."
+    ),
+    tags=["Competitions - State Transitions"],
+    responses={
+        400: {
+            "model": HandicapUpdateRefusedDTO,
+            "description": (
+                "Fuera de la ventana. Lleva `error_code` HANDICAP_UPDATE_NOT_ALLOWED y "
+                "`reason_code` (#541): STATUS, NO_WINDOWS, RYDER, DAY_IN_PLAY, NO_DAYS_LEFT, "
+                "TOO_CLOSE, NO_TIMEZONE y, al programar, IN_THE_PAST o TOO_TIGHT. "
+                "El 409 lleva RUNNING (ya en marcha) o DISABLED (apagada)."
+            ),
+        },
+        409: {
+            "model": HandicapUpdateRefusedDTO,
+            "description": "Ya en marcha (reason_code RUNNING) o apagada (DISABLED).",
+        },
+    },
+)
+@limiter.limit("10/minute")
+async def schedule_handicap_update(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    body: ScheduleHandicapUpdateRequestDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ProgramarActualizacionUseCase = Depends(get_programar_actualizacion_use_case),
+):
+    """200 con la hora programada; se ve en la ficha (`handicap_update_window.scheduled_at`)."""
+    try:
+        para = await use_case.execute(
+            CompetitionId(competition_id),
+            UserId(str(current_user.id)),
+            body.run_at,
+            is_admin=current_user.is_admin,
+        )
+    except ActualizacionNoPermitidaError as e:
+        return _no_permitida(e, al_programar=True)
+    except RefrescoDesactivadoError as e:
+        return _conflicto(e)
+    return ScheduledHandicapUpdateDTO(run_at=para)
+
+
+@router.delete(
+    "/{competition_id}/handicap-updates/schedule",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Anular la actualización de hándicaps programada",
+    tags=["Competitions - State Transitions"],
+)
+@limiter.limit("10/minute")
+async def cancel_scheduled_handicap_update(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: AnularProgramacionUseCase = Depends(get_anular_programacion_use_case),
+):
+    """204 aunque no hubiera ninguna."""
+    await use_case.execute(
+        CompetitionId(competition_id),
+        UserId(str(current_user.id)),
+        is_admin=current_user.is_admin,
+    )
+
+
+@router.get(
+    "/me/handicaps-not-updated",
+    response_model=MyHandicapsNotUpdatedDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Mis hándicaps sin actualizar con la RFEG",
+    description=(
+        "Alimenta el bloque «Requiere tu Atención» del panel (15 nov 2026). "
+        "`as_organizer`: cada competición que organiza quien pregunta con jugadores sin "
+        "actualizar con la RFEG (los españoles, y todos si la competición es en España). "
+        "`as_player`: cada competición en la que la RFEG no encontró su hándicap (solo "
+        "jugadores españoles; si la RFEG falló, no sale). Solo de competiciones cerradas y "
+        "sin empezar, con la última actualización terminada; deja de salir al empezar la "
+        "competición o al actualizarse el hándicap. Vacío casi siempre."
+    ),
+    tags=["Competitions - State Transitions"],
+)
+# Lo dispara el panel de TODO el mundo en cada montaje, como los sobres
+# pendientes: con el cubo unico de produccion (ADR-038), 60/min daria 429 mudos
+@limiter.limit("300/minute")
+async def list_my_handicaps_not_updated(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ListMyHandicapsNotUpdatedUseCase = Depends(
+        get_list_my_handicaps_not_updated_use_case
+    ),
+):
+    """Lo que tengo que mirar de los hándicaps con la RFEG (15 nov 2026)."""
+    return await use_case.execute(UserId(str(current_user.id)))
+
+
+# El texto de cada motivo, fijo y no el de la excepción (CodeQL, BE #562): las
+# constantes del dominio, sin copiarlas
+_DETALLE_AL_ACTUALIZAR = MOTIVOS
+# Al programar, la ventana se mira a la hora pedida
+_DETALLE_AL_PROGRAMAR = {
+    **{c: f"{PREFIJO_A_ESA_HORA}{t}" for c, t in MOTIVOS_DE_LA_VENTANA.items()},
+    **MOTIVOS_SIN_VENTANA,
+}
+
+
+def _no_permitida(error: ActualizacionNoPermitidaError, al_programar: bool = False) -> JSONResponse:
+    """El 400 con el motivo como código, para decirlo en el idioma de la app (#541)."""
+    return respuesta_con_codigo(
+        status.HTTP_400_BAD_REQUEST,
+        _DETALLE_AL_PROGRAMAR if al_programar else _DETALLE_AL_ACTUALIZAR,
+        error.codigo,
+        error_code="HANDICAP_UPDATE_NOT_ALLOWED",
+        reason_code=error.codigo,
+    )
+
+
+def _conflicto(error: Exception) -> JSONResponse:
+    """El 409 con el mismo código que la ventana: RUNNING o DISABLED (#541)."""
+    codigo = (
+        CodigoDeVentana.RUNNING
+        if isinstance(error, ActualizacionEnCursoError)
+        else CodigoDeVentana.DISABLED
+    )
+    return respuesta_con_codigo(
+        status.HTTP_409_CONFLICT,
+        _DETALLE_AL_ACTUALIZAR,
+        codigo,
+        error_code="HANDICAP_UPDATE_NOT_ALLOWED",
+        reason_code=codigo,
+    )

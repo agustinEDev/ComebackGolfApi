@@ -1,0 +1,211 @@
+"""Tests para SendFriendRequestUseCase."""
+
+from unittest.mock import AsyncMock
+
+import pytest
+
+from src.modules.social.application.dto.friendship_dto import SendFriendRequestRequestDTO
+from src.modules.social.application.exceptions import AddresseeNotFoundError
+from src.modules.social.application.use_cases.send_friend_request_use_case import (
+    SendFriendRequestUseCase,
+)
+from src.modules.social.domain.entities.friendship import Friendship
+from src.modules.social.domain.exceptions.social_violations import (
+    BlockedUserViolation,
+    DuplicateFriendRequestViolation,
+    SelfFriendRequestViolation,
+)
+from src.modules.social.domain.value_objects.friendship_id import FriendshipId
+from src.modules.social.infrastructure.persistence.in_memory.in_memory_social_unit_of_work import (
+    InMemorySocialUnitOfWork,
+)
+from src.modules.user.domain.entities.user import User
+from src.modules.user.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork as UserInMemoryUoW,
+)
+
+pytestmark = pytest.mark.asyncio
+
+
+class TestSendFriendRequestUseCase:
+    @pytest.fixture
+    def uow(self):
+        return InMemorySocialUnitOfWork()
+
+    @pytest.fixture
+    def user_uow(self):
+        return UserInMemoryUoW()
+
+    async def _create_user(self, user_uow, email):
+        user = User.create(
+            first_name="Test",
+            last_name="User",
+            email_str=email,
+            plain_password="SecureP@ssw0rd123",
+        )
+        async with user_uow:
+            await user_uow.users.save(user)
+        return user
+
+    async def test_send_request_success(self, uow, user_uow):
+        requester = await self._create_user(user_uow, "requester@test.com")
+        addressee = await self._create_user(user_uow, "addressee@test.com")
+
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+        response = await use_case.execute(
+            SendFriendRequestRequestDTO(
+                requester_id=requester.id.value, addressee_id=addressee.id.value
+            )
+        )
+
+        assert response.status == "PENDING"
+        assert response.requester_id == requester.id.value
+        assert response.addressee_id == addressee.id.value
+
+    async def test_self_request_raises(self, uow, user_uow):
+        user = await self._create_user(user_uow, "solo@test.com")
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+
+        with pytest.raises(SelfFriendRequestViolation):
+            await use_case.execute(
+                SendFriendRequestRequestDTO(requester_id=user.id.value, addressee_id=user.id.value)
+            )
+
+    async def test_addressee_not_found_raises(self, uow, user_uow):
+        requester = await self._create_user(user_uow, "requester2@test.com")
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+
+        from uuid import uuid4
+
+        with pytest.raises(AddresseeNotFoundError):
+            await use_case.execute(
+                SendFriendRequestRequestDTO(requester_id=requester.id.value, addressee_id=uuid4())
+            )
+
+    async def test_d1_a_deactivated_account_answers_like_a_missing_one(self, uow, user_uow):
+        """D1 (auditoría de la fase 6, B-13): a una cuenta desactivada, lo mismo que a
+        una que no existe, y sin guardar nada."""
+        requester = await self._create_user(user_uow, "requester-d1@test.com")
+        addressee = await self._create_user(user_uow, "desactivada@test.com")
+        addressee.deactivate()
+        async with user_uow:
+            await user_uow.users.save(addressee)
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+
+        with pytest.raises(AddresseeNotFoundError):
+            await use_case.execute(
+                SendFriendRequestRequestDTO(
+                    requester_id=requester.id.value, addressee_id=addressee.id.value
+                )
+            )
+
+        async with uow:
+            assert await uow.friendships.find_by_pair(requester.id, addressee.id) is None
+
+    async def test_duplicate_pending_request_raises(self, uow, user_uow):
+        requester = await self._create_user(user_uow, "requester3@test.com")
+        addressee = await self._create_user(user_uow, "addressee3@test.com")
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+        dto = SendFriendRequestRequestDTO(
+            requester_id=requester.id.value, addressee_id=addressee.id.value
+        )
+
+        await use_case.execute(dto)
+
+        with pytest.raises(DuplicateFriendRequestViolation):
+            await use_case.execute(dto)
+
+    async def test_blocked_relationship_raises(self, uow, user_uow):
+        """Quien bloqueó y escribe: el 403 del bloqueo. Al revés, ver test_pistas_del_bloqueo."""
+        requester = await self._create_user(user_uow, "requester4@test.com")
+        addressee = await self._create_user(user_uow, "addressee4@test.com")
+
+        blocked = Friendship.create_blocked(
+            id=FriendshipId.generate(),
+            blocker_id=requester.id,
+            blocked_id=addressee.id,
+        )
+        async with uow:
+            await uow.friendships.add(blocked)
+
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+        with pytest.raises(BlockedUserViolation):
+            await use_case.execute(
+                SendFriendRequestRequestDTO(
+                    requester_id=requester.id.value, addressee_id=addressee.id.value
+                )
+            )
+
+    async def test_resend_after_declined_creates_new_pending(self, uow, user_uow):
+        requester = await self._create_user(user_uow, "requester5@test.com")
+        addressee = await self._create_user(user_uow, "addressee5@test.com")
+
+        declined = Friendship.create(
+            id=FriendshipId.generate(), requester_id=requester.id, addressee_id=addressee.id
+        )
+        declined.decline()
+        async with uow:
+            await uow.friendships.add(declined)
+
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+        response = await use_case.execute(
+            SendFriendRequestRequestDTO(
+                requester_id=requester.id.value, addressee_id=addressee.id.value
+            )
+        )
+
+        assert response.status == "PENDING"
+        assert response.id != declined.id.value
+
+    async def test_should_call_email_service_on_success(self, uow, user_uow):
+        """Email service se llama con los parametros correctos al enviar la solicitud."""
+        requester = await self._create_user(user_uow, "requester6@test.com")
+        addressee = await self._create_user(user_uow, "addressee6@test.com")
+
+        mock_email = AsyncMock()
+        mock_email.send_friend_request_email = AsyncMock(return_value=True)
+
+        use_case = SendFriendRequestUseCase(uow, user_uow, email_service=mock_email)
+        response = await use_case.execute(
+            SendFriendRequestRequestDTO(
+                requester_id=requester.id.value, addressee_id=addressee.id.value
+            )
+        )
+
+        assert response.status == "PENDING"
+        mock_email.send_friend_request_email.assert_awaited_once()
+        call_kwargs = mock_email.send_friend_request_email.call_args[1]
+        assert call_kwargs["to_email"] == "addressee6@test.com"
+        assert call_kwargs["addressee_name"] == "Test User"
+        assert call_kwargs["requester_name"] == "Test User"
+
+    async def test_should_create_friendship_even_if_email_fails(self, uow, user_uow):
+        """La solicitud se crea aunque el envio del email falle."""
+        requester = await self._create_user(user_uow, "requester7@test.com")
+        addressee = await self._create_user(user_uow, "addressee7@test.com")
+
+        mock_email = AsyncMock()
+        mock_email.send_friend_request_email = AsyncMock(side_effect=Exception("SMTP error"))
+
+        use_case = SendFriendRequestUseCase(uow, user_uow, email_service=mock_email)
+        response = await use_case.execute(
+            SendFriendRequestRequestDTO(
+                requester_id=requester.id.value, addressee_id=addressee.id.value
+            )
+        )
+
+        assert response.status == "PENDING"
+
+    async def test_no_email_sent_when_email_service_not_provided(self, uow, user_uow):
+        """Sin email_service inyectado (default None), no debe intentarse enviar nada."""
+        requester = await self._create_user(user_uow, "requester8@test.com")
+        addressee = await self._create_user(user_uow, "addressee8@test.com")
+
+        use_case = SendFriendRequestUseCase(uow, user_uow)
+        response = await use_case.execute(
+            SendFriendRequestRequestDTO(
+                requester_id=requester.id.value, addressee_id=addressee.id.value
+            )
+        )
+
+        assert response.status == "PENDING"

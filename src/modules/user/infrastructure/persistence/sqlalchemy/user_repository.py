@@ -1,0 +1,300 @@
+from collections.abc import Collection
+from typing import Any
+
+from sqlalchemy import ColumnElement, and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.repositories.user_repository_interface import (
+    UserRepositoryInterface,
+)
+from src.modules.user.domain.value_objects.email import Email
+from src.modules.user.domain.value_objects.token_hash import hash_del_enlace
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.modules.user.infrastructure.persistence.sqlalchemy.mappers import users_table
+from src.shared.infrastructure.persistence.leidos_en_la_sesion import recordar, ya_leido
+
+
+class SQLAlchemyUserRepository(UserRepositoryInterface):
+    """
+    Implementación asíncrona del repositorio de usuarios con SQLAlchemy.
+    """
+
+    MIN_NAME_PARTS = 2
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    async def save(self, user: User) -> None:
+        """Guarda un usuario en la base de datos."""
+        self._session.add(user)
+
+    async def find_by_id(self, user_id: UserId) -> User | None:
+        """
+        Busca un usuario por su ID. Una vez por petición: la sesión y el creador
+        de una ficha eran la misma lectura (PR 2 de rendimiento).
+        """
+        if (ya := ya_leido(self._session, User, user_id, ())) is not None:
+            return ya
+        usuario = await self._session.get(User, user_id)
+        if usuario is not None:
+            recordar(self._session, User, user_id, usuario)
+        return usuario
+
+    async def lock_for_sessions(self, user_id: UserId) -> None:
+        """SELECT … FOR KEY SHARE de la fila del usuario (ver la interfaz, F-02)."""
+        await self._session.execute(
+            select(users_table.c.id)
+            .where(users_table.c.id == str(user_id.value))
+            .with_for_update(read=True, key_share=True)
+        )
+
+    async def find_by_id_for_update(self, user_id: UserId) -> User | None:
+        """
+        Busca un usuario por su ID con bloqueo de fila (SELECT ... FOR UPDATE).
+
+        Serializa transacciones concurrentes sobre el mismo usuario (p.ej. subidas
+        de avatar simultáneas) para que operaciones read-modify-write como podar
+        el historial FIFO no se pisen entre sí.
+
+        `populate_existing`: si el usuario ya estaba en la sesión (lo carga
+        get_current_user en la misma petición), sin él SQLAlchemy devolvería
+        esa copia vieja aunque el SELECT ... FOR UPDATE haya leído la fila
+        actual, y quien esperaba el bloqueo escribiría sobre datos ya
+        cambiados por la otra transacción.
+        """
+        return await self._session.get(User, user_id, with_for_update=True, populate_existing=True)
+
+    async def find_by_ids(self, user_ids: list[UserId]) -> list[User]:
+        """Busca múltiples usuarios por sus IDs en una sola consulta."""
+        if not user_ids:
+            return []
+        statement = select(User).where(User._id.in_([str(uid) for uid in user_ids]))
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_email(self, email: Email) -> User | None:
+        """Busca un usuario por su email."""
+        # _email es un composite(Email, "_email_value"): comparar contra el VO completo
+        statement = select(User).where(User._email == email)
+        result = await self._session.execute(statement)
+        return result.scalar_one_or_none()
+
+    def _search_filter(self, search: str | None):
+        """Construye la condición ILIKE compartida por find_all/count_all."""
+        if not search or not search.strip():
+            return None
+        q = search.strip().lower()
+        return or_(
+            func.lower(User._first_name).contains(q, autoescape=True),
+            func.lower(User._last_name).contains(q, autoescape=True),
+            func.lower(User._first_name + " " + User._last_name).contains(q, autoescape=True),
+            func.lower(User._email_value).contains(q, autoescape=True),
+            # El alias tambien: quien administra ve el nombre legal, pero si
+            # busca por el apodo que le han dado tiene que encontrar la cuenta.
+            # LOWER(NULL) es NULL, asi que las cuentas sin alias no se pierden:
+            # siguen entrando por cualquiera de las otras ramas del OR
+            func.lower(User._alias).contains(q, autoescape=True),
+        )
+
+    def _build_filters(
+        self,
+        search: str | None,
+        is_admin: bool | None,
+        is_active: bool | None,
+        email_verified: bool | None,
+    ) -> list:
+        conditions = []
+        search_condition = self._search_filter(search)
+        if search_condition is not None:
+            conditions.append(search_condition)
+        if is_admin is not None:
+            conditions.append(User._is_admin == is_admin)
+        if is_active is not None:
+            conditions.append(User._is_active == is_active)
+        if email_verified is not None:
+            conditions.append(User._email_verified == email_verified)
+        return conditions
+
+    async def find_all(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        search: str | None = None,
+        is_admin: bool | None = None,
+        is_active: bool | None = None,
+        email_verified: bool | None = None,
+    ) -> list[User]:
+        """Devuelve una página de usuarios, opcionalmente filtrada."""
+        statement = select(User).order_by(User._created_at.desc(), User._id.desc())
+        for condition in self._build_filters(search, is_admin, is_active, email_verified):
+            statement = statement.where(condition)
+        statement = statement.limit(limit).offset(offset)
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def delete_by_id(self, user_id: UserId) -> bool:
+        """Elimina un usuario por su ID. Devuelve True si existía y se eliminó."""
+        user = await self.find_by_id(user_id)
+        if not user:
+            return False
+        await self._session.delete(user)
+        return True
+
+    async def update(self, user: User) -> None:
+        """
+        Actualiza un usuario.
+        SQLAlchemy lo maneja automáticamente al hacer commit si el objeto ya existe.
+        """
+        self._session.add(user)
+
+    async def find_by_alias(self, alias: str) -> User | None:
+        """
+        Busca un usuario por alias, ignorando mayúsculas.
+
+        `LOWER(alias) = LOWER(:alias)` es exactamente la expresión del índice
+        único `ix_users_alias_lower`, así que esta consulta lo usa.
+        """
+        normalized = alias.strip()
+        if not normalized:
+            return None
+        statement = select(User).filter(func.lower(User._alias) == normalized.lower())
+        result = await self._session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def find_by_full_name(self, full_name: str) -> User | None:
+        """
+        Busca un usuario ACTIVO por su nombre completo.
+
+        La desactivada se descarta en la consulta (F7, fase 3): descartarla después
+        dejaba sin encontrar a la activa del mismo nombre, o fallaba con dos filas.
+        """
+        # Separar el nombre completo en palabras para buscar
+        name_parts = full_name.strip().split()
+        if len(name_parts) < self.MIN_NAME_PARTS:
+            return None
+
+        # Todas las cuentas activas que casan, con cualquier forma de partir el nombre, en
+        # UNA consulta (un mismo instante: entre dos consultas, un cambio de nombre podía
+        # esconder la ambigüedad; CodeRabbit). Si hay más de una, «no encontrado»:
+        # devolver una podría llevar una invitación a quien no es (S-16; antes,
+        # scalar_one_or_none daba 500 con dos iguales). Cada cuenta casa con una sola
+        # forma de partir, así que dos filas son dos personas
+
+        def _normalizado(columna: Any) -> ColumnElement[str]:
+            # Sin mayúsculas ni espacios repetidos, como lo buscado (y como en memoria)
+            return func.regexp_replace(func.lower(func.trim(columna)), r"\s+", " ", "g")
+
+        formas = [
+            and_(
+                _normalizado(User._first_name) == " ".join(name_parts[:i]).lower(),
+                _normalizado(User._last_name) == " ".join(name_parts[i:]).lower(),
+            )
+            for i in range(1, len(name_parts))
+        ]
+        statement = select(User).filter(User._is_active.is_(True), or_(*formas)).limit(2)
+        result = await self._session.execute(statement)
+        encontrados = result.scalars().all()
+        return encontrados[0] if len(encontrados) == 1 else None
+
+    MIN_SEARCH_LENGTH = 2
+
+    async def search_by_partial_name(
+        self,
+        query: str,
+        limit: int = 10,
+        exclude_user_id: UserId | None = None,
+        exclude_user_ids: Collection[UserId] = (),
+    ) -> list[User]:
+        """
+        Searches active users by partial name or alias match using ILIKE.
+
+        Requires at least 2 characters. El alias entra en la busqueda porque es
+        justo lo que otra gente teclea para encontrarte: sin esto, ponerse un
+        apodo te hacia invisible para quien solo lo conoce por el.
+
+        Las cuentas desactivadas se excluyen: cualquiera puede buscar por
+        nombre, así que dejarlas visibles significa exponer a quien pidió
+        desactivarse y permitir solicitudes de amistad que nunca verá. El
+        listado de administración sí las muestra, que es donde tiene sentido.
+
+        Quien busca se queda fuera en la propia consulta, no después: si no,
+        se encontraba a sí mismo y ocupaba uno de los huecos del límite (FE #938).
+        """
+        query = query.strip()
+        if len(query) < self.MIN_SEARCH_LENGTH:
+            return []
+        q = query.lower()
+        statement = select(User).filter(
+            User._is_active.is_(True),
+            or_(
+                func.lower(User._first_name).contains(q, autoescape=True),
+                func.lower(User._last_name).contains(q, autoescape=True),
+                func.lower(User._first_name + " " + User._last_name).contains(q, autoescape=True),
+                func.lower(User._alias).contains(q, autoescape=True),
+            ),
+        )
+        if exclude_user_id is not None:
+            statement = statement.filter(User._id != str(exclude_user_id))
+        # Quienes bloquearon a quien busca (F-09), también en la consulta
+        if exclude_user_ids:
+            fuera = [str(u) for u in exclude_user_ids]
+            statement = statement.filter(User._id.not_in(fuera))
+        # Por apellido, nombre e id: sin orden, con más coincidencias que el
+        # límite cada petición podía devolver otras distintas (/code-review)
+        statement = statement.order_by(User._last_name, User._first_name, User._id).limit(limit)
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def exists_by_email(self, email: Email) -> bool:
+        """Verifica si un usuario existe por su email."""
+        # _email es un composite(Email, "_email_value"): comparar contra el VO completo
+        statement = select(func.count()).select_from(User).where(User._email == email)
+        result = await self._session.execute(statement)
+        return result.scalar_one() > 0
+
+    async def count_all(
+        self,
+        search: str | None = None,
+        is_admin: bool | None = None,
+        is_active: bool | None = None,
+        email_verified: bool | None = None,
+    ) -> int:
+        """Cuenta usuarios, opcionalmente filtrados (ver find_all)."""
+        statement = select(func.count()).select_from(User)
+        for condition in self._build_filters(search, is_admin, is_active, email_verified):
+            statement = statement.where(condition)
+        result = await self._session.execute(statement)
+        return result.scalar_one()
+
+    async def find_by_verification_token(self, token: str) -> User | None:
+        """Busca un usuario por su token de verificación: por su SHA-256, que es lo que se
+        guarda (fase 3, C3). Un token guardado en claro antes del cambio no se encuentra."""
+        if not token:
+            return None
+        token_hash = hash_del_enlace(token)
+        statement = select(User).filter_by(_verification_token=token_hash)
+        result = await self._session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def find_by_password_reset_token(self, token: str) -> User | None:
+        """
+        Busca un usuario por su token de reseteo de contraseña.
+
+        Args:
+            token: Token de reseteo generado con User.generate_password_reset_token()
+
+        Returns:
+            User encontrado o None si no existe
+
+        Note:
+            - Busca por el SHA-256 del token, que es lo que se guarda (fase 3, C3)
+            - Usa índice ix_users_password_reset_token para búsqueda rápida
+            - NO valida expiración (esa lógica está en User.can_reset_password())
+        """
+        if not token:
+            return None
+        token_hash = hash_del_enlace(token)
+        statement = select(User).filter_by(_password_reset_token=token_hash)
+        result = await self._session.execute(statement)
+        return result.scalar_one_or_none()

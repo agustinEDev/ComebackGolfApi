@@ -1,0 +1,149 @@
+"""
+QuickMatch Repository Interface - Domain Layer.
+"""
+
+from abc import ABC, abstractmethod
+
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.user.domain.value_objects.user_id import UserId
+
+from ..entities.quick_match import QuickMatch
+from ..value_objects.quick_match_id import QuickMatchId
+from ..value_objects.quick_match_status import QuickMatchStatus
+
+
+class QuickMatchRepositoryInterface(ABC):
+    """Interfaz para el repositorio de partidas rapidas."""
+
+    @abstractmethod
+    async def add(self, quick_match: QuickMatch) -> None:
+        pass
+
+    @abstractmethod
+    async def update(self, quick_match: QuickMatch) -> None:
+        pass
+
+    @abstractmethod
+    async def delete(self, quick_match: QuickMatch) -> None:
+        """
+        Borra la partida de verdad, y con ella sus golpes. Es lo que pasa cuando
+        la han tirado a la papelera todos los que podian
+        (`QuickMatch.is_trashed_by_everyone`). Borrar una que no esta guardada
+        no hace nada.
+
+        Lo que salio de ella en Actividad no es de este repositorio: lo borra
+        quien orquesta, en la misma transaccion.
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_id(self, quick_match_id: QuickMatchId) -> QuickMatch | None:
+        pass
+
+    @abstractmethod
+    async def find_by_ids(self, quick_match_ids: list[QuickMatchId]) -> list[QuickMatch]:
+        """Las que existan de esas, en una sola lectura; sin ids, ninguna."""
+        pass
+
+    @abstractmethod
+    async def find_by_id_for_update(self, quick_match_id: QuickMatchId) -> QuickMatch | None:
+        """
+        Como `find_by_id`, pero bloqueando la fila (row-level lock) hasta el
+        commit/rollback de la transaccion actual. Uso obligatorio en flujos
+        de carga-y-mutacion del roster (p.ej. add_participant) para evitar
+        que altas concurrentes superen el aforo del equipo.
+        """
+        pass
+
+    @abstractmethod
+    async def list_for_user(
+        self,
+        user_id: UserId,
+        status: QuickMatchStatus | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        golf_course_id: GolfCourseId | None = None,
+    ) -> list[QuickMatch]:
+        """
+        Lista partidas rapidas en las que el usuario es participante, la ultima
+        jugada primero. Con `golf_course_id`, solo las de ese campo.
+        """
+        pass
+
+    @abstractmethod
+    async def list_for_stats(
+        self,
+        user_id: UserId,
+        status: QuickMatchStatus | None = None,
+        limit: int | None = None,
+    ) -> list[QuickMatch]:
+        """
+        Partidas que cuentan en las estadisticas del usuario: descarta tanto las
+        que oculto de su historial como las que dejo fuera de sus estadisticas.
+        """
+        pass
+
+    @abstractmethod
+    async def count_for_user(
+        self,
+        user_id: UserId,
+        status: QuickMatchStatus | None = None,
+        golf_course_id: GolfCourseId | None = None,
+    ) -> int:
+        pass
+
+    @abstractmethod
+    async def count_all(self) -> int:
+        """Cuenta el total de partidas rapidas en el sistema (estadisticas de admin)."""
+        pass
+
+    @abstractmethod
+    async def exists_created_by(self, creator_id: UserId) -> bool:
+        """
+        True si el usuario ha creado alguna partida rapida.
+
+        Util para bloquear el borrado definitivo de una cuenta: quick_matches.creator_id
+        tiene ON DELETE CASCADE, asi que borrar al creador borraria la partida entera
+        (incluyendo a otros participantes) si no se bloquea antes.
+        """
+        pass
+
+    @abstractmethod
+    async def list_shared_by(
+        self, user_id: UserId, other_id: UserId, status: QuickMatchStatus
+    ) -> list[QuickMatch]:
+        """
+        Las partidas en ese estado donde juegan los dos y que ninguno oculto.
+
+        Basta con que uno la haya quitado de su lista (la papelera) para que deje
+        de ser «de los dos»: es lo que se enseña en el perfil del otro (BE-3).
+        """
+        pass
+
+    @abstractmethod
+    async def list_completed_for_users(self, user_ids: list[UserId]) -> list[QuickMatch]:
+        """
+        Todas las partidas terminadas en las que participa alguno de ellos,
+        tambien las que tenga en su papelera, sin tope ni orden: el historial
+        de campos tiene que ver hasta lo mas antiguo (22 oct 2026).
+        """
+        pass
+
+    @abstractmethod
+    async def find_trashed_with_participant(self, user_id: UserId) -> list[QuickMatchId]:
+        """
+        Las partidas en las que ese jugador participa y que alguien tiene en la
+        papelera, en cualquier estado: las unicas que pueden haber quedado
+        «tiradas por todos» al irse el (su cuenta se borra). Solo los ids: cada
+        una se vuelve a leer, con bloqueo, antes de decidir.
+        """
+        pass
+
+    @abstractmethod
+    async def list_open(self) -> list[QuickMatch]:
+        """
+        Las partidas sin terminar (PENDING o IN_PROGRESS), de todos: las que
+        el proceso periódico mira para cerrarlas solas (23 oct 2026), de la más
+        antigua a la más nueva.
+        """
+        pass

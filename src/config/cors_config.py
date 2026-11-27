@@ -1,0 +1,266 @@
+"""
+CORS Configuration for Comeback Golf API
+
+Este módulo centraliza la configuración de CORS (Cross-Origin Resource Sharing)
+para proteger el backend contra accesos no autorizados desde orígenes externos.
+
+OWASP Coverage:
+- A05: Security Misconfiguration (whitelist estricta de orígenes)
+- A01: Broken Access Control (control de acceso a nivel de origen)
+
+Features implementadas:
+- Whitelist estricta de orígenes (no se permite '*')
+- Separación clara entre desarrollo y producción
+- Validación de orígenes en tiempo de ejecución
+- Soporte para múltiples frontends (web, mobile, etc.)
+- allow_credentials=True para cookies httpOnly
+"""
+
+import os
+from urllib.parse import urlparse
+
+from src.config.arranque_seguro import en_desarrollo_declarado
+
+
+def _is_production() -> bool:
+    """
+    Determina si la aplicación está corriendo en producción.
+
+    Returns:
+        bool: False solo con ENVIRONMENT=development; True en cualquier otro caso
+            (el mismo criterio que el arranque, auditoría de la fase 6, B-09: un
+            valor ausente o mal escrito no abre CORS a localhost)
+    """
+    return not en_desarrollo_declarado()
+
+
+def _parse_frontend_origins() -> list[str]:
+    """
+    Parsea los orígenes del frontend desde la variable de entorno FRONTEND_ORIGINS.
+
+    El formato esperado es una lista separada por comas:
+    FRONTEND_ORIGINS=https://www.comebackgolf.com,https://otro.example
+
+    Returns:
+        list[str]: Lista de orígenes parseados (sin espacios en blanco)
+    """
+    frontend_origins_raw = os.getenv("FRONTEND_ORIGINS", "")
+    return [origin.strip() for origin in frontend_origins_raw.split(",") if origin.strip()]
+
+
+def _get_development_origins() -> list[str]:
+    """
+    Retorna lista de orígenes permitidos en desarrollo local.
+
+    Incluye:
+    - localhost:3000 (React/Next.js)
+    - localhost:5173/5174 (Vite - puerto por defecto y fallback)
+    - localhost:8080 (Kubernetes port-forward)
+    - Versiones con 127.0.0.1 de todas las anteriores
+
+    Returns:
+        list[str]: Lista de orígenes de desarrollo
+    """
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+    ]
+
+
+def _is_wildcard(origin: str) -> bool:
+    """Verifica si el origen es un wildcard."""
+    return origin == "*"
+
+
+def _has_valid_scheme(origin: str) -> bool:
+    """Verifica si el origen tiene un esquema HTTP/HTTPS válido."""
+    try:
+        parsed = urlparse(origin)
+        return parsed.scheme in ["http", "https"]
+    except Exception:
+        return False
+
+
+def _handle_invalid_origin(message: str) -> None:
+    """Maneja un origen inválido: lanza excepción en producción, imprime warning en desarrollo."""
+    if _is_production():
+        raise ValueError(f"CORS: {message}")
+    print(f"⚠️  CORS: {message} (ignorado)")
+
+
+def _validate_origins(origins: list[str]) -> list[str]:
+    """
+    Valida y sanitiza una lista de orígenes CORS.
+
+    Validaciones:
+    1. Rechaza wildcards ('*') - no permitidos por seguridad
+    2. Rechaza orígenes inválidos (sin esquema http/https)
+    3. Elimina duplicados conservando orden
+    4. Rechaza orígenes vacíos
+
+    Args:
+        origins: Lista de orígenes a validar
+
+    Returns:
+        list[str]: Lista de orígenes validados
+
+    Raises:
+        ValueError: Si se detecta un origen inválido en producción
+    """
+    validated = []
+    seen = set()
+
+    for origin in origins:
+        # Rechazar wildcards
+        if _is_wildcard(origin):
+            _handle_invalid_origin(
+                "No se permite el wildcard '*' en producción. "
+                "Configure FRONTEND_ORIGINS con orígenes específicos."
+            )
+            continue
+
+        # Rechazar orígenes vacíos
+        if not origin:
+            continue
+
+        # Validar esquema HTTP/HTTPS
+        if not _has_valid_scheme(origin):
+            _handle_invalid_origin(
+                f"Origen inválido '{origin}'. Solo se permiten esquemas http/https."
+            )
+            continue
+
+        # Eliminar duplicados (preservando orden)
+        if origin not in seen:
+            validated.append(origin)
+            seen.add(origin)
+
+    return validated
+
+
+def get_allowed_origins() -> list[str]:
+    """
+    Retorna la lista final de orígenes permitidos según el entorno.
+
+    Lógica:
+    - Producción: Solo FRONTEND_ORIGINS (variable de entorno)
+    - Desarrollo: FRONTEND_ORIGINS + orígenes de desarrollo local
+
+    Si FRONTEND_ORIGINS está vacío:
+    - Producción: Lanza error (configuración requerida)
+    - Desarrollo: Usa solo orígenes de desarrollo local
+
+    Returns:
+        List[str]: Lista de orígenes permitidos (validada)
+
+    Raises:
+        ValueError: Si FRONTEND_ORIGINS está vacío en producción
+
+    Examples:
+        # Desarrollo (sin FRONTEND_ORIGINS)
+        >>> os.environ['ENVIRONMENT'] = 'development'
+        >>> os.environ['FRONTEND_ORIGINS'] = ''
+        >>> get_allowed_origins()
+        ['http://localhost:3000', 'http://127.0.0.1:3000', ...]
+
+        # Producción
+        >>> os.environ['ENVIRONMENT'] = 'production'
+        >>> os.environ['FRONTEND_ORIGINS'] = 'https://www.comebackgolf.com'
+        >>> get_allowed_origins()
+        ['https://www.comebackgolf.com']
+    """
+    is_prod = _is_production()
+    frontend_origins = _parse_frontend_origins()
+
+    # En producción, FRONTEND_ORIGINS es obligatorio
+    if is_prod and not frontend_origins:
+        raise ValueError(
+            "CORS: FRONTEND_ORIGINS no está configurado en producción. "
+            "Configure la variable de entorno con los orígenes permitidos "
+            "(ej: FRONTEND_ORIGINS=https://www.comebackgolf.com)"
+        )
+
+    # Combinar orígenes según entorno
+    if is_prod:
+        allowed_origins = frontend_origins
+    else:
+        # En desarrollo, combinar frontend + locales
+        dev_origins = _get_development_origins()
+        allowed_origins = frontend_origins + dev_origins
+
+    # Validar y sanitizar
+    validated_origins = _validate_origins(allowed_origins)
+
+    # Fallback de seguridad en desarrollo (si todo falla)
+    if not validated_origins and not is_prod:
+        print("⚠️  CORS: Usando fallback de desarrollo (solo localhost)")
+        validated_origins = [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
+
+    # En producción, si no hay orígenes válidos, lanzar error
+    if not validated_origins and is_prod:
+        raise ValueError(
+            "CORS: No hay orígenes válidos configurados en producción. "
+            "Verifique la configuración de FRONTEND_ORIGINS."
+        )
+
+    return validated_origins
+
+
+def get_cors_config() -> dict:
+    """
+    Retorna la configuración completa de CORS para FastAPI CORSMiddleware.
+
+    Returns:
+        dict: Diccionario con parámetros para CORSMiddleware
+
+    Example:
+        >>> from fastapi.middleware.cors import CORSMiddleware
+        >>> from src.config.cors_config import get_cors_config
+        >>> app.add_middleware(CORSMiddleware, **get_cors_config())
+    """
+    allowed_origins = get_allowed_origins()
+
+    # Debug log (solo en desarrollo)
+    if not _is_production():
+        print(f"🔒 CORS allowed_origins ({len(allowed_origins)}):")
+        for origin in allowed_origins:
+            print(f"   - {origin}")
+
+    return {
+        "allow_origins": allowed_origins,
+        "allow_credentials": True,  # Requerido para cookies httpOnly (v1.8.0)
+        "allow_methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        "allow_headers": [
+            "Content-Type",
+            "Accept",
+            "Accept-Language",
+            "Content-Language",
+            "Origin",
+            "X-Requested-With",
+            "X-Correlation-ID",
+            "X-CSRF-Token",  # v1.13.0: CSRF Protection
+            "X-App-Mode",  # La app instalada se distingue del navegador (BE #737)
+            # Sentry headers para tracing distribuido
+            "sentry-trace",
+            "baggage",
+        ],
+        "expose_headers": [
+            "X-Correlation-ID",
+        ],
+        "max_age": 3600,  # Cache de preflight requests (1 hora)
+    }
+
+
+# Variables exportadas para uso en main.py
+__all__ = ["get_allowed_origins", "get_cors_config"]

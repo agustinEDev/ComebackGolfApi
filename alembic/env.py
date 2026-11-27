@@ -1,0 +1,150 @@
+import sys
+from pathlib import Path
+
+# --- Configuración del Entorno ---
+# 1. Añadir la raíz del proyecto al PYTHONPATH para que Python encuentre el módulo 'src'.
+#    Esto permite que Alembic importe los modelos de la aplicación.
+project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(project_root))
+
+# 2. Cargar las variables de entorno desde el fichero .env de la raíz del proyecto.
+#    'override=False' significa que las variables YA EXISTENTES en el entorno tienen prioridad
+#    sobre las del fichero .env. Esto permite:
+#    - Docker Compose: Las variables del docker-compose.yml prevalecen sobre .env
+#    - Desarrollo local: Se usan las del fichero .env (si no hay otras definidas)
+#    - CI/CD: Variables del pipeline tienen precedencia sobre .env
+from dotenv import load_dotenv  # noqa: E402 - Must be after sys.path setup
+
+load_dotenv(dotenv_path=project_root / ".env", override=False)
+# --- Fin de la Configuración del Entorno ---
+
+from logging.config import fileConfig  # noqa: E402
+from alembic import context  # noqa: E402
+from sqlalchemy import engine_from_config, pool  # noqa: E402
+
+# Alembic necesita conocer TODAS las tablas; con solo una parte, autogenerate
+# propondría borrar las demás (#565). Se arrancan todos los mappers con la lista
+# de la aplicación: algunas tablas solo se registran al arrancar su grupo (las de
+# usuario, la de mapas de hoyos), no basta con importar. Son idempotentes, y si
+# uno falla la app tampoco arrancaría. Un test lo comprueba contra las
+# migraciones (test_schema_parity)
+from src.shared.infrastructure.persistence.sqlalchemy.base import metadata  # noqa: E402
+from src.config.mappers import start_all_mappers  # noqa: E402
+from src.config.migraciones import url_de_las_migraciones  # noqa: E402
+
+start_all_mappers()
+
+# Constantes para drivers de PostgreSQL
+ASYNCPG_DRIVER = "postgresql+asyncpg"
+PSYCOPG2_DRIVER = "postgresql+psycopg2"
+SIN_DRIVER = "postgresql://"
+POSTGRES_CORTO = "postgres://"
+
+
+def _url_con_driver_sincrono(url: str) -> str:
+    """
+    Alembic necesita un driver síncrono: psycopg2, el que está instalado.
+
+    Se fija también cuando la URL no dice ninguno: desde SQLAlchemy 2.1, un
+    `postgresql://` a secas usa psycopg (v3), que no está instalado, y la
+    DATABASE_URL de Render es así. La v2.23.0 no arrancó por eso (1 oct 2026).
+    """
+    if url.startswith(ASYNCPG_DRIVER):
+        return url.replace(ASYNCPG_DRIVER, PSYCOPG2_DRIVER, 1)
+    if url.startswith(SIN_DRIVER):
+        return url.replace(SIN_DRIVER, f"{PSYCOPG2_DRIVER}://", 1)
+    # SQLAlchemy 2 no conoce `postgres://`, y la guardia de arranque lo acepta (/code-review)
+    if url.startswith(POSTGRES_CORTO):
+        return url.replace(POSTGRES_CORTO, f"{PSYCOPG2_DRIVER}://", 1)
+    return url
+
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# Usamos el metadata centralizado que ahora contiene TODAS las tablas
+target_metadata = metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# Example: config.get_main_option("my_important_option")
+# etc.
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode."""
+    # Priorizar la URL de entorno sobre alembic.ini: la del dueño si la hay (DB-01)
+    url = url_de_las_migraciones()
+    if not url:
+        url = config.get_main_option("sqlalchemy.url")
+
+    if url:
+        url = _url_con_driver_sincrono(url)
+
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode."""
+    # La del dueño de la base si la hay; si no, la de la API (DB-01)
+    db_url = url_de_las_migraciones()
+    if not db_url:
+        raise ValueError("La variable de entorno DATABASE_URL no está configurada")
+
+    db_url = _url_con_driver_sincrono(db_url)
+
+    # El ConfigParser de Alembic interpreta `%`: una contraseña codificada en la URL
+    # (`%40` por `@`) lo rompería; `%%` vuelve a ser `%` al leerla (CodeRabbit)
+    config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
+
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        # Como mucho 5 s esperando un bloqueo (auditoría de la fase 6, DB-04): si una
+        # transacción larga tiene la tabla, el arranque falla y Render sigue con la versión
+        # anterior, en vez de dejar la API en cola detrás del ALTER. De la sesión, así que
+        # vale para todas las migraciones, también las de autocommit_block()
+        connection.exec_driver_sql("SET lock_timeout = '5s'")
+        connection.commit()
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            # Una transacción POR migración, no una para todas las pendientes. Lo pide
+            # `autocommit_block()`, que usa la migración del índice de golf_course_tees
+            # (43bc18ca6df1): CREATE INDEX CONCURRENTLY no puede ir dentro de una
+            # transacción, así que el bloque cierra la que esté abierta. Sin esto, esa
+            # migración confirmaría de paso todas las anteriores del mismo arranque, y un
+            # fallo posterior dejaría la base a medias en vez de deshacerse entera.
+            # A cambio, cada revisión queda sellada al terminar: un reintento sigue por
+            # donde se quedó en lugar de repetirlas todas.
+            transaction_per_migration=True,
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()

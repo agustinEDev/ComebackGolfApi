@@ -1,0 +1,194 @@
+"""
+In-Memory Refresh Token Repository for Testing.
+
+Implementación en memoria del repositorio de refresh tokens para tests unitarios.
+"""
+
+from datetime import datetime
+
+from src.modules.user.domain.entities.refresh_token import RefreshToken
+from src.modules.user.domain.repositories.refresh_token_repository_interface import (
+    RefreshTokenRepositoryInterface,
+)
+from src.modules.user.domain.value_objects.refresh_token_id import RefreshTokenId
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_utc_sin_zona
+from src.shared.infrastructure.security.token_hash import hash_token
+
+
+class InMemoryRefreshTokenRepository(RefreshTokenRepositoryInterface):
+    """
+    Repositorio en memoria para RefreshToken (usado en tests).
+
+    Almacena los tokens en un diccionario en memoria para tests rápidos
+    sin necesidad de base de datos real.
+    """
+
+    def __init__(self):
+        """Inicializa el repositorio con almacenamiento vacío."""
+        self._tokens: dict[str, RefreshToken] = {}  # Key: token_id (str)
+
+    async def save(self, refresh_token: RefreshToken) -> RefreshToken:
+        """
+        Guarda un refresh token en memoria.
+
+        Args:
+            refresh_token: Token a guardar
+
+        Returns:
+            El token guardado
+        """
+        token_id = str(refresh_token.id.value)
+        self._tokens[token_id] = refresh_token
+        return refresh_token
+
+    async def find_by_id(self, token_id: RefreshTokenId) -> RefreshToken | None:
+        """
+        Busca un token por su ID.
+
+        Args:
+            token_id: ID del token
+
+        Returns:
+            RefreshToken si existe, None si no
+        """
+        return self._tokens.get(str(token_id.value))
+
+    async def find_by_token_hash(self, token: str) -> RefreshToken | None:
+        """
+        Busca un token por su hash.
+
+        Args:
+            token: Token JWT en texto plano
+
+        Returns:
+            RefreshToken si existe, None si no
+        """
+        token_hash_value = hash_token(token)
+
+        for refresh_token in self._tokens.values():
+            if refresh_token.token_hash.value == token_hash_value:
+                return refresh_token
+
+        return None
+
+    async def find_by_token_hash_for_update(self, token: str) -> RefreshToken | None:
+        """En memoria no hay transacciones: igual que find_by_token_hash."""
+        return await self.find_by_token_hash(token)
+
+    async def find_all_by_user(self, user_id: UserId) -> list[RefreshToken]:
+        """
+        Busca todos los tokens de un usuario.
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            Lista de RefreshTokens
+        """
+        return [token for token in self._tokens.values() if token.user_id.value == user_id.value]
+
+    async def revoke_all_for_user(self, user_id: UserId) -> int:
+        """
+        Revoca todos los tokens de un usuario.
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            Número de tokens revocados
+        """
+        count = 0
+        for token in self._tokens.values():
+            if token.user_id.value == user_id.value and not token.revoked:
+                count += 0 if token.is_replaced else 1
+                token.revoke()
+        return count
+
+    async def count_active_for_user(self, user_id: UserId) -> int:
+        """
+        Cuenta los tokens activos de un usuario.
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            Número de tokens activos (no revocados, no expirados)
+        """
+        now = ahora_utc_sin_zona()
+        return sum(
+            1
+            for token in self._tokens.values()
+            if token.user_id.value == user_id.value
+            and not token.revoked
+            and not token.is_replaced
+            and token.expires_at > now
+        )
+
+    async def delete(self, token_id: RefreshTokenId) -> bool:
+        """
+        Elimina un token específico.
+
+        Args:
+            token_id: ID del token a eliminar
+
+        Returns:
+            True si se eliminó, False si no existía
+        """
+        token_id_str = str(token_id.value)
+        if token_id_str in self._tokens:
+            del self._tokens[token_id_str]
+            return True
+        return False
+
+    async def revoke_all_for_device(self, device_id: UserDeviceId) -> int:
+        """
+        Revoca todos los refresh tokens asociados a un dispositivo.
+
+        Args:
+            device_id: ID del dispositivo cuyos tokens se revocarán
+
+        Returns:
+            Número de tokens revocados
+        """
+        count = 0
+        for token in self._tokens.values():
+            if token.device_id and token.device_id.value == device_id.value and not token.revoked:
+                count += 0 if token.is_replaced else 1
+                token.revoke()
+        return count
+
+    async def hay_uno_vivo_mas_nuevo(
+        self, device_ids: list[UserDeviceId], creado_despues_de: datetime, ahora: datetime
+    ) -> bool:
+        """Si alguno de esos dispositivos tiene un token vivo más nuevo (BE #734)."""
+        return any(
+            token.device_id in device_ids
+            and not token.revoked
+            and not token.is_replaced
+            and token.expires_at > ahora
+            and token.created_at > creado_despues_de
+            for token in self._tokens.values()
+        )
+
+    async def device_ids_with_live_tokens(
+        self, user_id: UserId, ahora: datetime
+    ) -> set[UserDeviceId]:
+        """Los dispositivos del usuario con algún refresh token sin revocar ni caducar."""
+        return {
+            token.device_id
+            for token in self._tokens.values()
+            if token.user_id == user_id
+            and not token.revoked
+            and not token.is_replaced
+            and token.expires_at > ahora
+            and token.device_id is not None
+        }
+
+    async def delete_expired_before(self, antes: datetime) -> int:
+        """Borra los refresh tokens caducados antes de `antes`."""
+        viejos = [token_id for token_id, token in self._tokens.items() if token.expires_at < antes]
+        for token_id in viejos:
+            del self._tokens[token_id]
+        return len(viejos)

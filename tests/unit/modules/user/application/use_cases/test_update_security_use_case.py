@@ -1,0 +1,300 @@
+"""
+Tests para UpdateSecurityUseCase
+
+Tests unitarios para el caso de uso de actualización de seguridad del usuario.
+"""
+
+import pytest
+from pydantic import ValidationError
+
+from src.modules.user.application.dto.user_dto import UpdateSecurityRequestDTO
+from src.modules.user.application.use_cases.update_security_use_case import (
+    UpdateSecurityUseCase,
+)
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.errors.user_errors import (
+    DuplicateEmailError,
+    InvalidCredentialsError,
+    UserNotFoundError,
+)
+from src.modules.user.domain.value_objects.password import InvalidPasswordError
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.modules.user.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork,
+)
+from src.modules.user.infrastructure.security.security_audit_logger import SecurityAuditLogger
+
+
+@pytest.fixture
+def uow():
+    """Fixture que proporciona un Unit of Work en memoria."""
+    return InMemoryUnitOfWork()
+
+
+@pytest.fixture
+async def existing_user(uow):
+    """
+    Fixture que crea un usuario existente en el sistema.
+    Email: test@example.com
+    Password: ValidPass123
+    """
+    user = User.create(
+        first_name="John",
+        last_name="Doe",
+        email_str="test@example.com",
+        plain_password="V@l1dP@ss123!",
+    )
+
+    async with uow:
+        await uow.users.save(user)
+        await uow.commit()
+
+    return user
+
+
+@pytest.fixture
+async def another_user(uow):
+    """
+    Fixture que crea otro usuario para probar duplicados.
+    Email: another@example.com
+    """
+    user = User.create(
+        first_name="Jane",
+        last_name="Smith",
+        email_str="another@example.com",
+        plain_password="An0th3rP@ss!",
+    )
+
+    async with uow:
+        await uow.users.save(user)
+        await uow.commit()
+
+    return user
+
+
+@pytest.mark.asyncio
+class TestUpdateSecurityUseCase:
+    """Tests para el caso de uso de actualización de seguridad."""
+
+    async def test_update_email_only(self, uow, existing_user):
+        """Debe actualizar solo el email cuando se proporciona."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        request = UpdateSecurityRequestDTO(
+            current_password="V@l1dP@ss123!",
+            new_email="newemail@example.com",
+            new_password=None,
+            confirm_password=None,
+        )
+
+        # Act
+        response = await use_case.execute(user_id, request)
+
+        # Assert
+        assert response is not None
+        # Pendiente hasta confirmarlo desde la dirección nueva (#749)
+        assert response.user.email == "test@example.com"
+        assert response.user.pending_email == "newemail@example.com"
+        assert response.message == "Email change pending confirmation"
+
+        # Verificar que el password no cambió
+        updated_user = await uow.users.find_by_id(UserId(user_id))
+        assert updated_user.verify_password("V@l1dP@ss123!")
+
+    async def test_reusing_a_recent_password_carries_its_code(self, uow, existing_user):
+        """
+        Given un usuario que ya ha cambiado dos veces su contraseña
+        When intenta volver a una de las recientes
+        Then InvalidPasswordError con código PASSWORD_REUSED (BE #519): el cliente
+        lo reconocía buscando un texto en inglés
+        """
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        await use_case.execute(
+            user_id,
+            UpdateSecurityRequestDTO(
+                current_password="V@l1dP@ss123!",
+                new_email=None,
+                new_password="N3wS3cur3P@ss!",
+                confirm_password="N3wS3cur3P@ss!",
+            ),
+        )
+
+        # El historial guarda la NUEVA de cada cambio: dos cambios y volver a la primera
+        await use_case.execute(
+            user_id,
+            UpdateSecurityRequestDTO(
+                current_password="N3wS3cur3P@ss!",
+                new_email=None,
+                new_password="0tr4S3gur4P@ss!",
+                confirm_password="0tr4S3gur4P@ss!",
+            ),
+        )
+
+        with pytest.raises(InvalidPasswordError) as error:
+            await use_case.execute(
+                user_id,
+                UpdateSecurityRequestDTO(
+                    current_password="0tr4S3gur4P@ss!",
+                    new_email=None,
+                    new_password="N3wS3cur3P@ss!",
+                    confirm_password="N3wS3cur3P@ss!",
+                ),
+            )
+
+        assert error.value.error_code == "PASSWORD_REUSED"
+        # El texto, el del dominio: el mismo que da la ruta (BE #562)
+        from src.modules.user.domain.value_objects.password import MENSAJES_DE_LA_CONTRASENA
+
+        assert str(error.value) == MENSAJES_DE_LA_CONTRASENA["PASSWORD_REUSED"]
+
+    async def test_update_password_only(self, uow, existing_user):
+        """Debe actualizar solo el password cuando se proporciona."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        request = UpdateSecurityRequestDTO(
+            current_password="V@l1dP@ss123!",
+            new_email=None,
+            new_password="N3wS3cur3P@ss!",
+            confirm_password="N3wS3cur3P@ss!",
+        )
+
+        # Act
+        response = await use_case.execute(user_id, request)
+
+        # Assert
+        assert response is not None
+        assert response.user.email == "test@example.com"  # No cambió
+
+        # Verificar que el password SÍ cambió
+        updated_user = await uow.users.find_by_id(UserId(user_id))
+        assert updated_user.verify_password("N3wS3cur3P@ss!")
+        assert not updated_user.verify_password("V@l1dP@ss123!")
+
+    async def test_update_both_email_and_password(self, uow, existing_user):
+        """Debe actualizar ambos cuando se proporcionan."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        request = UpdateSecurityRequestDTO(
+            current_password="V@l1dP@ss123!",
+            new_email="newemail@example.com",
+            new_password="N3wS3cur3P@ss!",
+            confirm_password="N3wS3cur3P@ss!",
+        )
+
+        # Act
+        response = await use_case.execute(user_id, request)
+
+        # Assert
+        assert response is not None
+        assert response.user.pending_email == "newemail@example.com"
+
+        # Verificar cambios en BD
+        updated_user = await uow.users.find_by_id(UserId(user_id))
+        assert str(updated_user.email.value) == "test@example.com"
+        assert updated_user.verify_password("N3wS3cur3P@ss!")
+
+    async def test_update_fails_with_wrong_current_password(self, uow, existing_user):
+        """Debe lanzar InvalidCredentialsError cuando el password actual es incorrecto."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        request = UpdateSecurityRequestDTO(
+            current_password="Wr0ngP@ssw0rd!",
+            new_email="newemail@example.com",
+            new_password=None,
+            confirm_password=None,
+        )
+
+        # Act & Assert
+        with pytest.raises(InvalidCredentialsError, match="Current password is incorrect"):
+            await use_case.execute(user_id, request)
+
+    async def test_update_fails_when_user_not_found(self, uow):
+        """Debe lanzar UserNotFoundError cuando el usuario no existe."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        non_existent_id = "00000000-0000-0000-0000-000000000000"
+        request = UpdateSecurityRequestDTO(
+            current_password="V@l1dP@ss123!",
+            new_email="newemail@example.com",
+            new_password=None,
+            confirm_password=None,
+        )
+
+        # Act & Assert
+        with pytest.raises(UserNotFoundError):
+            await use_case.execute(non_existent_id, request)
+
+    async def test_update_fails_with_duplicate_email(self, uow, existing_user, another_user):
+        """Debe lanzar DuplicateEmailError cuando el email ya está en uso."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        request = UpdateSecurityRequestDTO(
+            current_password="V@l1dP@ss123!",
+            new_email="another@example.com",  # Ya existe
+            new_password=None,
+            confirm_password=None,
+        )
+
+        # Act & Assert
+        with pytest.raises(DuplicateEmailError, match="already in use"):
+            await use_case.execute(user_id, request)
+
+    async def test_update_allows_same_email_for_same_user(self, uow, existing_user):
+        """Debe permitir actualizar con el mismo email del usuario actual."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        request = UpdateSecurityRequestDTO(
+            current_password="V@l1dP@ss123!",
+            new_email="test@example.com",  # Mismo email
+            new_password=None,
+            confirm_password=None,
+        )
+
+        # Act
+        response = await use_case.execute(user_id, request)
+
+        # Assert - No debe lanzar error
+        assert response is not None
+        assert response.user.email == "test@example.com"
+
+    async def test_update_fails_with_invalid_email_format(self, uow, existing_user):
+        """Debe rechazar email inválido (validación Pydantic)."""
+        # Arrange - Pydantic valida formato de email antes de llegar al use case
+
+        # Act & Assert
+        with pytest.raises(ValidationError):
+            UpdateSecurityRequestDTO(
+                current_password="V@l1dP@ss123!",
+                new_email="invalid-email",  # Sin @
+                new_password=None,
+                confirm_password=None,
+            )
+
+    async def test_update_applies_email_and_password(self, uow, existing_user):
+        """Debe dejar el correo pendiente y la contraseña nueva puesta."""
+        # Arrange
+        use_case = UpdateSecurityUseCase(uow, security_audit=SecurityAuditLogger())
+        user_id = str(existing_user.id.value)
+        request = UpdateSecurityRequestDTO(
+            current_password="V@l1dP@ss123!",
+            new_email="newemail@example.com",
+            new_password="N3wP@ss456!0",
+            confirm_password="N3wP@ss456!0",
+        )
+
+        # Act
+        await use_case.execute(user_id, request)
+
+        # Assert
+        updated_user = await uow.users.find_by_id(UserId(user_id))
+
+        # Verificar que los cambios se aplicaron (el correo, pendiente: #749)
+        assert updated_user.pending_email == "newemail@example.com"
+        assert updated_user.verify_password("N3wP@ss456!0")

@@ -1,0 +1,106 @@
+"""Mapper para convertir entidades QuickMatch a DTOs de presentacion."""
+
+from src.modules.quick_match.application.dto.quick_match_dto import (
+    QuickMatchParticipantDTO,
+    QuickMatchResponseDTO,
+)
+from src.modules.quick_match.domain.entities.quick_match import QuickMatch
+from src.modules.quick_match.domain.value_objects.participant_id import ParticipantId
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import en_utc
+
+
+class QuickMatchDTOMapper:
+    """Mapper para convertir entidades QuickMatch a DTOs de presentacion."""
+
+    @staticmethod
+    async def to_response_dto(
+        quick_match: QuickMatch,
+        user_uow: UserUnitOfWorkInterface,
+        users_by_id: dict[UserId, User] | None = None,
+        *,
+        requester_id: UserId,
+    ) -> QuickMatchResponseDTO:
+        """
+        Convierte una QuickMatch a su DTO de respuesta.
+
+        Si `users_by_id` se proporciona (precargado en bloque por el caller,
+        p.ej. al listar varias partidas), se evita una query por participante.
+        Los invitados (`is_guest=True`) no tienen `user_id` y se resuelven
+        directamente desde sus datos manuales, sin tocar `users_by_id`.
+
+        `requester_id` resuelve `excluded_from_stats`, que es una marca POR
+        USUARIO: sin saber quien pregunta no hay respuesta posible. Es
+        obligatorio y va como keyword a proposito. Con un valor por defecto,
+        olvidarlo devolvia "esta partida cuenta" para una que no cuenta —una
+        respuesta equivocada en silencio, que el cliente cachea y pinta— en vez
+        de un error al arrancar.
+        """
+        if users_by_id is None:
+            registered_ids = [p.user_id for p in quick_match.participants if p.user_id is not None]
+            async with user_uow:
+                users_by_id = {}
+                for user_id in registered_ids:
+                    user = await user_uow.users.find_by_id(user_id)
+                    if user:
+                        users_by_id[user_id] = user
+
+        participants_dto = []
+        for p in quick_match.participants:
+            # `is_guest` es esto mismo; mirado aquí, el tipo sabe que hay `user_id`
+            if p.user_id is None:
+                # Un invitado no tiene cuenta, así que tampoco alias: se queda
+                # con el nombre que tecleó quien lo añadió (BE #239)
+                name = f"{p.first_name} {p.last_name}"
+                handicap = p.effective_handicap(profile_handicap=None)
+            else:
+                user = users_by_id.get(p.user_id)
+                # `display_name`: su alias si lo tiene, y si no su nombre
+                # completo. Este campo ya era «nombre para enseñar»
+                name = user.display_name if user else "Unknown"
+                profile_handicap = user.handicap.value if user and user.handicap else None
+                # El fijado al empezar si lo hay (BE #514); si no, el de siempre
+                handicap = p.effective_handicap(profile_handicap)
+            participants_dto.append(
+                QuickMatchParticipantDTO(
+                    participant_id=p.participant_id.value,
+                    user_id=p.user_id.value if p.user_id else None,
+                    name=name,
+                    # Solo los lleva un invitado: el dominio no deja ponérselos
+                    # a un registrado (BE #717)
+                    first_name=p.first_name,
+                    last_name=p.last_name,
+                    handicap=handicap,
+                    team=p.team,
+                    is_guest=p.is_guest,
+                    tee_color=p.tee_color.value if p.tee_color else None,
+                    tee_gender=p.tee_gender.value if p.tee_gender else None,
+                )
+            )
+
+        return QuickMatchResponseDTO(
+            id=quick_match.id.value,
+            creator_id=quick_match.creator_id.value,
+            golf_course_id=quick_match.golf_course_id.value,
+            match_format=quick_match.match_format.value if quick_match.match_format else None,
+            scoring_format=(
+                quick_match.scoring_format.value if quick_match.scoring_format else None
+            ),
+            status=quick_match.status.value,
+            name=quick_match.name,
+            allowance_percentage=quick_match.allowance_percentage,
+            effective_allowance=quick_match.get_effective_allowance(),
+            play_mode=quick_match.play_mode.value,
+            participants=participants_dto,
+            scorer_ids=[sid.value for sid in quick_match.scorer_ids],
+            excluded_from_stats=quick_match.is_stats_excluded_for(
+                ParticipantId(requester_id.value)
+            ),
+            created_at=quick_match.created_at,
+            updated_at=quick_match.updated_at,
+            played_at=en_utc(quick_match.played_at),
+        )

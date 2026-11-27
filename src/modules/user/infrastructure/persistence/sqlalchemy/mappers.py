@@ -1,0 +1,332 @@
+# src/modules/user/infrastructure/persistence/sqlalchemy/mappers.py
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Table,
+    func,
+    inspect,
+)
+from sqlalchemy.exc import NoInspectionAvailable
+from sqlalchemy.orm import composite
+from sqlalchemy.types import TypeDecorator
+
+from src.modules.user.domain.entities.user import User
+from src.modules.user.domain.value_objects.avatar_source import AvatarSource
+from src.modules.user.domain.value_objects.email import Email
+from src.modules.user.domain.value_objects.handicap import Handicap
+from src.modules.user.domain.value_objects.password import Password
+from src.modules.user.domain.value_objects.terms_of_service import TERMS_VERSION_MAX_LENGTH
+from src.modules.user.domain.value_objects.user_avatar_upload_id import UserAvatarUploadId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.value_objects.gender import Gender
+
+# Importar registry y metadata centralizados
+from src.shared.infrastructure.persistence.sqlalchemy.base import (
+    mapper_registry,
+    metadata,
+)
+
+# Importar CountryCodeDecorator del shared domain
+from src.shared.infrastructure.persistence.sqlalchemy.country_mappers import (
+    CountryCodeDecorator,
+)
+from src.shared.infrastructure.persistence.sqlalchemy.tipos_de_id import tipo_de_id
+
+# --- TypeDecorator para UserId ---
+# Le enseña a SQLAlchemy a manejar nuestro ValueObject UserId.
+UserIdDecorator = tipo_de_id(UserId)
+
+
+# --- TypeDecorator para Gender ---
+class GenderDecorator(TypeDecorator):
+    """Convierte entre Gender enum y string en BD."""
+
+    impl = String(10)
+    cache_ok = True
+
+    def process_bind_param(self, value: Gender | None, dialect) -> str | None:
+        """Del valor del dominio a la columna."""
+        if value is None:
+            return None
+        return value.value
+
+    def process_result_value(self, value: str | None, dialect) -> Gender | None:
+        """De la columna al valor del dominio."""
+        if value is None:
+            return None
+        return Gender(value)
+
+
+# --- TypeDecorator para AvatarSource ---
+class AvatarSourceDecorator(TypeDecorator):
+    """Convierte entre AvatarSource enum y string en BD."""
+
+    impl = String(10)
+    cache_ok = True
+
+    def process_bind_param(self, value: AvatarSource | None, dialect) -> str | None:
+        """Del valor del dominio a la columna."""
+        if value is None:
+            return None
+        return value.value
+
+    def process_result_value(self, value: str | None, dialect) -> AvatarSource | None:
+        """De la columna al valor del dominio."""
+        if value is None:
+            return AvatarSource.NONE
+        return AvatarSource(value)
+
+
+# --- TypeDecorator para UserAvatarUploadId (nullable) ---
+ActiveAvatarUploadIdDecorator = tipo_de_id(UserAvatarUploadId)
+
+
+# --- TypeDecorator para Handicap ---
+# Le enseña a SQLAlchemy a manejar nuestro ValueObject Handicap.
+class HandicapDecorator(TypeDecorator):
+    impl = Float
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect) -> float | None:
+        """Convierte el objeto Handicap a float para guardarlo en la BD."""
+
+        if isinstance(value, Handicap):
+            return value.value
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def process_result_value(self, value: float | None, dialect) -> Handicap | None:
+        """Convierte el float de la BD de vuelta a un objeto Handicap."""
+
+        if value is None:
+            return None
+        return Handicap(value)
+
+
+# --- Registro y Metadatos ---
+# (Importados de base.py - ver imports arriba)
+
+
+# --- Definición de la Tabla ---
+class PasswordDecorator(TypeDecorator):
+    """
+    La contraseña hasheada como VARCHAR(255), y NULL como None: una cuenta solo Google
+    no tiene. Con `composite()` la columna a NULL daba `Password(hashed_value=None)` y la
+    cuenta parecía tener contraseña (probador de la release, 8 nov 2026; regla de docs/modules/user-management.md:
+    TypeDecorator para los Value Objects de una columna y opcionales).
+    """
+
+    impl = String(255)
+    cache_ok = True
+
+    def process_bind_param(self, value: Password | None, dialect) -> str | None:
+        """El hash, o NULL sin contraseña."""
+        return value.hashed_value if isinstance(value, Password) else None
+
+    def process_result_value(self, value: str | None, dialect) -> Password | None:
+        """La contraseña con su hash, o None si la columna está a NULL."""
+        return Password(value) if value is not None else None
+
+
+users_table = Table(
+    "users",
+    metadata,
+    Column("id", UserIdDecorator, primary_key=True),
+    Column("first_name", String(50), nullable=False),
+    Column("last_name", String(50), nullable=False),
+    # Apodo publico, opcional. Su unicidad es un indice aparte, justo debajo
+    Column("alias", String(20), nullable=True),
+    Column("email", String(255), nullable=False, unique=True),
+    Column("password", PasswordDecorator, nullable=True),  # NULL: cuenta solo Google
+    Column("handicap", HandicapDecorator, nullable=True),
+    Column("handicap_updated_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
+    Column("email_verified", Boolean, nullable=False, default=False),
+    # Los enlaces del correo, con el SHA-256 del token y su caducidad (fase 3, C1-C3)
+    Column("verification_token", String(255), nullable=True),
+    Column("verification_token_expires_at", DateTime, nullable=True),
+    Column("password_reset_token", String(255), nullable=True),
+    Column("reset_token_expires_at", DateTime, nullable=True),
+    # El cupo diario de correos de restablecer (H2) y el último aviso de registro (B2)
+    Column(
+        "password_reset_emails_in_window", Integer, nullable=False, default=0, server_default="0"
+    ),
+    Column("password_reset_window_started_at", DateTime, nullable=True),
+    Column("register_attempt_notice_at", DateTime, nullable=True),
+    # El correo nuevo, pendiente de confirmar desde su dirección (#749)
+    Column("pending_email", String(255), nullable=True),
+    Column("pending_email_token", String(255), nullable=True),
+    Column("pending_email_expires_at", DateTime, nullable=True),
+    Column(
+        "country_code",
+        CountryCodeDecorator,
+        ForeignKey("countries.code", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    # Account Lockout fields (v1.13.0)
+    Column("failed_login_attempts", Integer, nullable=False, default=0),
+    Column("locked_until", DateTime, nullable=True),
+    # El respaldo de todas las redes y su aviso (BE #732)
+    Column("failed_login_window_started_at", DateTime, nullable=True),
+    Column("failed_login_notice_at", DateTime, nullable=True),
+    Column("failed_login_day_attempts", Integer, nullable=False, default=0, server_default="0"),
+    Column("failed_login_day_window_started_at", DateTime, nullable=True),
+    # RBAC field (v2.0.0)
+    Column("is_admin", Boolean, nullable=False, default=False),
+    # Admin panel: deactivation (v2.4.0)
+    Column("is_active", Boolean, nullable=False, default=True, server_default="true"),
+    # Gender field (tee system refactor)
+    Column("gender", GenderDecorator(), nullable=True),
+    # Avatar fields (v2.3.0)
+    Column(
+        "avatar_source",
+        AvatarSourceDecorator(),
+        nullable=False,
+        default="NONE",
+        server_default="NONE",
+    ),
+    Column("avatar_preset_id", Integer, nullable=True),
+    # Feed de actividad (BE #175): cuándo miró el feed por última vez, de donde
+    # sale el aviso de novedades, y si publica o no sus logros
+    Column("feed_last_seen_at", DateTime, nullable=True),
+    Column("share_activity", Boolean, nullable=False, default=True, server_default="true"),
+    Column(
+        "active_avatar_upload_id",
+        ActiveAvatarUploadIdDecorator,
+        # use_alter=True: rompe el ciclo de FKs con user_avatar_uploads.user_id -> users.id
+        # (SQLAlchemy crea la columna primero y añade el constraint en un ALTER TABLE aparte).
+        ForeignKey(
+            "user_avatar_uploads.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_users_active_avatar_upload_id",
+        ),
+        nullable=True,
+    ),
+    # Términos de uso: la versión más reciente que aceptó y cuándo aceptó ESA
+    # versión por primera vez (aceptarla otra vez no cambia la fecha). Nulos =
+    # nunca los ha aceptado (los usuarios anteriores a esto y las altas con
+    # Google), y entonces no puede usar la app hasta aceptar
+    Column("terms_accepted_at", DateTime(timezone=True), nullable=True),
+    Column("terms_version", String(TERMS_VERSION_MAX_LENGTH), nullable=True),
+)
+
+
+# Unicidad del alias ignorando mayusculas. Va en los METADATOS y no solo en la
+# migracion a proposito: el esquema de los tests se construye con
+# `metadata.create_all`, asi que un indice que viviera solo en la migracion no
+# existiria en ningun test y la suite entera daria por buena una duplicidad que
+# en produccion revienta. Es funcional —sobre LOWER(alias)— y parcial —solo
+# donde hay alias—: en Postgres los NULL no chocan entre si, asi que indexarlos
+# no aportaria nada
+Index(
+    "ix_users_alias_lower",
+    func.lower(users_table.c.alias),
+    unique=True,
+    postgresql_where=users_table.c.alias.isnot(None),
+)
+
+
+def start_mappers():
+    """
+    Inicia el mapeo entre las entidades de dominio y las tablas de la base de datos.
+    Es idempotente, por lo que se puede llamar de forma segura varias veces.
+    """
+    # Verificar si User ya está mapeado usando inspect() (idempotencia)
+    try:
+        inspect(User)
+        # Si llegamos aquí, User ya está mapeado
+    except NoInspectionAvailable:
+        # User no está mapeado, proceder a mapear
+        mapper_registry.map_imperatively(
+            User,
+            users_table,
+            properties={
+                # Scalar fields → private attrs (encapsulación, issue #109)
+                "_id": users_table.c.id,
+                "_first_name": users_table.c.first_name,
+                "_last_name": users_table.c.last_name,
+                "_alias": users_table.c.alias,
+                "_handicap": users_table.c.handicap,
+                "_handicap_updated_at": users_table.c.handicap_updated_at,
+                "_created_at": users_table.c.created_at,
+                "_updated_at": users_table.c.updated_at,
+                "_email_verified": users_table.c.email_verified,
+                "_verification_token": users_table.c.verification_token,
+                "_verification_token_expires_at": users_table.c.verification_token_expires_at,
+                "_pending_email": users_table.c.pending_email,
+                "_pending_email_token": users_table.c.pending_email_token,
+                "_pending_email_expires_at": users_table.c.pending_email_expires_at,
+                "_country_code": users_table.c.country_code,
+                "_password_reset_token": users_table.c.password_reset_token,
+                "_reset_token_expires_at": users_table.c.reset_token_expires_at,
+                "_password_reset_emails_in_window": (users_table.c.password_reset_emails_in_window),
+                "_password_reset_window_started_at": (
+                    users_table.c.password_reset_window_started_at
+                ),
+                "_register_attempt_notice_at": users_table.c.register_attempt_notice_at,
+                "_failed_login_attempts": users_table.c.failed_login_attempts,
+                "_locked_until": users_table.c.locked_until,
+                "_failed_login_window_started_at": users_table.c.failed_login_window_started_at,
+                "_failed_login_notice_at": users_table.c.failed_login_notice_at,
+                "_failed_login_day_attempts": users_table.c.failed_login_day_attempts,
+                "_failed_login_day_window_started_at": (
+                    users_table.c.failed_login_day_window_started_at
+                ),
+                "_is_admin": users_table.c.is_admin,
+                "_is_active": users_table.c.is_active,
+                "_gender": users_table.c.gender,
+                "_avatar_source": users_table.c.avatar_source,
+                "_avatar_preset_id": users_table.c.avatar_preset_id,
+                "_feed_last_seen_at": users_table.c.feed_last_seen_at,
+                "_share_activity": users_table.c.share_activity,
+                "_active_avatar_upload_id": users_table.c.active_avatar_upload_id,
+                "_terms_accepted_at": users_table.c.terms_accepted_at,
+                "_terms_version": users_table.c.terms_version,
+                # Value Objects de una columna (Email, Password) → mapeamos la columna
+                # cruda a un atributo "_value" y componemos el VO real sobre el
+                # atributo privado "_email"/"_password" que respalda la @property
+                # pública de solo lectura del dominio.
+                "_email_value": users_table.c.email,
+                "_email": composite(Email, "_email_value"),
+                # TypeDecorator y no composite: la columna admite NULL
+                "_password": users_table.c.password,
+            },
+        )
+
+    # Mapear RefreshToken, PasswordHistory y UserDevice entities
+    # Imports dinámicos necesarios para evitar circular imports
+    from src.modules.user.infrastructure.persistence.sqlalchemy.password_history_mapper import (  # noqa: PLC0415
+        start_mappers as start_password_history_mappers,
+    )
+    from src.modules.user.infrastructure.persistence.sqlalchemy.refresh_token_mapper import (  # noqa: PLC0415
+        start_mappers as start_refresh_token_mappers,
+    )
+    from src.modules.user.infrastructure.persistence.sqlalchemy.terms_acceptance_mapper import (  # noqa: PLC0415
+        start_mappers as start_terms_acceptance_mappers,
+    )
+    from src.modules.user.infrastructure.persistence.sqlalchemy.user_avatar_upload_mapper import (  # noqa: PLC0415
+        start_mappers as start_user_avatar_upload_mappers,
+    )
+    from src.modules.user.infrastructure.persistence.sqlalchemy.user_device_mapper import (  # noqa: PLC0415
+        start_user_device_mappers,
+    )
+    from src.modules.user.infrastructure.persistence.sqlalchemy.user_oauth_account_mapper import (  # noqa: PLC0415
+        start_oauth_account_mappers,
+    )
+
+    start_refresh_token_mappers()
+    start_password_history_mappers()
+    start_user_device_mappers()
+    start_oauth_account_mappers()
+    start_user_avatar_upload_mappers()
+    start_terms_acceptance_mappers()

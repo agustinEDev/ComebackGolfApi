@@ -1,0 +1,725 @@
+"""
+Comeback Golf - Main Application
+
+Punto de entrada de la aplicación FastAPI.
+"""
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # Cargar variables de entorno desde .env
+
+# All imports below must be after load_dotenv() to access environment variables
+
+import asyncio  # noqa: E402
+import contextlib  # noqa: E402
+import logging  # noqa: E402
+import secrets  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
+
+import uvicorn  # noqa: E402
+from fastapi import Depends, FastAPI, HTTPException, Request, status  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.security import HTTPBasic, HTTPBasicCredentials  # noqa: E402
+from pydantic import BaseModel  # noqa: E402
+from slowapi import _rate_limit_exceeded_handler  # noqa: E402
+from slowapi.errors import RateLimitExceeded  # noqa: E402
+
+from src.config.arranque_seguro import (  # noqa: E402
+    comprueba_la_configuracion_de_seguridad,
+    en_desarrollo_declarado,
+)
+from src.config.aviso_en_segundo_plano import drena_al_apagar  # noqa: E402
+from src.config.cierre_de_inscripciones import (  # noqa: E402
+    CierreDeInscripciones,
+    cierre_de_inscripciones_activado,
+)
+from src.config.cierre_de_partidas_rapidas import (  # noqa: E402
+    CierreDePartidasRapidas,
+    cierre_activado,
+)
+from src.config.clave_de_brevo_viva import (  # noqa: E402
+    VigiaDeLaClaveDeBrevo,
+    vigia_activado,
+)
+from src.config.codigos_de_error import los_que_llevan_su_codigo, todos_los_codigos  # noqa: E402
+from src.config.correo_verificado import EmailNotVerifiedError  # noqa: E402
+from src.config.cors_config import get_cors_config  # noqa: E402
+from src.config.credencial_del_dueno import (  # noqa: E402
+    avisa_de_la_credencial_del_dueno,
+    retira_la_credencial_del_dueno,
+)
+from src.config.database import async_session_maker  # noqa: E402
+from src.config.dependencies import get_lanzador_de_actualizaciones  # noqa: E402
+from src.config.limpieza_de_sesiones import LimpiezaDeSesiones  # noqa: E402
+from src.config.mappers import start_all_mappers  # noqa: E402
+from src.config.rate_limit import (  # noqa: E402
+    apply_default_rate_limit,
+    cuenta_un_fallo_de_la_documentacion,
+    frena_la_documentacion_con_la_ip_real,
+    limiter,
+)
+from src.config.refresco_de_handicaps import (  # noqa: E402
+    LanzadorEnSegundoPlano,
+    VigilanteDeActualizaciones,
+)
+from src.config.sentry_config import init_sentry  # noqa: E402
+from src.config.settings import settings  # noqa: E402
+from src.config.terms_guard import (  # noqa: E402
+    TermsNotAcceptedError,
+    terms_not_accepted_handler,
+)
+from src.config.version import (  # noqa: E402
+    APP_VERSION,
+    get_deployed_branch,
+    get_deployed_commit,
+    get_environment,
+)
+from src.modules.competition.infrastructure.api.v1 import (  # noqa: E402
+    competition_crud_routes,
+    competition_golf_course_routes,
+    competition_state_routes,
+    draft_routes,
+    enrollment_routes,
+    envelope_routes,
+    invitation_routes,
+    round_match_routes,
+    scoring_routes,
+    tee_group_routes,
+    tee_group_scoring_routes,
+)
+from src.modules.golf_course.infrastructure.api.v1 import (  # noqa: E402
+    golf_course_routes,
+    hole_map_routes,
+)
+from src.modules.quick_match.infrastructure.api.v1 import quick_match_routes  # noqa: E402
+from src.modules.social.application.use_cases.upload_profile_photo_use_case import (  # noqa: E402
+    MAX_UPLOAD_BYTES as MAX_PHOTO_UPLOAD_BYTES,
+)
+from src.modules.social.infrastructure.api.v1 import (  # noqa: E402
+    friend_routes,
+    profile_photo_routes,
+    profile_routes,
+)
+from src.modules.support.infrastructure.api.v1 import support_routes  # noqa: E402
+from src.modules.user.application.use_cases.upload_avatar_use_case import (  # noqa: E402
+    MAX_UPLOAD_BYTES,
+)
+from src.modules.user.infrastructure.api.v1 import (  # noqa: E402
+    admin_routes,
+    auth_routes,
+    avatar_routes,
+    device_routes,
+    google_auth_routes,
+    handicap_routes,
+    user_routes,
+)
+from src.shared.infrastructure.api.v1 import country_routes  # noqa: E402
+from src.shared.infrastructure.email.envio_de_correo import (  # noqa: E402
+    brevo_desde,
+    comprueba_el_envio_de_correo,
+)
+from src.shared.infrastructure.http.codigos_de_error import registra_los_codigos  # noqa: E402
+from src.shared.infrastructure.http.correlation_middleware import (  # noqa: E402
+    CorrelationMiddleware,
+)
+from src.shared.infrastructure.http.dominio_de_las_cookies import (  # noqa: E402
+    DominioDeLasCookies,
+)
+from src.shared.infrastructure.http.esquema_del_proxy import EsquemaDelProxy  # noqa: E402
+from src.shared.infrastructure.http.http_context_validator import (  # noqa: E402
+    informa_del_secreto_de_origen,
+)
+from src.shared.infrastructure.http.limite_del_cuerpo import (  # noqa: E402
+    LimitaElCuerpoDeLasSubidas,
+)
+from src.shared.infrastructure.http.limite_superado import (  # noqa: E402
+    ApuntaLosLimitesSuperados,
+)
+from src.shared.infrastructure.http.paginas_de_la_documentacion import (  # noqa: E402
+    pagina_de_redoc,
+    pagina_de_swagger,
+)
+from src.shared.infrastructure.http.ruta_sin_barras_codificadas import (  # noqa: E402
+    RutaSinBarrasCodificadas,
+)
+from src.shared.infrastructure.http.security_headers import apply_security_headers  # noqa: E402
+from src.shared.infrastructure.http.sentry_middleware import (  # noqa: E402
+    SentryUserContextMiddleware,
+)
+from src.shared.infrastructure.http.unhandled_error_middleware import (  # noqa: E402
+    UnhandledErrorMiddleware,
+)
+from src.shared.infrastructure.logging.security_logger import get_security_logger  # noqa: E402
+from src.shared.infrastructure.middleware.csrf_middleware import (  # noqa: E402
+    CSRFMiddleware,
+)
+
+
+def _vacia_el_log_de_seguridad() -> None:
+    """
+    Escribe lo que el log de seguridad tenga en cola cuando el arranque falla.
+
+    Ese log escribe desde un hilo y su vaciado normal está tras el `yield` del lifespan,
+    al que un arranque fallido no llega: el evento de la credencial del dueño, que se
+    registra justo antes de estas comprobaciones, podía perderse (CodeRabbit, #906).
+    Nunca tapa el error del arranque.
+    """
+    with contextlib.suppress(Exception):
+        get_security_logger().para()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001 - FastAPI requires this signature
+    """
+    Gestor de ciclo de vida de la aplicación.
+    - Inicializa Sentry para error tracking y performance monitoring
+    - Inicia los mappers de SQLAlchemy al arrancar.
+    - (Aquí se podrían añadir otras tareas de inicio/apagado, como conectar a Redis).
+    """
+    print("INFO:     Iniciando aplicación y configurando mappers...")
+
+    # Inicializar Sentry (v1.8.0 - Task 10)
+    init_sentry()
+
+    # La credencial del dueño de la base no se queda en el proceso de la API (DB-R3-01).
+    # Tras Sentry, para que el aviso llegue allí; antes de la comprobación de seguridad
+    retira_la_credencial_del_dueno(
+        os.environ,
+        en_desarrollo=en_desarrollo_declarado(os.environ),
+        avisa=avisa_de_la_credencial_del_dueno,
+    )
+
+    # Fuera de desarrollo, ni TESTING ni una SECRET_KEY de ejemplo o corta (F-06,
+    # F-12). Tras Sentry, para que un arranque fallido llegue allí
+    try:
+        comprueba_la_configuracion_de_seguridad(os.environ)
+    except RuntimeError:
+        logging.getLogger(__name__).exception("Insecure configuration: not starting")
+        _vacia_el_log_de_seguridad()
+        raise
+
+    # Sin un envío de correo válido no se arranca: en producción solo Mailgun y por
+    # https (BE #563). Tras Sentry, para que un arranque fallido llegue allí
+    try:
+        comprueba_el_envio_de_correo(os.environ)
+    except RuntimeError:
+        logging.getLogger(__name__).exception("Invalid email configuration: not starting")
+        _vacia_el_log_de_seguridad()
+        raise
+
+    # Si hay secreto de Cloudflare para la IP real, y de qué longitud (ADR-041)
+    informa_del_secreto_de_origen()
+
+    start_all_mappers()  # Todos, en un solo sitio (#565)
+
+    # El vigilante de las actualizaciones de hándicaps: lanza las programadas y
+    # recupera las cortadas por un reinicio. Solo en producción (#251)
+    tareas = []
+    lanzador = get_lanzador_de_actualizaciones()
+    if isinstance(lanzador, LanzadorEnSegundoPlano):
+        tareas.append(asyncio.create_task(VigilanteDeActualizaciones(lanzador).vigilar()))
+    # Las partidas rápidas que nadie termina se cierran solas, cada hora (23 oct
+    # 2026). En PRO y en el Kind; en los tests no
+    if cierre_activado(os.environ):
+        tareas.append(asyncio.create_task(CierreDePartidasRapidas(async_session_maker).vigilar()))
+        # Y la limpieza de dispositivos y refrescos viejos, también cada hora (BE #737)
+        tareas.append(asyncio.create_task(LimpiezaDeSesiones(async_session_maker).vigilar()))
+    # Las inscripciones cierran solas a las 12:00 del día anterior al torneo; se mira
+    # cada hora (15 nov 2026). En PRO y en el Kind; en los tests no
+    if cierre_de_inscripciones_activado(os.environ):
+        tareas.append(asyncio.create_task(CierreDeInscripciones(async_session_maker).vigilar()))
+    # La clave de Brevo, usada una vez al día para que no caduque (solo PRO)
+    brevo = brevo_desde(os.environ)
+    if vigia_activado(os.environ) and brevo is not None:
+        tareas.append(asyncio.create_task(VigiaDeLaClaveDeBrevo(brevo).vigilar()))
+    yield
+    for tarea in tareas:
+        tarea.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tarea
+    # Los correos en segundo plano que estén saliendo, y las actualizaciones de hándicaps
+    # en marcha: se esperan como mucho TOPE_AL_APAGAR_S y lo demás se cancela (13 nov)
+    try:
+        await drena_al_apagar(
+            lanzador.tareas_en_marcha() if isinstance(lanzador, LanzadorEnSegundoPlano) else ()
+        )
+    finally:
+        # El log de seguridad escribe en su hilo: lo pendiente se escribe y lo que llegue
+        # después, directamente (/code-review de la fase 2). También si el drenaje falla
+        get_security_logger().para()
+    print("INFO:     Apagando aplicación...")
+
+
+# HTTP Basic Security para proteger /docs
+security = HTTPBasic()
+
+
+def verify_docs_credentials(
+    request: Request, credentials: HTTPBasicCredentials = Depends(security)
+):
+    """
+    Verifica las credenciales HTTP Basic para acceder a /docs, /redoc y /openapi.json.
+
+    Unas equivocadas cuentan contra el límite de la documentación, por red, y pasado
+    este dan 429; las buenas no cuentan. Con la IP real de quien llama (Cloudflare),
+    un contador lleno frena también las buenas; con el contador compartido de toda la
+    app, no (F-11, /code-review, CodeRabbit).
+
+    Las credenciales se configuran en variables de entorno:
+    - DOCS_USERNAME
+    - DOCS_PASSWORD
+
+    Raises:
+        HTTPException 401: Si las credenciales son incorrectas o no están configuradas
+    """
+    # Si no están configuradas las credenciales, denegar acceso
+    if not settings.DOCS_USERNAME or not settings.DOCS_PASSWORD:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Documentación no disponible - credenciales no configuradas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    # Con la IP real y su contador lleno, ni se comparan (CodeRabbit en BE #774)
+    frena_la_documentacion_con_la_ip_real(request)
+
+    # Verificar username
+    correct_username = secrets.compare_digest(
+        credentials.username.encode("utf8"), settings.DOCS_USERNAME.encode("utf8")
+    )
+
+    # Verificar password
+    correct_password = secrets.compare_digest(
+        credentials.password.encode("utf8"), settings.DOCS_PASSWORD.encode("utf8")
+    )
+
+    if not (correct_username and correct_password):
+        cuenta_un_fallo_de_la_documentacion(request)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales incorrectas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
+
+
+class HealthResponse(BaseModel):
+    """Response model para el endpoint raiz."""
+
+    message: str
+    version: str
+    status: str
+    docs: str
+    description: str
+
+
+class DeploymentHealthResponse(BaseModel):
+    """Response model para /health: identifica el despliegue concreto."""
+
+    status: str
+    version: str
+    commit: str
+    branch: str
+    environment: str
+
+
+# Crear la app, registrando el gestor de ciclo de vida 'lifespan'
+# Deshabilitamos docs_url, redoc_url y openapi_url para crear endpoints protegidos
+# manualmente. El esquema sigue generándose con app.openapi() (el CI lo compara así)
+app = FastAPI(
+    title="Comeback Golf",
+    description="API para gestion de torneos tipo Ryder Cup entre amigos",
+    version=APP_VERSION,
+    docs_url=None,  # Deshabilitado - usaremos endpoint protegido
+    redoc_url=None,  # Deshabilitado - usaremos endpoint protegido
+    openapi_url=None,  # Deshabilitado - el esquema, con las mismas credenciales (F-11)
+    lifespan=lifespan,
+    # El límite por defecto en toda ruta sin uno propio (BE #467). Va aquí, antes de
+    # incluir los routers, para que lo hereden todas
+    dependencies=[Depends(apply_default_rate_limit)],
+)
+
+# Registrar el limiter en la app para que esté disponible en todos los endpoints
+app.state.limiter = limiter
+
+# Registrar el exception handler para RateLimitExceeded
+# Cuando se excede el límite, se responde automáticamente con HTTP 429
+# slowapi's handler is sync but FastAPI accepts both sync and async
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+
+# Cada error de dominio con su código, en un solo sitio (antes, un except en cada ruta)
+registra_los_codigos(app, todos_los_codigos(), los_que_llevan_su_codigo())
+
+# Términos de uso sin aceptar (B6): 403 con error_code TERMS_NOT_ACCEPTED
+app.add_exception_handler(TermsNotAcceptedError, terms_not_accepted_handler)
+
+# Correo sin verificar en lo que llega a otros (B-17): 403 con error_code EMAIL_NOT_VERIFIED
+app.add_exception_handler(EmailNotVerifiedError, terms_not_accepted_handler)
+
+# ================================
+# MIDDLEWARE STACK
+# ================================
+# Los middlewares se ejecutan en el orden INVERSO al que se registran:
+# El último en añadirse es el primero en ejecutarse
+
+
+# ================================
+# TOPE DEL CUERPO (subidas y todo lo demás)
+# ================================
+# El middleware ASGI de abajo rechaza sin leer lo que declara un Content-Length mayor
+# que su tope, y corta lo que llega por trozos sin declararlo: antes de que Starlette
+# parsee el multipart o el JSON entero. La comprobación exacta del fichero sigue en el
+# endpoint. (El fast-fail por Content-Length de las subidas vivía aquí aparte; desde la
+# auditoría de la fase 6 lo hace el mismo middleware, /code-review de B-04.)
+# Las rutas de subida de imágenes con su tope: el avatar y la galería (F-08)
+_UPLOAD_SIZE_LIMITS = {
+    "/api/v1/users/me/avatar/upload": MAX_UPLOAD_BYTES,
+    "/api/v1/users/me/photos": MAX_PHOTO_UPLOAD_BYTES,
+}
+# Content-Length cubre el multipart body ENTERO (boundaries + cabeceras de cada
+# parte), no solo los bytes del fichero — un archivo justo en el límite (o algo
+# por debajo) puede declarar un tamaño total ligeramente mayor que
+# MAX_UPLOAD_BYTES por ese framing. Se permite un margen para no rechazar
+# subidas válidas; el chequeo exacto por bytes reales sigue en el endpoint.
+_MAX_AVATAR_MULTIPART_OVERHEAD_BYTES = 16 * 1024
+
+
+# Y lo que no declara Content-Length (una subida chunked): se cuenta mientras llega y
+# se corta con 413 al pasar el tope más el margen, antes de que Starlette guarde el
+# multipart entero en /tmp (CodeRabbit en BE #774)
+# Y cualquier otro cuerpo, a 256 KB: el JSON más grande de verdad (el mapa de un campo)
+# pesa unos 14 KB, y Cloudflare corta igual lo que lo declara (auditoría de la fase 6, B-04)
+TOPE_GENERAL_DEL_CUERPO = 256 * 1024
+app.add_middleware(
+    LimitaElCuerpoDeLasSubidas,
+    limites=_UPLOAD_SIZE_LIMITS,
+    margen=_MAX_AVATAR_MULTIPART_OVERHEAD_BYTES,
+    tope_general=TOPE_GENERAL_DEL_CUERPO,
+)
+
+
+# ================================
+# CSRF PROTECTION MIDDLEWARE (v1.13.0)
+# ================================
+# Valida CSRF tokens en requests no seguros (POST, PUT, PATCH, DELETE)
+# Exime GET, HEAD, OPTIONS, rutas públicas (/health, /docs)
+# Se registra ANTES de CORS para que CORS envuelva CSRF en ejecución
+app.add_middleware(CSRFMiddleware)
+
+# ================================
+# ERRORES NO CONTROLADOS (FE #710)
+# ================================
+# Registrado ANTES de CORS → se ejecuta DENTRO de él: un 500 lleva sus
+# cabeceras y el navegador lo lee como 500, no como «Failed to fetch»
+app.add_middleware(UnhandledErrorMiddleware)
+
+# ================================
+# RUTAS CON UNA BARRA CODIFICADA (FE-03)
+# ================================
+# Uvicorn decodifica %2F antes de enrutar: un id con «/» añadía tramos a la ruta. Antes
+# del CSRF y de las rutas, y dentro de CORS y del correlation id, como el 403 del CSRF:
+# el 400 se lee desde el front y el preflight lo contesta CORS (Agustín, 11 nov 2026)
+app.add_middleware(RutaSinBarrasCodificadas)
+
+# ================================
+# CORS MIDDLEWARE (v1.8.0)
+# ================================
+# Registrado DESPUÉS de CSRF → se ejecuta PRIMERO (orden inverso)
+# Así cualquier respuesta (incluidos 403 de CSRF) lleva headers CORS
+app.add_middleware(CORSMiddleware, **get_cors_config())
+
+# Sentry User Context Middleware (captura usuario de JWT para eventos)
+app.add_middleware(SentryUserContextMiddleware)
+
+# Cada 429, de slowapi o de una ruta, al log de seguridad (auditoría de la fase 6,
+# B-06). Solo mira el código de estado: la respuesta no cambia
+app.add_middleware(ApuntaLosLimitesSuperados)
+
+# Correlation ID Middleware (debe capturar todos los requests)
+app.add_middleware(CorrelationMiddleware)
+
+# https tras el proxy de Render: solo el esquema, por X-Forwarded-Proto, y solo hacia
+# https; la IP del cliente no la toca (P-03). Sin él la redirección de la barra final
+# bajaba a http://. Fuera de todo lo anterior; por fuera solo quedan el del dominio de
+# las cookies, el de depuración y add_security_headers, que no miran el esquema. Lo cambia en el mismo
+# scope, así que al volver ellos (y Sentry) también ven https
+app.add_middleware(EsquemaDelProxy)
+
+# El dominio de las cookies sale del Host de cada petición (ADR-054): la API se sirve
+# por más de un dominio. Hoy las cookies las ponen solo las rutas; va por fuera de todos
+# los de `add_middleware` para que uno que mañana escriba la suya también lo vea. Los
+# dos de `@app.middleware` (cabeceras y depuración) lo envuelven a él y no ponen cookies
+app.add_middleware(DominioDeLasCookies)
+
+# Debug middleware para ver requests CORS (solo en desarrollo)
+# Va casi al final para ejecutarse casi primero (solo le envuelve el de las cabeceras)
+# Con la regla del arranque: un ENVIRONMENT mal escrito no lo monta (fase 6, B-09)
+if en_desarrollo_declarado():
+
+    @app.middleware("http")
+    async def debug_cors_requests(request, call_next):
+        origin = request.headers.get("origin", "N/A")
+        method = request.method
+
+        # Log de peticiones con origen
+        if origin != "N/A":
+            print(f"🌍 {method} request to: {request.url.path}")
+            print(f"   Origin: {origin}")
+
+            if method == "OPTIONS":
+                print(
+                    f"   Access-Control-Request-Method: {request.headers.get('access-control-request-method', 'N/A')}"
+                )
+                print(
+                    f"   Access-Control-Request-Headers: {request.headers.get('access-control-request-headers', 'N/A')}"
+                )
+
+        response = await call_next(request)
+
+        # Log de respuesta CORS
+        if origin != "N/A":
+            print(f"   Response status: {response.status_code}")
+            cors_headers = {
+                k: v
+                for k, v in response.headers.items()
+                if "access-control" in k.lower() or "vary" in k.lower()
+            }
+            if cors_headers:
+                print(f"   CORS headers: {cors_headers}")
+            else:
+                print("   ⚠️  NO CORS headers in response!")
+
+        return response
+
+
+# ================================
+# SECURITY HEADERS MIDDLEWARE
+# ================================
+# El ÚLTIMO en registrarse: el más externo. Así llevan las cabeceras también el 403
+# del CSRF, el preflight que contesta CORS y el 500 del UnhandledErrorMiddleware, que
+# se las saltaban cuando era el más interno (F-15)
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """
+    Middleware para añadir Security Headers HTTP a todas las respuestas.
+
+    La política (y el porqué de cada cabecera) vive en
+    src/shared/infrastructure/http/security_headers.py, con sus tests.
+    """
+    response = await call_next(request)
+    apply_security_headers(response, request.url.path)
+    return response
+
+
+# Incluir los routers de la API
+app.include_router(
+    auth_routes.router,
+    prefix="/api/v1/auth",
+    tags=["Authentication"],
+)
+
+app.include_router(
+    google_auth_routes.router,
+    prefix="/api/v1/auth",
+    tags=["Authentication"],
+)
+
+app.include_router(
+    handicap_routes.router,
+    prefix="/api/v1",
+    tags=["Handicaps"],
+)
+
+app.include_router(
+    user_routes.router,
+    prefix="/api/v1/users",
+    tags=["Users"],
+)
+
+app.include_router(
+    admin_routes.router,
+    prefix="/api/v1/admin",
+    tags=["Admin"],
+)
+
+app.include_router(
+    avatar_routes.router,
+    prefix="/api/v1",
+    tags=["Avatars"],
+)
+
+app.include_router(
+    device_routes.router,
+    prefix="/api/v1",
+    tags=["Devices"],
+)
+
+app.include_router(
+    competition_crud_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    competition_state_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    draft_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    envelope_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    competition_golf_course_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    round_match_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    tee_group_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    tee_group_scoring_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    scoring_routes.router,
+    prefix="/api/v1/competitions",
+)
+
+app.include_router(
+    country_routes.router,
+    prefix="/api/v1/countries",
+    tags=["Countries"],
+)
+
+app.include_router(
+    enrollment_routes.router,
+    prefix="/api/v1",
+    tags=["Enrollments"],
+)
+
+app.include_router(
+    invitation_routes.router,
+    prefix="/api/v1",
+    tags=["Invitations"],
+)
+
+app.include_router(
+    friend_routes.router,
+    prefix="/api/v1",
+    tags=["Friends"],
+)
+
+app.include_router(
+    profile_routes.router,
+    prefix="/api/v1",
+    tags=["Profiles & Feed"],
+)
+
+app.include_router(
+    profile_photo_routes.router,
+    prefix="/api/v1",
+    tags=["Profile Photos"],
+)
+
+app.include_router(
+    quick_match_routes.router,
+    prefix="/api/v1",
+    tags=["Quick Matches"],
+)
+
+app.include_router(
+    golf_course_routes.router,
+    prefix="/api/v1",
+    tags=["Golf Courses"],
+)
+
+app.include_router(
+    hole_map_routes.router,
+    prefix="/api/v1",
+    tags=["Golf Courses"],
+)
+
+app.include_router(
+    support_routes.router,
+    prefix="/api/v1/support",
+    tags=["Support"],
+)
+
+
+# Endpoints protegidos de documentación con HTTP Basic Auth; las credenciales
+# equivocadas cuentan contra su límite por red (F-11)
+@app.get("/docs", include_in_schema=False)
+async def get_documentation(
+    username: str = Depends(verify_docs_credentials),  # noqa: ARG001
+):
+    """Swagger UI protegido con HTTP Basic Auth, con sus scripts fijados y con SRI (P-02)."""
+    return pagina_de_swagger("/openapi.json")
+
+
+@app.get("/redoc", include_in_schema=False)
+async def get_redoc_documentation(
+    username: str = Depends(verify_docs_credentials),  # noqa: ARG001
+):
+    """ReDoc UI protegido con HTTP Basic Auth, con su script fijado y con SRI (P-02)."""
+    return pagina_de_redoc("/openapi.json")
+
+
+@app.get("/openapi.json", include_in_schema=False)
+async def get_openapi_schema(
+    username: str = Depends(verify_docs_credentials),  # noqa: ARG001
+) -> JSONResponse:
+    """El esquema OpenAPI, con las mismas credenciales que /docs (F-11).
+
+    Las páginas de /docs y /redoc lo piden desde el navegador, que repite las
+    credenciales de HTTP Basic en el mismo origen.
+    """
+    return JSONResponse(app.openapi())
+
+
+# Endpoint raíz para health check y metadata básica
+@app.get("/", response_model=HealthResponse)
+async def root() -> HealthResponse:
+    return HealthResponse(
+        message="Comeback Golf API",
+        version=APP_VERSION,
+        status="running",
+        docs="Visita /docs para la documentacion interactiva",
+        description="API para gestion de torneos tipo Ryder Cup entre amigos",
+    )
+
+
+# Health check de despliegue: responde QUE version y QUE commit estan corriendo,
+# que es lo unico que permite verificar si una release ha llegado a produccion.
+# `/` no sirve para eso porque no distingue un despliegue de otro.
+@app.get("/health", response_model=DeploymentHealthResponse)
+async def health() -> DeploymentHealthResponse:
+    return DeploymentHealthResponse(
+        status="ok",
+        version=APP_VERSION,
+        commit=get_deployed_commit(),
+        branch=get_deployed_branch(),
+        environment=get_environment(),
+    )
+
+
+if __name__ == "__main__":
+    # Para reload=True necesitamos pasar la app como string
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

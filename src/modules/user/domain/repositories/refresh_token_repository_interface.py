@@ -1,0 +1,228 @@
+"""
+RefreshToken Repository Interface.
+
+Define el contrato para persistencia de refresh tokens.
+"""
+
+from abc import ABC, abstractmethod
+from datetime import datetime
+
+from src.modules.user.domain.entities.refresh_token import RefreshToken
+from src.modules.user.domain.value_objects.refresh_token_id import RefreshTokenId
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class RefreshTokenRepositoryInterface(ABC):
+    """
+    Interfaz para el repositorio de Refresh Tokens.
+
+    Define las operaciones de persistencia necesarias para gestionar
+    tokens de renovación (refresh tokens) en la capa de dominio.
+
+    Esta interfaz sigue el patrón Repository, permitiendo que el dominio
+    no dependa de detalles de implementación (SQLAlchemy, Redis, etc.).
+    """
+
+    @abstractmethod
+    async def save(self, refresh_token: RefreshToken) -> RefreshToken:
+        """
+        Persiste un refresh token.
+
+        Guarda un nuevo refresh token o actualiza uno existente.
+
+        Args:
+            refresh_token: Entidad RefreshToken a persistir
+
+        Returns:
+            La entidad persistida
+
+        Example:
+            >>> token = RefreshToken.create(user_id, jwt_token)
+            >>> saved = await repository.save(token)
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_id(self, token_id: RefreshTokenId) -> RefreshToken | None:
+        """
+        Busca un refresh token por su ID.
+
+        Args:
+            token_id: ID del refresh token
+
+        Returns:
+            RefreshToken si existe, None si no se encuentra
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_token_hash(self, token: str) -> RefreshToken | None:
+        """
+        Busca un refresh token por su hash.
+
+        Este método recibe el token JWT en texto plano, lo hashea,
+        y busca en la base de datos por el hash correspondiente.
+
+        Args:
+            token: Token JWT en texto plano
+
+        Returns:
+            RefreshToken si existe y el hash coincide, None si no
+
+        Example:
+            >>> token_jwt = "<jwt firmado>"
+            >>> refresh_token = await repository.find_by_token_hash(token_jwt)
+            >>> if refresh_token and refresh_token.is_valid(token_jwt):
+            >>>     # Token válido, renovar access token
+        """
+        pass
+
+    @abstractmethod
+    async def find_by_token_hash_for_update(self, token: str) -> RefreshToken | None:
+        """
+        Como find_by_token_hash, pero bloquea la fila hasta el final de la transacción
+        (F-02): dos refrescos a la vez con el mismo token se ordenan, y el segundo lee
+        lo que dejó el primero. Así no salen dos sustitutos ni un robo falso.
+        """
+
+    @abstractmethod
+    async def find_all_by_user(self, user_id: UserId) -> list[RefreshToken]:
+        """
+        Busca todos los refresh tokens de un usuario.
+
+        Útil para:
+        - Revocar todos los tokens en logout de todos los dispositivos
+        - Ver sesiones activas del usuario
+        - Auditoría de seguridad
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            Lista de RefreshTokens (puede estar vacía)
+
+        Example:
+            >>> tokens = await repository.find_all_by_user(user_id)
+            >>> active_tokens = [t for t in tokens if not t.revoked and not t.is_expired()]
+        """
+        pass
+
+    @abstractmethod
+    async def revoke_all_for_user(self, user_id: UserId) -> int:
+        """
+        Revoca todos los refresh tokens de un usuario.
+
+        Útil para:
+        - Logout de todos los dispositivos
+        - Cambio de contraseña (invalidar todas las sesiones)
+        - Compromiso de cuenta detectado
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            Número de sesiones vivas revocadas: también revoca los tokens ya
+            sustituidos por la rotación, pero no los cuenta (F-02)
+
+        Example:
+            >>> # Usuario cambia contraseña -> invalidar todas las sesiones
+            >>> revoked_count = await repository.revoke_all_for_user(user_id)
+        """
+        pass
+
+    @abstractmethod
+    async def count_active_for_user(self, user_id: UserId) -> int:
+        """
+        Cuenta los refresh tokens activos (no revocados, no sustituidos, no expirados).
+
+        Útil para:
+        - Limitar número de sesiones simultáneas
+        - Dashboard de seguridad ("Tienes 3 sesiones activas")
+        - Detección de uso anómalo
+
+        Args:
+            user_id: ID del usuario
+
+        Returns:
+            Número de tokens activos
+
+        Example:
+            >>> active_sessions = await repository.count_active_for_user(user_id)
+            >>> if active_sessions > 10:
+            >>>     # Posible compromiso de cuenta
+            >>>     await send_security_alert(user_id)
+        """
+        pass
+
+    @abstractmethod
+    async def delete(self, token_id: RefreshTokenId) -> bool:
+        """
+        Elimina un refresh token específico.
+
+        Args:
+            token_id: ID del token a eliminar
+
+        Returns:
+            True si se eliminó, False si no existía
+
+        Example:
+            >>> deleted = await repository.delete(token_id)
+        """
+        pass
+
+    @abstractmethod
+    async def revoke_all_for_device(self, device_id: UserDeviceId) -> int:
+        """
+        Revoca todos los refresh tokens de un dispositivo específico.
+
+        Este método es CRÍTICO para la funcionalidad de revocación de dispositivos.
+        Cuando un usuario revoca un dispositivo, TODOS los refresh tokens asociados
+        a ese dispositivo deben invalidarse para cerrar las sesiones activas.
+
+        Útil para:
+        - Revocar dispositivo → cerrar sesiones del dispositivo
+        - Usuario revoca Safari iOS → Safari iOS se desloguea automáticamente
+        - Compromiso de dispositivo detectado
+
+        Args:
+            device_id: ID del dispositivo cuyos tokens se revocarán
+
+        Returns:
+            Número de sesiones vivas revocadas: también revoca los tokens ya
+            sustituidos por la rotación, pero no los cuenta (F-02)
+
+        Example:
+            >>> # Usuario revoca su iPhone desde su Mac
+            >>> device_id = UserDeviceId("550e8400-...")
+            >>> revoked_count = await repository.revoke_all_for_device(device_id)
+            >>> # Todos los refresh tokens del iPhone quedan inválidos
+            >>> # iPhone se desloguea al intentar refrescar el access token
+        """
+        pass
+
+    @abstractmethod
+    async def device_ids_with_live_tokens(
+        self, user_id: UserId, ahora: datetime
+    ) -> set[UserDeviceId]:
+        """
+        Los dispositivos del usuario con algún refresh token vivo: sin revocar, sin
+        sustituir y sin caducar a `ahora` (BE #737). Son los que tienen una sesión
+        abierta de verdad.
+        """
+
+    @abstractmethod
+    async def hay_uno_vivo_mas_nuevo(
+        self, device_ids: list[UserDeviceId], creado_despues_de: datetime, ahora: datetime
+    ) -> bool:
+        """
+        Si alguno de esos dispositivos (los del navegador) tiene un refresh token vivo
+        (sin revocar, sin sustituir ni caducar a `ahora`) de una sesión empezada después
+        de `creado_despues_de` (BE
+        #734): entonces el navegador ya tiene la cookie de esa sesión nueva, y un
+        rechazo tardío del token viejo no la borra.
+        """
+
+    @abstractmethod
+    async def delete_expired_before(self, antes: datetime) -> int:
+        """Borra los refresh tokens caducados antes de `antes`; devuelve cuántos (BE #737)."""

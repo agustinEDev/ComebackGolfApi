@@ -1,0 +1,458 @@
+"""DTOs para el modulo QuickMatch."""
+
+from datetime import datetime
+from typing import Annotated, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from src.modules.golf_course.domain.value_objects.tee_color import TeeColor
+from src.modules.quick_match.domain.entities.quick_match import MAX_NAME_LENGTH, MAX_SCORERS
+from src.modules.quick_match.domain.value_objects.quick_match_participant import (
+    MAX_HANDICAP,
+    MIN_HANDICAP,
+)
+
+# Del enum, no de una lista escrita a mano: añadir un color nuevo no puede
+# dejar la validación de la API por detrás del dominio.
+TEE_COLOR_PATTERN = f"^({'|'.join(TeeColor)})$"
+TEE_GENDER_PATTERN = "^(MALE|FEMALE)$"
+
+
+def _require_tee_color_for_gender(tee_color: str | None, tee_gender: str | None) -> None:
+    """
+    El color y el género van juntos: son las dos mitades de la misma identidad.
+
+    Ni un color suelto ni un género suelto señalan una salida concreta, así que
+    se rechaza cualquiera de las dos mitades por separado antes de que el caso
+    de uso pregunte al campo si esa salida existe.
+    """
+    if (tee_color is None) != (tee_gender is None):
+        raise ValueError("tee_color and tee_gender must be provided together.")
+
+
+class CreateQuickMatchRequestDTO(BaseModel):
+    """DTO para crear una partida rapida. Exactamente uno de match_format/scoring_format."""
+
+    creator_id: UUID
+    golf_course_id: UUID
+    match_format: str | None = Field(None, pattern="^(SINGLES|FOURBALL|FOURSOMES)$")
+    scoring_format: str | None = Field(None, pattern="^(MEDAL|STABLEFORD)$")
+    name: str | None = Field(
+        None, max_length=MAX_NAME_LENGTH, description="Nombre opcional para diferenciar la partida"
+    )
+    allowance_percentage: int | None = Field(
+        None, ge=50, le=100, description="Allowance WHS personalizado (50-100, incrementos de 5)."
+    )
+    play_mode: str = Field(
+        "HANDICAP",
+        pattern="^(SCRATCH|HANDICAP)$",
+        description=(
+            "SCRATCH juega a golpes brutos y nadie recibe golpes; HANDICAP aplica "
+            "el reparto WHS. Se omite para el comportamiento habitual (HANDICAP)."
+        ),
+    )
+    creator_tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    creator_tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _strip_name(cls, value: str | None) -> str | None:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _exactly_one_format(self) -> "CreateQuickMatchRequestDTO":
+        if (self.match_format is None) == (self.scoring_format is None):
+            raise ValueError("Exactly one of match_format or scoring_format must be provided.")
+        return self
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "CreateQuickMatchRequestDTO":
+        _require_tee_color_for_gender(self.creator_tee_color, self.creator_tee_gender)
+        return self
+
+
+class AddParticipantRequestDTO(BaseModel):
+    """DTO para añadir un amigo registrado como participante."""
+
+    quick_match_id: UUID
+    requester_id: UUID
+    friend_user_id: UUID
+    team: str | None = Field(None, pattern="^(A|B)$")
+    tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "AddParticipantRequestDTO":
+        _require_tee_color_for_gender(self.tee_color, self.tee_gender)
+        return self
+
+
+class AddGuestParticipantRequestDTO(BaseModel):
+    """DTO para añadir a mano un jugador invitado (sin cuenta) como participante."""
+
+    quick_match_id: UUID
+    requester_id: UUID
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    handicap: float | None = Field(None, ge=-10.0, le=54.0)
+    team: str | None = Field(None, pattern="^(A|B)$")
+    tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "AddGuestParticipantRequestDTO":
+        _require_tee_color_for_gender(self.tee_color, self.tee_gender)
+        return self
+
+
+class SetParticipantHandicapRequestDTO(BaseModel):
+    """DTO para editar el handicap (manual u override) de un participante, en PENDING."""
+
+    quick_match_id: UUID
+    requester_id: UUID
+    target_participant_id: UUID
+    handicap: float | None = Field(None, ge=MIN_HANDICAP, le=MAX_HANDICAP)
+
+
+class RemoveParticipantRequestDTO(BaseModel):
+    """DTO para eliminar un participante (leave o kick por el creador)."""
+
+    quick_match_id: UUID
+    requester_id: UUID
+    target_participant_id: UUID
+
+
+class HideQuickMatchRequestDTO(BaseModel):
+    """DTO para ocultar/mostrar una partida rapida del propio historial (siempre self-scoped)."""
+
+    quick_match_id: UUID
+    requester_id: UUID
+
+
+class StartQuickMatchRequestDTO(BaseModel):
+    """DTO para iniciar la partida, configurando quien anota (1 a 4 anotadores)."""
+
+    quick_match_id: UUID
+    requester_id: UUID
+    scorer_ids: list[UUID] = Field(..., min_length=1, max_length=MAX_SCORERS)
+
+
+class QuickStartFriendDTO(BaseModel):
+    """Un amigo en la partida que se crea e inicia de una vez (FE #848)."""
+
+    kind: Literal["FRIEND"] = "FRIEND"
+    friend_user_id: UUID
+    team: str | None = Field(None, pattern="^(A|B)$")
+    tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+    handicap: float | None = Field(
+        None,
+        ge=MIN_HANDICAP,
+        le=MAX_HANDICAP,
+        description="Override del hándicap del perfil para esta partida; sin él, el del perfil.",
+    )
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "QuickStartFriendDTO":
+        _require_tee_color_for_gender(self.tee_color, self.tee_gender)
+        return self
+
+
+class QuickStartGuestDTO(BaseModel):
+    """Un invitado sin cuenta en la partida que se crea e inicia de una vez (FE #848)."""
+
+    kind: Literal["GUEST"] = "GUEST"
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    handicap: float | None = Field(None, ge=MIN_HANDICAP, le=MAX_HANDICAP)
+    team: str | None = Field(None, pattern="^(A|B)$")
+    tee_color: str | None = Field(None, pattern=TEE_COLOR_PATTERN)
+    tee_gender: str | None = Field(None, pattern=TEE_GENDER_PATTERN)
+
+    @model_validator(mode="after")
+    def _tee_gender_requires_color(self) -> "QuickStartGuestDTO":
+        _require_tee_color_for_gender(self.tee_color, self.tee_gender)
+        return self
+
+
+QuickStartPlayerDTO = Annotated[
+    QuickStartFriendDTO | QuickStartGuestDTO, Field(discriminator="kind")
+]
+
+
+def require_unique(ids: list[UUID], field: str) -> list[UUID]:
+    """Sin repetidos: lo comparten el DTO y el body de la ruta."""
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{field} must not contain duplicates.")
+    return ids
+
+
+class CreateAndStartQuickMatchRequestDTO(CreateQuickMatchRequestDTO):
+    """
+    Crear e iniciar una partida rápida en una sola petición (FE #848).
+
+    Lo del alta, más los jugadores EN EL ORDEN en que se añadieron, los cambios
+    de hándicap y quién anota: el asistente no crea nada hasta «Confirmar e
+    iniciar», y salir a medias no deja una partida pendiente.
+
+    - `quick_match_id` lo genera el cliente: reintentar tras perder la
+      respuesta devuelve la misma partida en vez de crear otra.
+    - Los anotadores van por su UserId, que es el `participant_id` de un
+      registrado; un invitado no puede anotar.
+    """
+
+    quick_match_id: UUID
+    creator_handicap: float | None = Field(None, ge=MIN_HANDICAP, le=MAX_HANDICAP)
+    participants: list[QuickStartPlayerDTO] = Field(default_factory=list, max_length=3)
+    scorer_user_ids: list[UUID] = Field(..., min_length=1, max_length=MAX_SCORERS)
+
+    @field_validator("scorer_user_ids")
+    @classmethod
+    def _unique_scorer_user_ids(cls, value: list[UUID]) -> list[UUID]:
+        return require_unique(value, "scorer_user_ids")
+
+
+class CreateAndStartQuickMatchResponseDTO(BaseModel):
+    """La partida, y si se acaba de crear o ya existía (reintento con el mismo id)."""
+
+    quick_match: "QuickMatchResponseDTO"
+    created: bool
+
+
+class SubmitHoleScoreRequestDTO(BaseModel):
+    """
+    DTO para registrar/actualizar el score propio de un hoyo (solo anotadores).
+
+    `score` nulo es la raya: el hoyo queda anotado como recogido. El campo sigue
+    siendo obligatorio en el body —`Field(...)`—, asi que omitirlo no es lo
+    mismo que mandarlo nulo y no se puede borrar un score por descuido.
+    """
+
+    quick_match_id: UUID
+    player_user_id: UUID
+    hole_number: int = Field(..., ge=1, le=18)
+    score: int | None = Field(..., ge=1, le=15)
+
+
+class SubmitProxyHoleScoreRequestDTO(BaseModel):
+    """DTO para que un anotador registre el score de otro participante asignado."""
+
+    quick_match_id: UUID
+    scorer_user_id: UUID
+    target_participant_id: UUID
+    hole_number: int = Field(..., ge=1, le=18)
+    score: int | None = Field(..., ge=1, le=15)
+
+
+class QuickMatchParticipantDTO(BaseModel):
+    """DTO de un participante enriquecido con su nombre."""
+
+    participant_id: UUID
+    user_id: UUID | None = None
+    name: str
+    # Para rellenar el asistente al repetir la partida sin partir `name` a ojo
+    # (BE #717, FE #1021)
+    first_name: str | None = Field(
+        default=None,
+        description="Nombre del invitado, como se creo. Nulo en los registrados.",
+    )
+    last_name: str | None = Field(
+        default=None,
+        description="Apellidos del invitado, como se creo. Nulo en los registrados.",
+    )
+    handicap: float | None = None
+    team: str | None = None
+    is_guest: bool = False
+    tee_color: str | None = None
+    tee_gender: str | None = None
+
+
+class QuickMatchResponseDTO(BaseModel):
+    """DTO de respuesta completa de una partida rapida."""
+
+    id: UUID
+    creator_id: UUID
+    golf_course_id: UUID
+    match_format: str | None = None
+    scoring_format: str | None = None
+    status: str
+    name: str | None = None
+    allowance_percentage: int | None = None
+    effective_allowance: int
+    play_mode: str = "HANDICAP"
+    participants: list[QuickMatchParticipantDTO]
+    scorer_ids: list[UUID]
+    excluded_from_stats: bool = Field(
+        default=False,
+        description=(
+            "True si QUIEN PREGUNTA ha dejado esta partida fuera de sus estadisticas. "
+            "La partida se sigue viendo en su historial, marcada. Es por usuario: "
+            "la misma partida puede contar para un participante y no para otro."
+        ),
+    )
+    created_at: datetime
+    updated_at: datetime
+    played_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Cuando se jugo, en UTC con su zona: al empezar, o al crearla si nunca "
+            "empezo. Es la fecha que se enseña (H5)."
+        ),
+    )
+
+
+class HideQuickMatchResponseDTO(QuickMatchResponseDTO):
+    """
+    La respuesta de tirar una partida a la papelera (26 nov 2026): la partida,
+    como siempre, y si con eso se ha borrado de verdad. En un DTO aparte para
+    que `deleted` no viaje en el detalle ni en la lista, donde no dice nada.
+    """
+
+    deleted: bool = Field(
+        default=False,
+        description=(
+            "True cuando con esta papelera la han tirado ya todos sus jugadores y la "
+            "partida se ha BORRADO de verdad: lo que viene es su ultima foto, y desde "
+            "ahora responde 404."
+        ),
+    )
+
+
+class PaginatedQuickMatchResponseDTO(BaseModel):
+    """DTO paginado de partidas rapidas."""
+
+    quick_matches: list[QuickMatchResponseDTO]
+    total_count: int
+    page: int
+    limit: int
+
+
+class HoleScoreResponseDTO(BaseModel):
+    """DTO de un score de hoyo registrado. `score` nulo es la raya."""
+
+    hole_number: int
+    participant_id: UUID
+    score: int | None
+    recorded_by_participant_id: UUID
+
+
+class QuickMatchStandingResponseDTO(BaseModel):
+    """DTO del estado del partido calculado a partir de los scores registrados."""
+
+    status: str
+    leading_team: str | None = None
+    holes_played: int
+    holes_remaining: int
+    is_decided: bool
+
+
+class ScoringAssignmentDTO(BaseModel):
+    """DTO del reparto de anotacion: que participantes cubre cada anotador."""
+
+    scorer_participant_id: UUID
+    scorer_name: str
+    covered_participant_ids: list[UUID]
+
+
+class ParticipantStrokesDTO(BaseModel):
+    """
+    Golpes que recibe un participante, ya resueltos por el backend.
+
+    Se expone para que la tarjeta pinte exactamente los mismos golpes que se han
+    usado para decidir cada hoyo. El frontend conserva su propio calculo para
+    poder anotar sin conexion, pero mientras haya red este es el dato bueno.
+    """
+
+    participant_id: UUID
+    playing_handicap: int
+    # Numero de hoyo -> golpes en ese hoyo, CON SIGNO (negativo si los cede, que
+    # es lo que hace un handicap plus). Solo los hoyos con golpe.
+    strokes_by_hole: dict[int, int] = Field(default_factory=dict)
+
+
+class QuickMatchDetailResponseDTO(QuickMatchResponseDTO):
+    """DTO de detalle: partida + scores + standing + reparto de anotacion."""
+
+    hole_scores: list[HoleScoreResponseDTO]
+    standing: QuickMatchStandingResponseDTO | None = None
+    scoring_assignments: list[ScoringAssignmentDTO] = Field(default_factory=list)
+    participant_strokes: list[ParticipantStrokesDTO] = Field(default_factory=list)
+
+
+class SharedQuickMatchParticipantDTO(BaseModel):
+    """
+    Un participante en la vista de solo lectura (bloque K).
+
+    `name` nulo: quien mira no puede ver su nombre. Con `is_guest`, el cliente
+    pinta «un invitado»; sin el, «un jugador» (bloqueo o cuenta desactivada),
+    igual que en Actividad.
+    """
+
+    participant_id: UUID
+    user_id: UUID | None = None
+    name: str | None = None
+    first_name: str | None = Field(
+        default=None,
+        description="Nombre del invitado. Nulo en los registrados y, como `name`, si quien mira no puede verlo.",
+    )
+    last_name: str | None = Field(
+        default=None,
+        description="Apellidos del invitado. Nulo en los registrados y, como `name`, si quien mira no puede verlo.",
+    )
+    handicap: float | None = None
+    team: str | None = None
+    is_guest: bool = False
+    tee_color: str | None = None
+    tee_gender: str | None = None
+
+
+class SharedScoringAssignmentDTO(BaseModel):
+    """El reparto de anotacion en solo lectura: `scorer_name` nulo, como `name`."""
+
+    scorer_participant_id: UUID
+    scorer_name: str | None = None
+    covered_participant_ids: list[UUID]
+
+
+class SharedQuickMatchDetailResponseDTO(BaseModel):
+    """
+    La partida rapida de un amigo, en solo lectura (bloque K, 22 oct 2026).
+
+    Lleva los mismos campos que `QuickMatchDetailResponseDTO` —la pantalla de
+    la partida la pinta sin cambios— salvo que los nombres pueden venir nulos.
+    Es un contrato aparte, y no el detalle con los nombres opcionales, para no
+    tocar el de quien anota: ahi el nombre sigue siendo obligatorio.
+    """
+
+    id: UUID
+    creator_id: UUID
+    golf_course_id: UUID
+    match_format: str | None = None
+    scoring_format: str | None = None
+    status: str
+    name: str | None = None
+    allowance_percentage: int | None = None
+    effective_allowance: int
+    play_mode: str = "HANDICAP"
+    participants: list[SharedQuickMatchParticipantDTO]
+    scorer_ids: list[UUID]
+    excluded_from_stats: bool = False
+    created_at: datetime
+    updated_at: datetime
+    played_at: datetime | None = None
+    hole_scores: list[HoleScoreResponseDTO]
+    standing: QuickMatchStandingResponseDTO | None = None
+    scoring_assignments: list[SharedScoringAssignmentDTO] = Field(default_factory=list)
+    participant_strokes: list[ParticipantStrokesDTO] = Field(default_factory=list)
+    read_only: bool = Field(
+        default=True,
+        description="Siempre True: esta vista no deja anotar ni tocar nada.",
+    )
+    viewer_is_participant: bool = Field(
+        default=False,
+        description="Si quien mira jugo la partida: entonces ve todos los nombres.",
+    )
+
+
+CreateAndStartQuickMatchResponseDTO.model_rebuild()

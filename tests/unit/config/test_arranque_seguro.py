@@ -1,0 +1,548 @@
+"""
+La app no arranca fuera de desarrollo con una configuración insegura (F-06 y F-12,
+auditoría OWASP del 9 nov 2026).
+
+Fuera de un desarrollo declarado (`ENVIRONMENT=development`: local, Kind y los tests;
+sin ENVIRONMENT o con otro valor cuenta como producción, como en contrasenas.py y
+rate_limit.py):
+
+  S1 TESTING=true                         -> no arranca (apaga CSRF y más)
+  S2 sin SECRET_KEY                       -> no arranca
+  S3 SECRET_KEY de ejemplo                -> no arranca (las de settings, .env.example,
+                                             docker y k8s)
+  S4 SECRET_KEY de menos de 32 bytes      -> no arranca
+  S5 configuración buena                  -> arranca
+  S6 en desarrollo, todo lo anterior vale -> arranca
+  S7 el mensaje no lleva la clave
+  S8 el arranque de verdad (lifespan) lo comprueba
+  S9 el algoritmo del JWT es HS256 aunque ALGORITHM diga otro
+  S10 COOKIE_DOMAIN con una entrada que no es un dominio -> no arranca, sin el valor
+      en el mensaje (ADR-054); en desarrollo vale `localhost` o una IP
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from src.config.arranque_seguro import (
+    CLAVES_DE_EJEMPLO,
+    comprueba_la_configuracion_de_seguridad,
+)
+
+RAIZ = Path(__file__).resolve().parents[3]
+CLAVE_BUENA = "k" * 48
+PRODUCCION = {"ENVIRONMENT": "production", "SECRET_KEY": CLAVE_BUENA}
+
+
+@pytest.mark.parametrize("testing", ["true", "TRUE", " true "])
+def test_s1_testing_outside_development_refuses_to_start(testing):
+    """
+    Given: Producción con TESTING=true (apaga el CSRF y deja elegir la red)
+    When: Se comprueba la configuración
+    Then: RuntimeError: no arranca
+    """
+    with pytest.raises(RuntimeError, match="TESTING"):
+        comprueba_la_configuracion_de_seguridad({**PRODUCCION, "TESTING": testing})
+
+
+@pytest.mark.parametrize("clave", [None, "", "   "])
+def test_s2_a_missing_secret_key_refuses_to_start(clave):
+    """
+    Given: Producción sin SECRET_KEY (o vacía)
+    When: Se comprueba la configuración
+    Then: RuntimeError: no arranca
+    """
+    entorno = {"ENVIRONMENT": "production"}
+    if clave is not None:
+        entorno["SECRET_KEY"] = clave
+
+    with pytest.raises(RuntimeError, match="SECRET_KEY sin configurar"):
+        comprueba_la_configuracion_de_seguridad(entorno)
+
+
+@pytest.mark.parametrize("clave", sorted(CLAVES_DE_EJEMPLO))
+def test_s3_an_example_secret_key_refuses_to_start(clave):
+    """
+    Given: Producción con una SECRET_KEY de ejemplo de los ficheros del repositorio
+    When: Se comprueba la configuración
+    Then: RuntimeError: no arranca, aunque sea larga
+    """
+    with pytest.raises(RuntimeError, match="valor de ejemplo"):
+        comprueba_la_configuracion_de_seguridad({"ENVIRONMENT": "production", "SECRET_KEY": clave})
+
+
+def test_s3_the_known_examples_are_listed():
+    """
+    Given: Los valores de ejemplo de settings.py, .env.example, docker y k8s
+    When: Se mira la lista
+    Then: Están todos
+    """
+    assert {
+        "your-secret-key-change-in-production",
+        "your-secret-key-change-me",
+        "your_secret_key_here",
+        "MISSING_SECRET_KEY",
+        "your-super-secret-key-min-32-chars",
+        "your-local-secret-key",
+    } <= CLAVES_DE_EJEMPLO
+
+
+def test_s3_the_settings_default_is_an_example():
+    """
+    Given: La SECRET_KEY por defecto de settings.py (sin variable de entorno)
+    When: Se mira si es de ejemplo
+    Then: Lo es: un despliegue sin la variable no arranca
+    """
+    codigo = (RAIZ / "src/config/settings.py").read_text(encoding="utf-8")
+
+    assert any(f'"SECRET_KEY", "{clave}"' in codigo for clave in CLAVES_DE_EJEMPLO)
+
+
+@pytest.mark.parametrize("longitud", [1, 16, 31])
+def test_s4_a_short_secret_key_refuses_to_start(longitud):
+    """
+    Given: Producción con una SECRET_KEY de menos de 32 bytes
+    When: Se comprueba la configuración
+    Then: RuntimeError: no arranca
+    """
+    with pytest.raises(RuntimeError, match="32"):
+        comprueba_la_configuracion_de_seguridad(
+            {"ENVIRONMENT": "production", "SECRET_KEY": "x" * longitud}
+        )
+
+
+def test_s4_the_length_is_in_bytes():
+    """
+    Given: Una SECRET_KEY de 16 caracteres de 2 bytes (32 bytes en UTF-8)
+    When: Se comprueba la configuración
+    Then: Arranca: la longitud se mide en bytes, que es lo que usa el HMAC
+    """
+    comprueba_la_configuracion_de_seguridad({"ENVIRONMENT": "production", "SECRET_KEY": "ñ" * 16})
+
+
+@pytest.mark.parametrize(
+    "entorno",
+    [
+        PRODUCCION,
+        {**PRODUCCION, "TESTING": "false"},
+        {"SECRET_KEY": "x" * 32},  # sin ENVIRONMENT: producción, y la clave vale
+    ],
+)
+def test_s5_a_good_configuration_starts(entorno):
+    """
+    Given: Una configuración de producción buena
+    When: Se comprueba
+    Then: No lanza nada
+    """
+    comprueba_la_configuracion_de_seguridad(entorno)
+
+
+@pytest.mark.parametrize(
+    "entorno",
+    [
+        {"ENVIRONMENT": "development", "TESTING": "true"},
+        {"ENVIRONMENT": "Development", "SECRET_KEY": "your-secret-key-change-me"},
+        {"ENVIRONMENT": "development", "SECRET_KEY": "corta"},
+    ],
+)
+def test_s6_a_declared_development_starts_with_anything(entorno):
+    """
+    Given: ENVIRONMENT=development (local, Kind y los tests)
+    When: Se comprueba con TESTING, una clave de ejemplo o corta
+    Then: Arranca, como hasta ahora
+    """
+    comprueba_la_configuracion_de_seguridad(entorno)
+
+
+@pytest.mark.parametrize("environment", [None, "staging", "produccion", "prod"])
+def test_s6_an_unknown_environment_counts_as_production(environment):
+    """
+    Given: ENVIRONMENT ausente o desconocido, con TESTING=true
+    When: Se comprueba la configuración
+    Then: No arranca: solo un desarrollo declarado se libra
+    """
+    entorno = {"SECRET_KEY": CLAVE_BUENA, "TESTING": "true"}
+    if environment is not None:
+        entorno["ENVIRONMENT"] = environment
+
+    with pytest.raises(RuntimeError):
+        comprueba_la_configuracion_de_seguridad(entorno)
+
+
+def test_s7_the_error_does_not_reveal_the_key():
+    """
+    Given: Producción con una SECRET_KEY corta
+    When: Se rechaza
+    Then: El mensaje no lleva la clave
+    """
+    with pytest.raises(RuntimeError) as error:
+        comprueba_la_configuracion_de_seguridad(
+            {"ENVIRONMENT": "production", "SECRET_KEY": "clave-corta-secreta"}
+        )
+
+    assert "clave-corta-secreta" not in str(error.value)
+
+
+async def test_s8_the_real_startup_checks_it(monkeypatch):
+    """
+    Given: Producción con TESTING=true en el entorno del proceso
+    When: Arranca la app (su lifespan)
+    Then: No arranca
+    """
+    import main
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("TESTING", "true")
+    monkeypatch.setenv("SECRET_KEY", CLAVE_BUENA)
+    # La del `.env` local es http://localhost: en producción no vale, y pararía antes
+    monkeypatch.delenv("FRONTEND_URL", raising=False)
+    monkeypatch.setattr(main.settings, "SENTRY_DSN", "")
+
+    with pytest.raises(RuntimeError, match="TESTING"):
+        async with main.lifespan(main.app):
+            pass
+
+
+def test_s9_the_jwt_algorithm_is_always_hs256():
+    """
+    Given: ALGORITHM=none en el entorno (o cualquier otro)
+    When: Se cargan los settings en un proceso nuevo
+    Then: El algoritmo sigue siendo HS256: ya no se lee del entorno
+    """
+    for algoritmo in ("none", "HS512"):
+        salida = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from src.config.settings import settings; print(settings.ALGORITHM)",
+            ],
+            cwd=RAIZ,
+            env={**os.environ, "ALGORITHM": algoritmo},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert salida.stdout.strip() == "HS256"
+
+
+@pytest.mark.parametrize("render", ["true", "1", "yes"])
+def test_s10_development_on_render_refuses_to_start(render):
+    """
+    Given: ENVIRONMENT=development con RENDER definida (Render la pone siempre)
+    When: Se comprueba la configuración
+    Then: No arranca: un desarrollo declarado por error en Render se saltaría todo lo
+          demás (revisión de la fase 2)
+    """
+    with pytest.raises(RuntimeError, match="RENDER"):
+        comprueba_la_configuracion_de_seguridad(
+            {"ENVIRONMENT": "development", "RENDER": render, "TESTING": "true"}
+        )
+
+
+@pytest.mark.parametrize("entorno", [{"RENDER": ""}, {}])
+def test_s10_development_without_render_still_starts(entorno):
+    """
+    Given: ENVIRONMENT=development sin RENDER (o vacía): local, Kind y los tests
+    When: Se comprueba la configuración
+    Then: Arranca
+    """
+    comprueba_la_configuracion_de_seguridad({"ENVIRONMENT": "development", **entorno})
+
+
+def test_s10_production_on_render_with_a_good_config_starts():
+    """
+    Given: Producción en Render con una configuración buena
+    When: Se comprueba
+    Then: Arranca
+    """
+    comprueba_la_configuracion_de_seguridad({**PRODUCCION, "RENDER": "true"})
+
+
+def _como_script(entorno: dict[str, str]) -> subprocess.CompletedProcess:
+    """Ejecuta `python -m src.config.arranque_seguro` con solo ese entorno (y PATH)."""
+    return subprocess.run(
+        [sys.executable, "-m", "src.config.arranque_seguro"],
+        cwd=RAIZ,
+        env={"PATH": os.environ.get("PATH", ""), **entorno},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "entorno",
+    [
+        {"ENVIRONMENT": "production", "SECRET_KEY": CLAVE_BUENA, "TESTING": "true"},
+        {"ENVIRONMENT": "production", "SECRET_KEY": "corta-y-secreta"},
+        {"ENVIRONMENT": "production"},
+    ],
+)
+def test_s11_as_a_script_a_bad_config_exits_non_zero_without_the_key(entorno):
+    """
+    Given: Una configuración insegura de producción
+    When: Se ejecuta el módulo como script (lo hace entrypoint.sh antes de migrar)
+    Then: Sale con código distinto de 0, dice el motivo y no muestra la clave
+    """
+    resultado = _como_script(entorno)
+
+    assert resultado.returncode != 0
+    assert "no se arranca" in resultado.stderr
+    assert "corta-y-secreta" not in resultado.stdout + resultado.stderr
+
+
+@pytest.mark.parametrize(
+    "entorno",
+    [{"ENVIRONMENT": "production", "SECRET_KEY": CLAVE_BUENA}, {"ENVIRONMENT": "development"}],
+)
+def test_s11_as_a_script_a_good_config_exits_zero(entorno):
+    """
+    Given: Una configuración buena (o un desarrollo declarado)
+    When: Se ejecuta el módulo como script
+    Then: Sale con 0
+    """
+    assert _como_script(entorno).returncode == 0
+
+
+def test_s12_the_entrypoint_checks_before_migrating():
+    """
+    Given: entrypoint.sh (el arranque de Render y del Kind)
+    When: Se mira el orden de sus pasos
+    Then: Comprueba la configuración de seguridad ANTES de `alembic upgrade head`, y
+          sale si falla: con una configuración mala la base de datos no se migra
+          mientras la app vieja sigue sirviendo
+    """
+    guion = (RAIZ / "entrypoint.sh").read_text(encoding="utf-8")
+    comprobacion = guion.index("if ! python -m src.config.arranque_seguro; then")
+    migracion = guion.index("alembic upgrade head")
+
+    assert comprobacion < migracion
+    assert "exit 1" in guion[comprobacion:migracion]
+
+
+@pytest.mark.parametrize(
+    ("entorno", "es"),
+    [
+        ({"TESTING": "true", "ENVIRONMENT": "development"}, True),
+        ({"TESTING": "TRUE", "ENVIRONMENT": " Development "}, True),
+        ({"TESTING": "true"}, False),
+        ({"ENVIRONMENT": "development"}, False),
+        ({"TESTING": "true", "ENVIRONMENT": "production"}, False),
+        ({}, False),
+    ],
+)
+def test_s13_test_mode_needs_testing_and_development(entorno, es):
+    """
+    Given: Cada combinación de TESTING y ENVIRONMENT
+    When: Se pregunta si es el modo de tests
+    Then: Solo con TESTING=true Y ENVIRONMENT=development (ADR-047)
+    """
+    from src.config.arranque_seguro import modo_de_tests
+
+    assert modo_de_tests(entorno) is es
+
+
+def test_s13_csrf_and_rate_limit_share_the_test_mode_predicate():
+    """
+    Given: El salto del CSRF y X-Test-Client-ID
+    When: Se mira de dónde sacan el modo de tests
+    Then: Los dos de modo_de_tests, sin repetir la condición (/code-review)
+    """
+    for fichero in (
+        "src/shared/infrastructure/middleware/csrf_middleware.py",
+        "src/config/rate_limit.py",
+    ):
+        codigo = (RAIZ / fichero).read_text(encoding="utf-8")
+        assert "modo_de_tests(" in codigo, fichero
+        assert "testing_activado(" not in codigo, fichero
+
+
+# --- R4: la URL de las migraciones (auditoría de la fase 6, DB-01) ---------------------
+
+
+@pytest.mark.parametrize("entorno_base", [{"ENVIRONMENT": "development"}, {}])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "mysql://u:clave-secreta@h/db",
+        "clave-secreta",
+        "http://x",
+        "postgresx://u:clave-secreta@h/db",
+        "postgresql:/u:clave-secreta@h/db",
+    ],
+)
+def test_r4_a_malformed_migrations_url_does_not_start_and_is_not_shown(entorno_base, url):
+    """
+    Given: MIGRATIONS_DATABASE_URL puesta, pero sin formato de URL de Postgres
+    When: Se comprueba la configuración (en desarrollo o fuera)
+    Then: No arranca, dice el motivo y no muestra la URL (lleva la contraseña del dueño)
+    """
+    entorno = {"SECRET_KEY": CLAVE_BUENA, **entorno_base, "MIGRATIONS_DATABASE_URL": url}
+
+    with pytest.raises(RuntimeError) as error:
+        comprueba_la_configuracion_de_seguridad(entorno)
+
+    assert "MIGRATIONS_DATABASE_URL" in str(error.value)
+    assert "clave-secreta" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "postgres://u:p@h:5432/db",
+        "postgresql://u:p@h/db",
+        "postgresql+psycopg2://u:p@h/db",
+        "postgresql+asyncpg://u:p@h/db",
+    ],
+)
+def test_r4_a_postgres_migrations_url_or_none_starts(url):
+    """Una URL de Postgres, o ninguna, no impide arrancar."""
+    entorno = {"ENVIRONMENT": "production", "SECRET_KEY": CLAVE_BUENA}
+    if url:
+        entorno["MIGRATIONS_DATABASE_URL"] = url
+
+    comprueba_la_configuracion_de_seguridad(entorno)
+
+
+@pytest.mark.parametrize(
+    "valor",
+    [
+        "https://.antiguo.example",
+        ".antiguo.example:443",
+        ".antiguo.example;.comebackgolf.com",
+        ".antiguo.example .comebackgolf.com",
+        ".com",
+        "com",
+        ".antiguo.example,https://comebackgolf.com",
+        ".antiguo.example/ruta",
+        "..antiguo.example",
+        "*.antiguo.example",
+        ".-mal.com",
+    ],
+)
+def test_s10_a_cookie_domain_entry_that_is_not_a_domain_refuses_to_start(valor):
+    """
+    Given: COOKIE_DOMAIN con una entrada con esquema, puerto, otro separador o un TLD
+    When: Se comprueba la configuración fuera de desarrollo
+    Then: RuntimeError: saldría tal cual en Domain= y el navegador tiraría la cookie.
+          El mensaje no lleva el valor: puede ser un secreto pegado donde no era
+    """
+    with pytest.raises(RuntimeError, match="COOKIE_DOMAIN") as error:
+        comprueba_la_configuracion_de_seguridad({**PRODUCCION, "COOKIE_DOMAIN": valor})
+
+    # (`.com` y `com` salen en el ejemplo del propio mensaje)
+    assert len(valor) <= 4 or valor not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "valor",
+    [
+        None,
+        "",
+        "  ",
+        ".antiguo.example",
+        "antiguo.example",
+        ".antiguo.example,.comebackgolf.com",
+        " .antiguo.example , .comebackgolf.com ,",
+        ".ANTIGUO.EXAMPLE",
+        ".mi-dominio.co.uk",
+    ],
+)
+def test_s10_a_good_cookie_domain_starts(valor):
+    """
+    Given: COOKIE_DOMAIN vacío, con un dominio o con varios bien escritos
+    When: Se comprueba la configuración
+    Then: Arranca
+    """
+    entorno = dict(PRODUCCION) if valor is None else {**PRODUCCION, "COOKIE_DOMAIN": valor}
+
+    comprueba_la_configuracion_de_seguridad(entorno)
+
+
+@pytest.mark.parametrize("valor", ["localhost", "192.168.1.10", "https://mal"])
+def test_s10_in_development_the_cookie_domain_is_not_checked(valor):
+    """
+    Given: Un desarrollo declarado con COOKIE_DOMAIN=localhost o una IP (probar en el móvil)
+    When: Se comprueba la configuración
+    Then: Arranca, como antes
+    """
+    comprueba_la_configuracion_de_seguridad({"ENVIRONMENT": "development", "COOKIE_DOMAIN": valor})
+
+
+@pytest.mark.parametrize(
+    "valor",
+    [
+        "www.comebackgolf.com",
+        # Por http los enlaces con token irían en claro
+        "http://www.comebackgolf.com",
+        # Con ruta, consulta o fragmento, el enlace que se le pega sale roto
+        "https://www.comebackgolf.com/app",
+        "https://www.comebackgolf.com/?a=1",
+        "https://www.comebackgolf.com?a=1",
+        "https://www.comebackgolf.com/#f",
+        "https://www.comebackgolf.com:puerto",
+        "https://www.comebackgolf.com:99999",
+        'https://www.comebackgolf.com"><b>',
+        "https://www.comebackgolf.com\u200b",
+        "https://www.antiguo.example;https://www.comebackgolf.com",
+        "https://www.antiguo.example https://www.comebackgolf.com",
+        "https://www.antiguo.example,www.comebackgolf.com",
+        "https://usuario:clave-secreta@www.comebackgolf.com",
+        "ftp://www.comebackgolf.com",
+        "https://",
+        "https://[::1/mal",
+    ],
+)
+def test_s14_a_front_address_that_is_not_a_url_refuses_to_start(valor):
+    """
+    Given: FRONTEND_URL con una entrada sin esquema, por http, con ruta, con otro
+           separador o con credenciales
+    When: Se comprueba la configuración fuera de desarrollo
+    Then: RuntimeError: de ella salen los enlaces de los correos, y saldrían rotos.
+          El mensaje no lleva el valor
+    """
+    with pytest.raises(RuntimeError, match="FRONTEND_URL") as error:
+        comprueba_la_configuracion_de_seguridad({**PRODUCCION, "FRONTEND_URL": valor})
+
+    # (`https://` a secas sale en el ejemplo del propio mensaje)
+    assert valor == "https://" or valor not in str(error.value)
+    assert "clave-secreta" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "valor",
+    [
+        None,
+        "",
+        "https://www.antiguo.example",
+        "https://www.antiguo.example,https://www.comebackgolf.com",
+        " https://www.antiguo.example , https://www.comebackgolf.com ,",
+        "https://www.comebackgolf.com/",
+        "https://antiguo.example",
+        "https://www.comebackgolf.com:8443",
+    ],
+)
+def test_s14_a_good_front_address_starts(valor):
+    """
+    Given: FRONTEND_URL sin poner, con una dirección o con varias separadas por comas
+    When: Se comprueba la configuración
+    Then: Arranca
+    """
+    entorno = dict(PRODUCCION) if valor is None else {**PRODUCCION, "FRONTEND_URL": valor}
+
+    comprueba_la_configuracion_de_seguridad(entorno)
+
+
+def test_s14_in_development_the_front_address_is_not_checked():
+    """
+    Given: Un desarrollo declarado con FRONTEND_URL=localhost:5173, sin esquema
+    When: Se comprueba la configuración
+    Then: Arranca, como antes
+    """
+    comprueba_la_configuracion_de_seguridad(
+        {"ENVIRONMENT": "development", "FRONTEND_URL": "localhost:5173"}
+    )

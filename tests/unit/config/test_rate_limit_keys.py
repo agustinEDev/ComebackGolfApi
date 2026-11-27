@@ -1,0 +1,268 @@
+"""
+Tests unitarios de las claves del rate limit (BE #273).
+
+Qué identidad cuenta cada petición. La invariante del ADR-038 no cambia: ninguna
+cabecera que escriba el cliente elige el contador. Lo nuevo es que el tráfico con
+sesión cuenta por usuario, y el usuario sale de un JWT cuya firma se verifica: un
+token inventado no elige contador, cae en el de red.
+"""
+
+from datetime import timedelta
+from uuid import uuid4
+
+import jwt
+import pytest
+from slowapi.errors import RateLimitExceeded
+from starlette.requests import Request
+
+from src.config import rate_limit
+from src.config.rate_limit import (
+    count_or_refuse,
+    email_rate_limit_key,
+    failed_logins_exhausted,
+    get_client_identifier,
+    get_rate_limit_key,
+    limiter,
+    record_failed_login,
+)
+from src.config.settings import settings
+from src.shared.domain.services.instante_utc import ahora_en_utc
+from src.shared.infrastructure.security.jwt_handler import (
+    create_access_token,
+    create_refresh_token,
+)
+
+PEER = "10.1.2.3"
+
+
+def _request(cookie_token: str | None = None, bearer_token: str | None = None) -> Request:
+    headers: list[tuple[bytes, bytes]] = []
+    if cookie_token:
+        headers.append((b"cookie", f"access_token={cookie_token}".encode()))
+    if bearer_token:
+        headers.append((b"authorization", f"Bearer {bearer_token}".encode()))
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/",
+        "query_string": b"",
+        "headers": headers,
+        "client": (PEER, 12345),
+    }
+    return Request(scope)
+
+
+@pytest.fixture(autouse=True)
+def _production(monkeypatch):
+    """En producción la clave de red es solo la IP del peer: sin escape de tests."""
+    monkeypatch.setenv("ENVIRONMENT", "production")
+
+
+def test_valid_access_token_in_cookie_keys_on_the_user():
+    """
+    Given: Un access token válido en la cookie
+    When: Se calcula la clave
+    Then: Es la del usuario del token
+    """
+    user_id = str(uuid4())
+
+    key = get_rate_limit_key(_request(cookie_token=create_access_token({"sub": user_id})))
+
+    assert key == f"user:{user_id}"
+
+
+def test_a_bearer_header_alone_keys_on_the_network():
+    """
+    Given: Un access token válido solo en la cabecera Authorization (2.58.0: ya no vale)
+    When: Se calcula la clave
+    Then: Es la de red, como una petición sin sesión
+    """
+    user_id = str(uuid4())
+
+    key = get_rate_limit_key(_request(bearer_token=create_access_token({"sub": user_id})))
+
+    assert key == get_rate_limit_key(_request())
+    assert user_id not in key
+
+
+def test_a_bearer_header_does_not_change_the_cookie_user():
+    """
+    Given: La cookie de A y una cabecera Bearer de B
+    When: Se calcula la clave
+    Then: Cuenta A: la cabecera no se lee (2.58.0), como en get_current_user
+    """
+    user_a, user_b = str(uuid4()), str(uuid4())
+
+    key = get_rate_limit_key(
+        _request(
+            cookie_token=create_access_token({"sub": user_a}),
+            bearer_token=create_access_token({"sub": user_b}),
+        )
+    )
+
+    assert key == f"user:{user_a}"
+
+
+def test_forged_token_does_not_choose_the_bucket():
+    """
+    Given: Un token firmado con otra clave y un sub elegido por el atacante
+    When: Se calcula la clave
+    Then: Cae en la de red; si no, rotar el sub daría un contador nuevo por petición
+    """
+    forged = jwt.encode(
+        {"sub": "chosen-by-attacker", "type": "access"}, "not-the-secret", algorithm="HS256"
+    )
+
+    key = get_rate_limit_key(_request(cookie_token=forged))
+
+    assert key == PEER
+
+
+def test_expired_token_keys_on_the_network():
+    """
+    Given: Un access token caducado
+    When: Se calcula la clave
+    Then: Cae en la de red
+    """
+    # A mano y ya caducado: un token con `exp` en el pasado, sin depender de cómo lo
+    # construye create_access_token
+    expired = jwt.encode(
+        {
+            "sub": str(uuid4()),
+            "type": "access",
+            "exp": ahora_en_utc() - timedelta(seconds=1),
+        },
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+
+    assert get_rate_limit_key(_request(cookie_token=expired)) == PEER
+
+
+def test_refresh_token_is_not_an_access_token_for_the_key():
+    """
+    Given: Un refresh token donde va el access token
+    When: Se calcula la clave
+    Then: Cae en la de red, como lo rechaza get_current_user
+    """
+    refresh = create_refresh_token({"sub": str(uuid4())})
+
+    assert get_rate_limit_key(_request(bearer_token=refresh)) == PEER
+
+
+def test_token_without_subject_keys_on_the_network():
+    """
+    Given: Un access token válido sin sub
+    When: Se calcula la clave
+    Then: Cae en la de red
+    """
+    no_sub = jwt.encode({"type": "access"}, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+    assert get_rate_limit_key(_request(cookie_token=no_sub)) == PEER
+
+
+def test_no_token_keys_on_the_network():
+    """
+    Given: Una petición sin token
+    When: Se calcula la clave
+    Then: Es la de red, la misma que get_client_identifier
+    """
+    request = _request()
+
+    assert get_rate_limit_key(request) == get_client_identifier(request) == PEER
+
+
+def test_email_key_is_normalised_and_does_not_contain_the_email():
+    """
+    Given: El mismo email escrito con mayúsculas y espacios
+    When: Se calcula su clave
+    Then: Coincide con la del email normalizado y no lleva el email en claro
+    """
+    key = email_rate_limit_key("  Pepe.Perez@Example.COM ")
+
+    assert key == email_rate_limit_key("pepe.perez@example.com")
+    assert "pepe" not in key.lower()
+    assert key != email_rate_limit_key("otro@example.com")
+
+
+def test_manual_counters_respect_a_disabled_limiter(monkeypatch):
+    """
+    Given: El limiter apagado (limiter.enabled = False), como lo apaga slowapi
+    When: Se cuenta por encima del tope con los contadores que no son decorador
+    Then: No rechazan nada, igual que los decoradores con el limiter apagado
+    """
+    monkeypatch.setattr(limiter, "enabled", False)
+    monkeypatch.setattr(rate_limit, "FAILED_LOGINS_LIMIT", "1/minute")
+
+    for _ in range(3):
+        count_or_refuse("1/minute", "test-disabled", "same-key")
+        record_failed_login("una-red")
+    assert not failed_logins_exhausted("una-red")
+
+
+def test_manual_counters_refuse_over_the_limit_when_enabled(monkeypatch):
+    """
+    Given: El limiter encendido y un tope de 1/minuto
+    When: Se cuenta dos veces la misma clave, y se registra un fallo de login
+    Then: La segunda cuenta y el siguiente login dan 429 (contraprueba del anterior)
+    """
+    monkeypatch.setattr(rate_limit, "FAILED_LOGINS_LIMIT", "1/minute")
+    limiter.reset()
+
+    count_or_refuse("1/minute", "test-enabled", "same-key")
+    with pytest.raises(RateLimitExceeded):
+        count_or_refuse("1/minute", "test-enabled", "same-key")
+
+    record_failed_login("una-red")
+    assert failed_logins_exhausted("una-red")
+    assert not failed_logins_exhausted("otra-red")
+    limiter.reset()
+
+
+def _con_cliente_de_prueba() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "query_string": b"",
+            "headers": [(b"x-test-client-id", b"elegido-por-quien-llama")],
+            "client": (PEER, 12345),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("environment", "testing", "lo_acepta"),
+    [
+        (None, None, False),  # sin ENVIRONMENT: ya no se toma por desarrollo
+        ("production", None, False),
+        ("PRODUCTION", "true", False),  # producción manda, aunque diga TESTING
+        ("development", None, False),  # el Kind, sin TESTING: tampoco (F-12)
+        ("staging", None, False),  # no hay staging: como producción
+        (None, "true", False),  # TESTING sin desarrollo declarado: no (F-12)
+        ("staging", "true", False),
+        ("development", "true", True),  # la suite de tests
+        ("Development", "TRUE", True),
+        ("preproduccion", None, False),  # un valor raro: como producción
+    ],
+)
+def test_x_test_client_id_only_when_the_environment_says_it_is_not_production(
+    monkeypatch, environment, testing, lo_acepta
+):
+    """
+    Given: Una petición con X-Test-Client-ID, y el entorno de cada caso
+    When: Se calcula su red
+    Then: La cabecera solo cuenta con TESTING=true Y ENVIRONMENT=development: la suite
+          de tests. Ni el Kind ni una producción con TESTING olvidado dejan a quien
+          llama elegir su red (auditoría OWASP de BE #732, A05; F-12 del 9 nov 2026)
+    """
+    for nombre, valor in (("ENVIRONMENT", environment), ("TESTING", testing)):
+        if valor is None:
+            monkeypatch.delenv(nombre, raising=False)
+        else:
+            monkeypatch.setenv(nombre, valor)
+
+    red = rate_limit.get_client_identifier(_con_cliente_de_prueba())
+
+    assert (red == "elegido-por-quien-llama") is lo_acepta

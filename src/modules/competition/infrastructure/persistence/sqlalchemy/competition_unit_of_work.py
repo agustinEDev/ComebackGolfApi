@@ -1,0 +1,239 @@
+"""
+SQLAlchemy Unit of Work - Competition Module Infrastructure Layer.
+
+Implementacion asincrona del Unit of Work para el modulo de competiciones.
+Coordina transacciones entre 8 repositorios.
+"""
+
+import contextlib
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.modules.competition.domain.repositories.barras_por_campo_repository_interface import (
+    BarrasPorCampoRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.competition_repository_interface import (
+    CompetitionRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.repositories.draft_repository_interface import (
+    DraftRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.enrollment_repository_interface import (
+    EnrollmentRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.envelope_repository_interface import (
+    EnvelopeRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.espera_en_franja_repository_interface import (
+    EsperaEnFranjaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.golpe_de_partida_repository_interface import (
+    GolpeDePartidaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.handicap_update_repository_interface import (
+    HandicapUpdateRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.hole_score_repository_interface import (
+    HoleScoreRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.invitation_repository_interface import (
+    InvitationRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.match_repository_interface import (
+    MatchRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.partida_repository_interface import (
+    PartidaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.plaza_en_franja_repository_interface import (
+    PlazaEnFranjaRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.round_repository_interface import (
+    RoundRepositoryInterface,
+)
+from src.modules.competition.domain.repositories.team_assignment_repository_interface import (
+    TeamAssignmentRepositoryInterface,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.barras_por_campo_repository import (
+    SQLAlchemyBarrasPorCampoRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.competition_repository import (
+    SQLAlchemyCompetitionRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.draft_repository import (
+    SQLAlchemyDraftRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.enrollment_repository import (
+    SQLAlchemyEnrollmentRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.envelope_repository import (
+    SQLAlchemyEnvelopeRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.espera_en_franja_repository import (
+    SQLAlchemyEsperaEnFranjaRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.golpe_de_partida_repository import (
+    SQLAlchemyGolpeDePartidaRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.handicap_update_repository import (
+    SQLAlchemyHandicapUpdateRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.hole_score_repository import (
+    SQLAlchemyHoleScoreRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.invitation_repository import (
+    SQLAlchemyInvitationRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.match_repository import (
+    SQLAlchemyMatchRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.partida_repository import (
+    SQLAlchemyPartidaRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.plaza_en_franja_repository import (
+    SQLAlchemyPlazaEnFranjaRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.round_repository import (
+    SQLAlchemyRoundRepository,
+)
+from src.modules.competition.infrastructure.persistence.sqlalchemy.team_assignment_repository import (
+    SQLAlchemyTeamAssignmentRepository,
+)
+from src.shared.domain.repositories.country_repository_interface import (
+    CountryRepositoryInterface,
+)
+from src.shared.infrastructure.persistence.sqlalchemy.country_repository import (
+    SQLAlchemyCountryRepository,
+)
+
+
+class SQLAlchemyCompetitionUnitOfWork(CompetitionUnitOfWorkInterface):
+    """
+    Implementacion asincrona de la Unit of Work con SQLAlchemy para Competition Module.
+
+    Gestiona transacciones atomicas para todos los repositorios del modulo.
+    """
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+        self._competitions = SQLAlchemyCompetitionRepository(session)
+        self._enrollments = SQLAlchemyEnrollmentRepository(session)
+        self._countries = SQLAlchemyCountryRepository(session)
+        self._rounds = SQLAlchemyRoundRepository(session)
+        self._matches = SQLAlchemyMatchRepository(session)
+        self._team_assignments = SQLAlchemyTeamAssignmentRepository(session)
+        self._envelopes = SQLAlchemyEnvelopeRepository(session)
+        self._invitations = SQLAlchemyInvitationRepository(session)
+        self._hole_scores = SQLAlchemyHoleScoreRepository(session)
+        self._drafts = SQLAlchemyDraftRepository(session)
+        self._handicap_updates = SQLAlchemyHandicapUpdateRepository(session)
+        self._plazas = SQLAlchemyPlazaEnFranjaRepository(session)
+        self._partidas = SQLAlchemyPartidaRepository(session)
+        self._golpes_de_partida = SQLAlchemyGolpeDePartidaRepository(session)
+        self._esperas = SQLAlchemyEsperaEnFranjaRepository(session)
+        self._barras_por_campo = SQLAlchemyBarrasPorCampoRepository(session)
+
+    @property
+    def competitions(self) -> CompetitionRepositoryInterface:
+        return self._competitions
+
+    @property
+    def enrollments(self) -> EnrollmentRepositoryInterface:
+        return self._enrollments
+
+    @property
+    def countries(self) -> CountryRepositoryInterface:
+        return self._countries
+
+    @property
+    def rounds(self) -> RoundRepositoryInterface:
+        return self._rounds
+
+    @property
+    def matches(self) -> MatchRepositoryInterface:
+        return self._matches
+
+    @property
+    def team_assignments(self) -> TeamAssignmentRepositoryInterface:
+        return self._team_assignments
+
+    @property
+    def drafts(self) -> DraftRepositoryInterface:
+        return self._drafts
+
+    @property
+    def envelopes(self) -> EnvelopeRepositoryInterface:
+        return self._envelopes
+
+    @property
+    def invitations(self) -> InvitationRepositoryInterface:
+        return self._invitations
+
+    @property
+    def hole_scores(self) -> HoleScoreRepositoryInterface:
+        return self._hole_scores
+
+    @property
+    def handicap_updates(self) -> HandicapUpdateRepositoryInterface:
+        return self._handicap_updates
+
+    @property
+    def barras_por_campo(self) -> BarrasPorCampoRepositoryInterface:
+        return self._barras_por_campo
+
+    @property
+    def plazas(self) -> PlazaEnFranjaRepositoryInterface:
+        return self._plazas
+
+    @property
+    def partidas(self) -> PartidaRepositoryInterface:
+        return self._partidas
+
+    @property
+    def golpes_de_partida(self) -> GolpeDePartidaRepositoryInterface:
+        return self._golpes_de_partida
+
+    @property
+    def esperas(self) -> EsperaEnFranjaRepositoryInterface:
+        return self._esperas
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            await self.rollback()
+            return
+        # Si el commit falla (una restricción única, la conexión), rollback: sin él la
+        # sesión quedaba inservible para lo siguiente de la misma petición (como la de
+        # usuarios, #752). Si el rollback también falla, sube el error del commit; y una
+        # cancelación (BaseException) se deshace igual
+        try:
+            await self.commit()
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await self.rollback()
+            raise
+
+    async def commit(self) -> None:
+        await self._session.commit()
+
+    async def rollback(self) -> None:
+        await self._session.rollback()
+
+    async def flush(self) -> None:
+        await self._session.flush()
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator[None]:
+        """SAVEPOINT de Postgres: deshace solo lo escrito dentro."""
+        async with self._session.begin_nested():
+            yield
+
+    def is_active(self) -> bool:
+        return self._session.is_active

@@ -1,0 +1,438 @@
+"""Excepciones compartidas de la capa de aplicación del módulo Competition."""
+
+from datetime import datetime
+from typing import TYPE_CHECKING, ClassVar
+
+if TYPE_CHECKING:
+    from src.modules.competition.domain.services.ventana_de_actualizacion import CodigoDeVentana
+
+
+class CompetitionNotFoundError(Exception):
+    """La competición no existe."""
+
+    pass
+
+
+class RoundNotFoundError(Exception):
+    """La ronda no existe."""
+
+    pass
+
+
+class NotCompetitionCreatorError(Exception):
+    """El usuario no es el creador de la competición."""
+
+    pass
+
+
+class RoundNotModifiableError(Exception):
+    """La ronda no puede modificarse en su estado actual."""
+
+    pass
+
+
+class CompetitionNotClosedError(Exception):
+    """La competición no está en estado CLOSED."""
+
+    pass
+
+
+class AgendaNotEditableError(Exception):
+    """La competición ya terminó o se canceló: su agenda no se toca (BE #365)."""
+
+    pass
+
+
+class FranjaInvalidaError(Exception):
+    """Una franja de stroke play (o una sesión de Ryder) que no puede ser así (#251)."""
+
+    pass
+
+
+class FranjaEnElPasadoError(FranjaInvalidaError):
+    """Su primera salida ya ha pasado: no admitiría partidas (QA del 11 oct 2026)."""
+
+    pass
+
+
+class ActualizacionNoPermitidaError(Exception):
+    """Fuera de la ventana para actualizar los hándicaps a mano (#251)."""
+
+    def __init__(self, mensaje: str | None, codigo: "CodigoDeVentana | None" = None):
+        super().__init__(mensaje)
+        # Para que el cliente lo diga en su idioma (#541)
+        self.codigo = codigo
+
+
+class ActualizacionEnCursoError(Exception):
+    """Ya hay una actualización de hándicaps en marcha (#251)."""
+
+    pass
+
+
+class RefrescoDesactivadoError(Exception):
+    """La actualización con la RFEG no está encendida en este entorno (#251)."""
+
+    pass
+
+
+class PlazaEnFranjaError(Exception):
+    """No se puede coger o soltar esa plaza en la franja (#251), con el motivo."""
+
+    pass
+
+
+class PartidasError(Exception):
+    """Las partidas de esa franja no se pueden generar o cambiar (#251), con el motivo."""
+
+    pass
+
+
+class PartidaNotFoundError(Exception):
+    """No existe esa partida (#251)."""
+
+    pass
+
+
+class DateOutOfRangeError(Exception):
+    """La fecha de la sesión está fuera de las fechas de la competición."""
+
+    pass
+
+
+class ScheduleAlreadyInPlayError(Exception):
+    """Alguna sesión ya tiene partidos: la agenda automática se la llevaría."""
+
+    pass
+
+
+class MatchNotFoundError(Exception):
+    """El partido no existe."""
+
+    pass
+
+
+class CompetitionNotDraftError(Exception):
+    """La competición no está en estado DRAFT."""
+
+    pass
+
+
+class InsufficientPlayersError(Exception):
+    """No hay suficientes jugadores aprobados."""
+
+    pass
+
+
+class InvalidTeeColorError(ValueError):
+    """El valor de tee_color no es válido."""
+
+    pass
+
+
+class InvitationNotFoundError(Exception):
+    """La invitacion no existe."""
+
+    pass
+
+
+class InviteeNotFoundError(Exception):
+    """El invitee (user_id) no existe."""
+
+    pass
+
+
+class NotInviteeError(Exception):
+    """El usuario no es el invitee de la invitacion."""
+
+    pass
+
+
+class NotMatchPlayerError(Exception):
+    """El usuario no es un jugador del partido."""
+
+    pass
+
+
+class NotYourMarkedPlayerError(Exception):
+    """
+    El jugador marcado no es el que le toca marcar a quien anota (BE #520).
+
+    Cada uno marca solo al jugador que le asignó el sorteo de marcadores. Sin
+    esta comprobación uno podía marcarse a sí mismo y dejar su hoyo validado, o
+    pisar lo que le había apuntado su marcador de verdad.
+    """
+
+    error_code = "NOT_YOUR_MARKED_PLAYER"
+    # El texto para el jugador, fijo: la ruta no devuelve el de la excepción
+    # (CodeQL, exposición de información de una excepción)
+    message = "Solo puedes apuntar los golpes del jugador que te toca marcar"
+
+    def __init__(self, message: str | None = None):
+        super().__init__(message or self.message)
+
+
+class PlayerWithdrawnError(Exception):
+    """
+    El jugador está retirado del fourball (25 oct 2026): ni anota su bola ni
+    entrega tarjeta. Para volver se deshace la retirada.
+    """
+
+    error_code = "PLAYER_WITHDRAWN"
+    message = "Estás retirado de este partido: deshaz la retirada para volver a anotar"
+
+    def __init__(self, message: str | None = None):
+        super().__init__(message or self.message)
+
+
+class WithdrawalNotAllowedError(Exception):
+    """
+    La retirada o su vuelta no se pueden hacer: fuera de fourball, con el partido
+    terminado, si es el último de su bando o con una tarjeta entregada.
+    """
+
+    error_code = "WITHDRAWAL_NOT_ALLOWED"
+    # El texto para el jugador, por motivo: la ruta no devuelve el de la
+    # excepcion, que esta en ingles y es para los logs
+    MENSAJES: ClassVar[dict[str, str]] = {
+        "NOT_FOURBALL": "Solo se puede retirar a un jugador en un fourball",
+        "MATCH_NOT_ACTIVE": "El partido ya no está en juego",
+        "NOT_A_PLAYER": "Ese jugador no juega este partido",
+        "ALREADY_WITHDRAWN": "Ese jugador ya está retirado",
+        "LAST_OF_SIDE": "No se puede retirar a los dos de un bando: concede el partido",
+        "SCORECARD_SUBMITTED": "Ya hay una tarjeta entregada: lo validado no se mueve",
+        "NOT_WITHDRAWN": "Ese jugador no está retirado",
+    }
+
+    def __init__(self, reason: str, message: str | None = None):
+        super().__init__(message or reason)
+        self.reason = reason
+
+    @property
+    def message(self) -> str:
+        return self.MENSAJES.get(self.reason, "No se puede retirar a ese jugador")
+
+
+class ScorecardNotReadyError(Exception):
+    """La tarjeta no esta lista para ser entregada (hay hoyos sin validar)."""
+
+    pass
+
+
+class ScorecardAlreadySubmittedError(Exception):
+    """El jugador ya entrego su tarjeta."""
+
+    pass
+
+
+class MatchNotScoringError(Exception):
+    """El partido no esta en estado para registrar scores."""
+
+    pass
+
+
+class ScoringNotOpenYetError(Exception):
+    """
+    La anotacion de ese partido todavia no ha abierto (BE #305).
+
+    Distinto de `MatchNotScoringError` a proposito: este rechazo lo arregla
+    ESPERAR, asi que el movil tiene que conservar el golpe en su cola en vez de
+    darlo por perdido. Lleva la hora de apertura para poder decirla.
+    """
+
+    error_code = "SCORING_NOT_OPEN_YET"
+
+    def __init__(self, message: str, opens_at: datetime):
+        super().__init__(message)
+        self.opens_at = opens_at
+
+
+class InvalidHoleNumberError(Exception):
+    """El numero de hoyo no es valido."""
+
+    pass
+
+
+class HandicapEditNotAllowedError(Exception):
+    """El hándicap personalizado no puede modificarse en el estado actual de la competición."""
+
+    pass
+
+
+class EnrollmentNotFoundError(Exception):
+    """La inscripción no existe."""
+
+    pass
+
+
+class NotCreatorError(Exception):
+    """El usuario no es el creador de la competición."""
+
+    pass
+
+
+class GolfCourseHasRoundsError(Exception):
+    """El campo tiene rondas programadas, así que no se puede quitar.
+
+    Antes no hacía falta: no se podían crear rondas hasta cerrar inscripciones,
+    y para entonces los campos ya no se tocaban. Al poder corregir el montaje
+    con las inscripciones abiertas (BE #323), las dos cosas conviven.
+    """
+
+    pass
+
+
+class NotCompetitionParticipantError(Exception):
+    """Quien pregunta no es de esta competicion.
+
+    Sin esto, probando identificadores se leia la sesion de cualquiera, incluida
+    la de una competicion privada (FE #655).
+    """
+
+    pass
+
+
+class CompetitionFullError(Exception):
+    """La competición no tiene plazas libres (BE #372).
+
+    Tanto al pedir plaza como al aprobarla: la violación del dominio sin
+    traducir llegaba como un 500 sin cabeceras de CORS, y el navegador lo veía
+    como un fallo de red.
+    """
+
+
+class CompetitionAlreadyExistsError(Exception):
+    """Ya existe una competición del mismo organizador con ese nombre (sin mayúsculas, #540)."""
+
+    pass
+
+
+class PendingGameNotRecalculableError(Exception):
+    """
+    Un partido o una partida pendiente no se puede rehacer con unas barras nuevas
+    por algo que no son esas barras (BE #912): la barra guardada de otro que el
+    campo ya no valora, un campo o una franja que ya no existen, una foto sin
+    hándicap índice. Nunca un 500, y sin datos de otros jugadores.
+    """
+
+    error_code = "PENDING_GAME_NOT_RECALCULABLE"
+
+
+class TeeNotRatedForPlayerError(Exception):
+    """
+    Las barras nuevas de un jugador no están valoradas en el campo de un partido o
+    una partida suya que queda por jugar (BE #912).
+    """
+
+
+class CourseNotInCompetitionError(Exception):
+    """Ese campo no es de la competición: no se le fijan barras (barras por campo)."""
+
+    error_code = "COURSE_NOT_IN_COMPETITION"
+
+
+class TeeNotAvailableError(Exception):
+    """
+    Esas barras no valen (422 TEE_NOT_AVAILABLE):
+
+    - Ese campo no tiene la barra que se fija en él: el cambio propio de una
+      inscripción (R1) o la del campo para un género (R2,
+      `CourseTeeNotAvailableError`, con su propio texto).
+    - En un campo donde le queda algo por jugar, la barra fijada allí para él (su
+      cambio propio o la del campo para su género) ya no vale, o con golpes no
+      está valorada en lo que se rehace.
+    - Con la general (o la habitual) en un campo así: la subclase
+      `TeeNotOnPendingCourseError`, con su propio código.
+    - Al quitar una fijada, la que quedaría no vale en un campo así: la subclase
+      `TeeRemovalLeavesNoValidTeeError`, con su propio texto.
+    """
+
+    error_code = "TEE_NOT_AVAILABLE"
+
+
+class CourseTeeNotAvailableError(TeeNotAvailableError):
+    """
+    Ese campo no tiene esas barras para ese género (ni mixtas): la barra del campo
+    para un género (R2). Mismo código que el del jugador, con su propio texto.
+    """
+
+
+class TeeNotOnPendingCourseError(TeeNotAvailableError):
+    """
+    La barra general nueva no vale en un campo donde le queda algo por jugar y no
+    tiene ni cambio propio ni barra del campo para su género: antes hay que fijar
+    la de ese campo. Nada pendiente queda sin barra válida (21 nov 2026).
+    """
+
+    error_code = "TEE_NOT_ON_PENDING_COURSE"
+
+
+class TeeRemovalLeavesNoValidTeeError(TeeNotAvailableError):
+    """
+    Al quitar una barra fijada en un campo (el cambio propio, R1, o la del campo
+    para un género, R2), la que pasaría a jugar allí (la del campo, la general o
+    la habitual) no vale y le queda algo por jugar en él. Mismo código que
+    `TeeNotAvailableError`, con su propio texto.
+    """
+
+
+class TeeNotSelectableError(TeeNotAvailableError):
+    """
+    OTHER no se elige (tabla del 21 nov 2026, C): ni al inscribirse, ni como barra
+    general, ni en un campo (la propia o la de un género), aunque el campo la tenga.
+    Mismo código que `TeeNotAvailableError`, con su propio texto.
+    """
+
+
+class PairingPlayerNotInTeamError(Exception):
+    """
+    Un emparejamiento a mano de la Ryder pone a un jugador que no está en ningún
+    equipo, o en el lado del equipo contrario (tabla del 21 nov 2026, D). Es lo que
+    manda el organizador, no un motivo de la sesión: no se apunta en ella.
+    """
+
+    error_code = "PAIRING_PLAYER_NOT_IN_TEAM"
+
+
+class PlayerTeeChangeInProgressError(NotCompetitionCreatorError):
+    """
+    El propio jugador intenta cambiar sus barras con la competición en curso (G1, 22
+    nov 2026): ya solo las cambian su capitán o el organizador. Sigue siendo un 403,
+    pero con su texto y su código, para que la pantalla diga quién puede.
+    """
+
+    error_code = "PLAYER_TEE_CHANGE_IN_PROGRESS"
+
+
+class PlayerTeeChangeInProgressNoTeamsError(PlayerTeeChangeInProgressError):
+    """
+    Lo mismo en un torneo sin equipos (stroke play): no hay capitán que nombrar, solo
+    el organizador (revisión, 22 nov 2026). Mismo código, otro texto.
+    """
+
+
+class PendingGamesError(Exception):
+    """
+    No se termina una competición con algo sin cerrar (I1, 22 nov 2026): un partido
+    de la Ryder sin empezar o en juego, o una partida de stroke play sin acabar.
+    Lleva cuántos de cada, para que el organizador sepa qué falta.
+    """
+
+    error_code = "PENDING_GAMES"
+
+    def __init__(self, partidos: int, partidas: int):
+        self.partidos = partidos
+        self.partidas = partidas
+        super().__init__(f"Quedan {partidos} partidos y {partidas} partidas sin terminar")
+
+
+class TeeChangeClosedError(Exception):
+    """La competición ya terminó o se canceló: ya no se cambian barras."""
+
+    error_code = "TEE_CHANGE_CLOSED"
+
+
+class EnrollmentNotApprovedError(Exception):
+    """Solo se tocan las barras de una inscripción aprobada."""
+
+    error_code = "ENROLLMENT_NOT_APPROVED"

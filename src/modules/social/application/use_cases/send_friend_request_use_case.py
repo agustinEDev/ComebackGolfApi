@@ -1,0 +1,154 @@
+"""Caso de Uso: Enviar una Solicitud de Amistad."""
+
+import logging
+
+from src.modules.social.application.dto.friendship_dto import (
+    FriendshipResponseDTO,
+    SendFriendRequestRequestDTO,
+)
+from src.modules.social.application.exceptions import AddresseeNotFoundError
+from src.modules.social.application.ports.social_email_service_interface import (
+    ISocialEmailService,
+)
+from src.modules.social.domain.entities.friendship import Friendship
+from src.modules.social.domain.exceptions.social_violations import (
+    BlockedUserViolation,
+    DuplicateFriendRequestViolation,
+    DuplicateFriendshipViolation,
+    InvalidFriendshipStatusViolation,
+    SelfFriendRequestViolation,
+)
+from src.modules.social.domain.repositories.social_unit_of_work_interface import (
+    SocialUnitOfWorkInterface,
+)
+from src.modules.social.domain.value_objects.friendship_id import FriendshipId
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.email_masking import mask_email as _mask_email
+
+logger = logging.getLogger(__name__)
+
+
+class SendFriendRequestUseCase:
+    """Envia una solicitud de amistad de un usuario a otro."""
+
+    def __init__(
+        self,
+        uow: SocialUnitOfWorkInterface,
+        user_uow: UserUnitOfWorkInterface,
+        email_service: ISocialEmailService | None = None,
+    ):
+        self._uow = uow
+        self._user_uow = user_uow
+        self._email_service = email_service
+
+    async def execute(self, request: SendFriendRequestRequestDTO) -> FriendshipResponseDTO:
+        """Manda la solicitud; si el otro me bloqueó, el 404 de un destinatario que no existe."""
+        requester_id = UserId(request.requester_id)
+        addressee_id = UserId(request.addressee_id)
+
+        if requester_id == addressee_id:
+            raise SelfFriendRequestViolation("Cannot send a friend request to yourself.")
+
+        async with self._user_uow:
+            addressee_user = await self._user_uow.users.find_by_id(addressee_id)
+            # Una cuenta desactivada, como una que no existe (auditoría de la fase 6, B-13)
+            if not addressee_user or not addressee_user.is_active:
+                raise AddresseeNotFoundError(f"User not found: {request.addressee_id}")
+
+        async with self._uow:
+            existing = await self._uow.friendships.find_by_pair(requester_id, addressee_id)
+
+            if existing is not None:
+                self._rechaza_si_ya_hay_relacion(existing, requester_id)
+                # DECLINED es terminal: se elimina el registro anterior y se reenvia.
+                # Flush explicito: el indice unico uq_friendship_pair (LEAST/GREATEST)
+                # rechaza el INSERT si el DELETE no se ha aplicado ya en BD (SQLAlchemy
+                # ordena inserts antes que deletes en el flush por defecto).
+                await self._uow.friendships.remove(existing)
+                await self._uow.flush()
+
+            friendship = Friendship.create(
+                id=FriendshipId.generate(),
+                requester_id=requester_id,
+                addressee_id=addressee_id,
+            )
+            try:
+                await self._uow.friendships.add(friendship)
+                await self._uow.flush()
+            except DuplicateFriendshipViolation:
+                # Otra petición ganó la carrera del índice uq_friendship_pair entre la
+                # lectura y el INSERT: A me bloqueó o me escribió a la vez. Se relee lo
+                # que dejó y se responde como si ya estuviera al leer. Si no hay nada
+                # (o un DECLINED), cambió por medio: que lo intente de nuevo
+                ganadora = await self._uow.friendships.find_by_pair(requester_id, addressee_id)
+                if ganadora is not None:
+                    self._rechaza_si_ya_hay_relacion(ganadora, requester_id)
+                raise InvalidFriendshipStatusViolation(
+                    "The relationship changed while sending the request; try again."
+                ) from None
+
+        return await self._build_response(friendship)
+
+    @staticmethod
+    def _rechaza_si_ya_hay_relacion(existing: Friendship, requester_id: UserId) -> None:
+        """Lo que se responde si la pareja ya tiene una relación que no deja escribir."""
+        # Si me bloqueó (y yo a él no), no existe para mí: lo mismo que un
+        # destinatario que no está, sin pista del bloqueo (F-09). Si le bloqueé yo,
+        # también si él me había bloqueado antes, el 403 de siempre (SB-02)
+        if existing.lo_oculta_a(requester_id):
+            otro = existing.other_user_id(requester_id)
+            raise AddresseeNotFoundError(f"User not found: {otro}")
+        if existing.is_blocked():
+            raise BlockedUserViolation(
+                "Cannot send a friend request: a block exists between both users."
+            )
+        if existing.is_pending() or existing.is_accepted():
+            raise DuplicateFriendRequestViolation(
+                "A friendship or pending request already exists between both users."
+            )
+
+    async def _build_response(self, friendship: Friendship) -> FriendshipResponseDTO:
+        async with self._user_uow:
+            requester = await self._user_uow.users.find_by_id(friendship.requester_id)
+            addressee = await self._user_uow.users.find_by_id(friendship.addressee_id)
+            # `display_name`: el alias de quien lo tenga, y si no su nombre
+            # completo (BE #239).
+            #
+            # Tambien en el correo de aviso, al contrario que los de
+            # verificacion o reseteo de contraseña: aquellos hablan de la
+            # cuenta y necesitan el nombre legal, este es la aplicacion
+            # contandote que alguien te ha escrito, y a ese alguien lo
+            # reconoces por como aparece en la aplicacion
+            requester_name = requester.display_name if requester else "Unknown"
+            addressee_name = addressee.display_name if addressee else "Unknown"
+
+        # Enviar email de notificacion (fuera de la transaccion, no bloquea la creacion)
+        if self._email_service and addressee and addressee.email:
+            addressee_email = str(addressee.email)
+            try:
+                await self._email_service.send_friend_request_email(
+                    to_email=addressee_email,
+                    addressee_name=addressee_name,
+                    requester_name=requester_name,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to send friend request email to %s: %s",
+                    _mask_email(addressee_email),
+                    str(e),
+                )
+
+        return FriendshipResponseDTO(
+            id=friendship.id.value,
+            requester_id=friendship.requester_id.value,
+            requester_name=requester_name,
+            addressee_id=friendship.addressee_id.value,
+            addressee_name=addressee_name,
+            status=friendship.status.value,
+            responded_at=friendship.responded_at,
+            created_at=friendship.created_at,
+            updated_at=friendship.updated_at,
+        )

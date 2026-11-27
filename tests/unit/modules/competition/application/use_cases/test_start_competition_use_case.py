@@ -1,0 +1,282 @@
+"""Tests para StartCompetitionUseCase."""
+
+from datetime import date
+from uuid import uuid4
+
+import pytest
+
+from src.modules.competition.application.dto.competition_dto import (
+    CreateCompetitionRequestDTO,
+    StartCompetitionRequestDTO,
+)
+from src.modules.competition.application.use_cases.create_competition_use_case import (
+    CreateCompetitionUseCase,
+)
+from src.modules.competition.application.use_cases.start_competition_use_case import (
+    CompetitionNotFoundError,
+    NotCompetitionCreatorError,
+    StartCompetitionUseCase,
+)
+from src.modules.competition.domain.entities.competition import CompetitionStateError
+from src.modules.competition.domain.entities.round import Round
+from src.modules.competition.domain.services.location_builder import LocationBuilder
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.competition.domain.value_objects.session_type import SessionType
+from src.modules.competition.infrastructure.persistence.in_memory.in_memory_unit_of_work import (
+    InMemoryUnitOfWork,
+)
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.value_objects.match_format import MatchFormat
+from tests.unit.modules.competition.application.use_cases.helpers import USUARIOS_CON_GENERO
+
+# Marcar todos los tests de este fichero para que se ejecuten con asyncio
+pytestmark = pytest.mark.asyncio
+
+
+async def _con_una_sesion(uow, competition_id) -> None:
+    """Una sesión: sin ninguna no hay torneo que iniciar (#710, 25 sep)."""
+    async with uow:
+        await uow.rounds.add(
+            Round.create(
+                competition_id=CompetitionId(competition_id),
+                golf_course_id=GolfCourseId(uuid4()),
+                round_date=date(2025, 6, 1),
+                session_type=SessionType.MORNING,
+                match_format=MatchFormat.SINGLES,
+            )
+        )
+
+
+class TestStartCompetitionUseCase:
+    """Suite de tests para el caso de uso StartCompetitionUseCase."""
+
+    @pytest.fixture
+    def uow(self) -> InMemoryUnitOfWork:
+        """Fixture que proporciona una Unit of Work en memoria para cada test."""
+        return InMemoryUnitOfWork()
+
+    @pytest.fixture
+    def creator_id(self) -> UserId:
+        """Fixture que proporciona un ID de usuario creador."""
+        return UserId(uuid4())
+
+    @pytest.fixture
+    def other_user_id(self) -> UserId:
+        """Fixture que proporciona un ID de otro usuario (no creador)."""
+        return UserId(uuid4())
+
+    async def test_should_start_competition_successfully(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se puede iniciar una competición en estado CLOSED.
+
+        Given: Una competición en estado CLOSED
+        When: El creador solicita iniciarla
+        Then: Se inicia correctamente y cambia a estado IN_PROGRESS
+        """
+        # Arrange: Crear, activar y cerrar competición
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Activar y cerrar inscripciones
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            competition.close_enrollments()
+            await uow.competitions.update(competition)
+            await uow.commit()
+        await _con_una_sesion(uow, created.id)
+
+        # Act: Iniciar competición
+        start_use_case = StartCompetitionUseCase(uow)
+        start_request = StartCompetitionRequestDTO(competition_id=created.id)
+        response = await start_use_case.execute(start_request, creator_id)
+
+        # Assert
+        assert response.id == created.id
+        assert response.status == "IN_PROGRESS"
+        assert response.started_at is not None
+
+        # Verificar que el estado se persistió correctamente
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            assert competition.status.value == "IN_PROGRESS"
+            assert competition.is_in_progress()
+
+    async def test_should_raise_error_when_competition_not_found(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que se lanza excepción si la competición no existe.
+
+        Given: Un ID de competición inexistente
+        When: Se intenta iniciar
+        Then: Se lanza CompetitionNotFoundError
+        """
+        # Arrange
+        start_use_case = StartCompetitionUseCase(uow)
+        fake_id = uuid4()
+        start_request = StartCompetitionRequestDTO(competition_id=fake_id)
+
+        # Act & Assert
+        with pytest.raises(CompetitionNotFoundError) as exc_info:
+            await start_use_case.execute(start_request, creator_id)
+
+        assert "No existe competición" in str(exc_info.value)
+
+    async def test_should_raise_error_when_user_is_not_creator(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId, other_user_id: UserId
+    ):
+        """
+        Verifica que solo el creador puede iniciar la competición.
+
+        Given: Una competición en estado CLOSED
+        When: Un usuario que NO es el creador intenta iniciarla
+        Then: Se lanza NotCompetitionCreatorError
+        """
+        # Arrange: Crear, activar y cerrar competición
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Activar y cerrar
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            competition.close_enrollments()
+            await uow.competitions.update(competition)
+            await uow.commit()
+
+        # Act: Intentar iniciar con otro usuario
+        start_use_case = StartCompetitionUseCase(uow)
+        start_request = StartCompetitionRequestDTO(competition_id=created.id)
+
+        # Assert
+        with pytest.raises(NotCompetitionCreatorError) as exc_info:
+            await start_use_case.execute(start_request, other_user_id)
+
+        assert "Solo el creador puede iniciar" in str(exc_info.value)
+
+    async def test_should_raise_error_when_competition_is_draft(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que no se puede iniciar una competición en DRAFT.
+
+        Given: Una competición en estado DRAFT
+        When: Se intenta iniciar
+        Then: Se lanza CompetitionStateError
+        """
+        # Arrange: Crear competición (queda en DRAFT)
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+            # Programada: desde BE #332 es la única que nace en DRAFT, que es el
+            # estado que este test quiere probar
+            enrollment_opens_days_before=5,
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Act: Intentar iniciar en DRAFT
+        start_use_case = StartCompetitionUseCase(uow)
+        start_request = StartCompetitionRequestDTO(competition_id=created.id)
+
+        # Assert
+        with pytest.raises(CompetitionStateError) as exc_info:
+            await start_use_case.execute(start_request, creator_id)
+
+        assert "No se puede iniciar una competición en estado DRAFT" in str(exc_info.value)
+
+    async def test_should_raise_error_when_competition_is_active(
+        self, uow: InMemoryUnitOfWork, creator_id: UserId
+    ):
+        """
+        Verifica que no se puede iniciar una competición en ACTIVE.
+
+        Given: Una competición en estado ACTIVE
+        When: Se intenta iniciar
+        Then: Se lanza CompetitionStateError
+        """
+        # Arrange: Crear y activar competición
+        create_use_case = CreateCompetitionUseCase(
+            uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+        )
+        create_request = CreateCompetitionRequestDTO(
+            name="Ryder Cup 2025",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        )
+        created = await create_use_case.execute(create_request, creator_id)
+
+        # Activar
+        async with uow:
+            competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+            await uow.competitions.update(competition)
+            await uow.commit()
+
+        # Act: Intentar iniciar en ACTIVE
+        start_use_case = StartCompetitionUseCase(uow)
+        start_request = StartCompetitionRequestDTO(competition_id=created.id)
+
+        # Assert
+        with pytest.raises(CompetitionStateError) as exc_info:
+            await start_use_case.execute(start_request, creator_id)
+
+        assert "No se puede iniciar una competición en estado ACTIVE" in str(exc_info.value)
+
+
+async def test_sin_ninguna_sesion_no_se_inicia_y_lo_dice():
+    """Decidido el 25 sep (#710): un torneo en juego sin nada que jugar no tiene
+    sentido. Antes el servidor lo dejaba y la ficha lo ofrecía."""
+    uow = InMemoryUnitOfWork()
+    creator_id = UserId(uuid4())
+    created = await CreateCompetitionUseCase(
+        uow, LocationBuilder(uow.countries), USUARIOS_CON_GENERO
+    ).execute(
+        CreateCompetitionRequestDTO(
+            name="Sin sesiones",
+            start_date=date(2025, 6, 1),
+            end_date=date(2025, 6, 3),
+            main_country="ES",
+            play_mode="SCRATCH",
+        ),
+        creator_id,
+    )
+    async with uow:
+        competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+        competition.close_enrollments()
+        await uow.competitions.update(competition)
+
+    with pytest.raises(CompetitionStateError, match="sesión"):
+        await StartCompetitionUseCase(uow).execute(
+            StartCompetitionRequestDTO(competition_id=created.id), creator_id
+        )
+
+    async with uow:
+        competition = await uow.competitions.find_by_id(CompetitionId(created.id))
+    assert competition.status.value == "CLOSED"

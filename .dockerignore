@@ -1,0 +1,27 @@
+# Lista de PERMITIDOS: todo fuera y solo vuelve lo que la app usa en ejecución.
+# Con una lista de excluidos se colaba cualquier fichero local nuevo, y desde que la
+# imagen da lectura a todo /app (fix/docker-readable-tree) el usuario de la app lo
+# podría leer. Render y el CI construyen desde git; el Kind, desde el árbol de
+# trabajo, que tiene .env, secretos del Kind, cachés y configuración local.
+*
+
+!src
+!alembic
+!alembic.ini
+!main.py
+!entrypoint.sh
+# Los scripts de importación (campos, mapas) se lanzan dentro del contenedor
+!scripts
+!requirements.txt
+!requirements.lock
+!requirements-bootstrap.txt
+!requirements-bootstrap.lock
+
+# Dentro de lo permitido, nada de cachés ni restos del equipo, a cualquier nivel
+**/__pycache__
+**/*.py[cod]
+**/*.log
+**/.DS_Store
+# Ningún Markdown: la app no lee ninguno al ejecutarse, y así no entran notas
+# locales que vivan dentro de src/ o alembic/ en un árbol de trabajo
+**/*.md

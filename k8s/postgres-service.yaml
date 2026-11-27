@@ -1,0 +1,60 @@
+# ==========================================
+# SERVICE - PostgreSQL Database
+# ==========================================
+# Service para exponer PostgreSQL SOLO internamente
+# (NO accesible desde internet, solo desde otros Pods)
+# ==========================================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service         # Nombre del Service (usado como DNS interno)
+  namespace: comebackgolf     # Namespace donde se desplegará el Service
+  labels:
+    app: comebackgolf
+    component: database
+    tier: data
+
+spec:
+  # ==========================================
+  # TIPO DE SERVICE - NodePort (acceso desde localhost con Kind)
+  # ==========================================
+  type: NodePort                 # Expuesto en NodePort para Kind port mapping
+  # En Kind con extraPortMappings, esto permite acceso directo desde localhost
+  # En producción, usar ClusterIP (solo acceso interno)
+
+  # ==========================================
+  # SELECTOR - Qué Pods gestionar
+  # ==========================================
+  selector:
+    app: comebackgolf
+    component: database
+
+  # ==========================================
+  # PUERTOS - Mapeo de puertos
+  # ==========================================
+  ports:
+    - name: postgres
+      protocol: TCP
+      port: 5432                 # Puerto EXTERNO (lo que ven otros Pods)
+      targetPort: 5432           # Puerto INTERNO (puerto de PostgreSQL)
+      nodePort: 30432            # Puerto fijo en el Node (para kind-config.yaml)
+      # Con Kind: localhost:5433 → Node:30432 → Service:5432 → Pod:5432
+
+  # ==========================================
+  # CLUSTER IP (Opcional - Kubernetes lo asigna automáticamente)
+  # ==========================================
+  # clusterIP: 10.96.0.10      # IP fija dentro del cluster (opcional)
+  # Si no se especifica, Kubernetes asigna una IP automáticamente
+
+# ==========================================
+# DNS INTERNO
+# ==========================================
+# Otros Pods pueden conectarse con:
+# - postgres-service (short name)
+# - postgres-service.default (con namespace)
+# - postgres-service.default.svc.cluster.local (FQDN completo)
+#
+# Ejemplo desde FastAPI:
+# DATABASE_URL=postgresql://user:pass@postgres-service:5432/comebackgolf
+# ==========================================

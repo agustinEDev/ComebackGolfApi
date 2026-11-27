@@ -1,0 +1,182 @@
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.modules.user.domain.errors.user_errors import (
+    AliasTakenConcurrentlyError,
+    EmailTakenConcurrentlyError,
+)
+from src.modules.user.domain.repositories.password_history_repository_interface import (
+    PasswordHistoryRepositoryInterface,
+)
+from src.modules.user.domain.repositories.refresh_token_repository_interface import (
+    RefreshTokenRepositoryInterface,
+)
+from src.modules.user.domain.repositories.terms_acceptance_repository_interface import (
+    TermsAcceptanceRepositoryInterface,
+)
+from src.modules.user.domain.repositories.user_avatar_upload_repository_interface import (
+    UserAvatarUploadRepositoryInterface,
+)
+from src.modules.user.domain.repositories.user_device_repository_interface import (
+    UserDeviceRepositoryInterface,
+)
+from src.modules.user.domain.repositories.user_oauth_account_repository_interface import (
+    UserOAuthAccountRepositoryInterface,
+)
+from src.modules.user.domain.repositories.user_repository_interface import (
+    UserRepositoryInterface,
+)
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.infrastructure.persistence.sqlalchemy.password_history_repository import (
+    SQLAlchemyPasswordHistoryRepository,
+)
+from src.modules.user.infrastructure.persistence.sqlalchemy.refresh_token_repository import (
+    SQLAlchemyRefreshTokenRepository,
+)
+from src.modules.user.infrastructure.persistence.sqlalchemy.terms_acceptance_repository import (
+    SQLAlchemyTermsAcceptanceRepository,
+)
+from src.modules.user.infrastructure.persistence.sqlalchemy.user_avatar_upload_repository import (
+    SQLAlchemyUserAvatarUploadRepository,
+)
+from src.modules.user.infrastructure.persistence.sqlalchemy.user_device_repository import (
+    SQLAlchemyUserDeviceRepository,
+)
+from src.modules.user.infrastructure.persistence.sqlalchemy.user_oauth_account_repository import (
+    SQLAlchemyUserOAuthAccountRepository,
+)
+from src.modules.user.infrastructure.persistence.sqlalchemy.user_repository import (
+    SQLAlchemyUserRepository,
+)
+
+
+class SQLAlchemyUnitOfWork(UserUnitOfWorkInterface):
+    """
+    Implementación asíncrona de la Unit of Work con SQLAlchemy.
+
+    Repositorios incluidos (v1.13.0):
+    - users: SQLAlchemyUserRepository
+    - refresh_tokens: SQLAlchemyRefreshTokenRepository (Session Timeout)
+    - password_history: SQLAlchemyPasswordHistoryRepository (Password History)
+    - user_devices: SQLAlchemyUserDeviceRepository (Device Fingerprinting)
+    """
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+        self._users = SQLAlchemyUserRepository(session)
+        self._refresh_tokens = SQLAlchemyRefreshTokenRepository(session)
+        self._password_history = SQLAlchemyPasswordHistoryRepository(session)
+        self._user_devices = SQLAlchemyUserDeviceRepository(session)
+        self._oauth_accounts = SQLAlchemyUserOAuthAccountRepository(session)
+        self._avatar_uploads = SQLAlchemyUserAvatarUploadRepository(session)
+        self._terms_acceptances = SQLAlchemyTermsAcceptanceRepository(session)
+
+    @property
+    def users(self) -> UserRepositoryInterface:
+        return self._users
+
+    @property
+    def refresh_tokens(self) -> RefreshTokenRepositoryInterface:
+        return self._refresh_tokens
+
+    @property
+    def password_history(self) -> PasswordHistoryRepositoryInterface:
+        return self._password_history
+
+    @property
+    def user_devices(self) -> UserDeviceRepositoryInterface:
+        return self._user_devices
+
+    @property
+    def oauth_accounts(self) -> UserOAuthAccountRepositoryInterface:
+        return self._oauth_accounts
+
+    @property
+    def avatar_uploads(self) -> UserAvatarUploadRepositoryInterface:
+        return self._avatar_uploads
+
+    @property
+    def terms_acceptances(self) -> TermsAcceptanceRepositoryInterface:
+        return self._terms_acceptances
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit - maneja commit/rollback automáticamente.
+
+        Clean Architecture: El Use Case no debe manejar transacciones explícitamente.
+        El UoW se encarga automáticamente de persistir los cambios.
+        """
+        if exc_type:
+            # Si hubo excepción, hacer rollback
+            await self.rollback()
+            # Un autoflush dentro del bloque (una consulta tras modificar el usuario)
+            # también puede chocar con el índice del alias, sin pasar por commit ni flush
+            if isinstance(exc_val, IntegrityError):
+                _traduce_la_violacion_del_alias(exc_val)
+        else:
+            # Si todo fue exitoso, hacer commit automáticamente. Si el commit falla (una
+            # restricción única), rollback: sin él la sesión quedaba inservible para lo
+            # siguiente de la misma petición (CodeRabbit en #752)
+            try:
+                await self.commit()
+            except Exception:
+                await self.rollback()
+                raise
+
+    async def commit(self) -> None:
+        """Confirma la transacción; el alias repetido sale como error del dominio."""
+        try:
+            await self._session.commit()
+        except IntegrityError as e:
+            _traduce_la_violacion_del_alias(e)
+            raise
+
+    async def rollback(self) -> None:
+        """Deshace la transacción."""
+        await self._session.rollback()
+
+    async def flush(self) -> None:
+        """Envía los cambios sin confirmar; el alias o el correo repetidos salen como error
+        del dominio (el correo, solo aquí: es donde el alta envía su fila, fase 3)."""
+        try:
+            await self._session.flush()
+        except IntegrityError as e:
+            _traduce_la_violacion_del_alias(e)
+            if _es_el_correo_repetido(e):
+                raise EmailTakenConcurrentlyError("El correo ya está en uso.") from e
+            raise
+
+    def is_active(self) -> bool:
+        return self._session.is_active
+
+
+# El índice único del alias (mappers.py). Entre la comprobación del caso de uso y el
+# commit cabe otra petición pidiendo el mismo alias, y quien lo resuelve de verdad es
+# este índice. Su violación se traduce aquí, en la infraestructura, al error del
+# dominio: el caso de uso no conoce SQLAlchemy ni el esquema (auditoría del 9 nov
+# 2026, B1). Cualquier otra violación sube tal cual
+INDICE_DEL_ALIAS = "ix_users_alias_lower"
+
+
+def _traduce_la_violacion_del_alias(error: IntegrityError) -> None:
+    """Lanza AliasTakenConcurrentlyError si el error es el del índice del alias."""
+    if INDICE_DEL_ALIAS in str(error.orig):
+        raise AliasTakenConcurrentlyError("El alias ya está en uso.") from error
+
+
+# La restricción única del correo de users (la que pone Postgres a `unique=True`)
+RESTRICCION_DEL_CORREO = "users_email_key"
+
+
+def _es_el_correo_repetido(error: IntegrityError) -> bool:
+    """True si lo que saltó es la restricción única del correo de users."""
+    causa = getattr(error.orig, "__cause__", None)
+    nombre = getattr(causa, "constraint_name", None) or getattr(error.orig, "constraint_name", None)
+    if nombre:
+        return nombre == RESTRICCION_DEL_CORREO
+    return RESTRICCION_DEL_CORREO in str(error.orig)

@@ -1,0 +1,923 @@
+"""
+Round & Match Routes - API REST Layer (Infrastructure).
+
+Endpoints FastAPI para gestión de rondas, partidos y equipos
+del módulo Competition siguiendo Clean Architecture.
+"""
+
+import logging
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
+
+from src.config.dependencies import (
+    get_assign_teams_use_case,
+    get_coger_plaza_use_case,
+    get_configure_schedule_use_case,
+    get_create_round_use_case,
+    get_current_user,
+    get_declare_walkover_use_case,
+    get_dejar_de_esperar_use_case,
+    get_delete_round_use_case,
+    get_entendido_use_case,
+    get_esperar_use_case,
+    get_generate_matches_use_case,
+    get_get_match_detail_use_case,
+    get_get_schedule_use_case,
+    get_mis_plazas_asignadas_use_case,
+    get_reassign_match_players_use_case,
+    get_soltar_plaza_use_case,
+    get_undo_teams_use_case,
+    get_update_match_status_use_case,
+    get_update_round_use_case,
+)
+from src.config.rate_limit import limiter
+from src.modules.competition.application.dto.match_generation_block_dto import block_to_dto
+from src.modules.competition.application.dto.round_match_dto import (
+    AssignedPlaceDTO,
+    AssignTeamsBodyDTO,
+    AssignTeamsRequestDTO,
+    AssignTeamsResponseDTO,
+    ConfigureScheduleBodyDTO,
+    ConfigureScheduleRequestDTO,
+    ConfigureScheduleResponseDTO,
+    CreateRoundBodyDTO,
+    CreateRoundRequestDTO,
+    CreateRoundResponseDTO,
+    DeclareWalkoverBodyDTO,
+    DeclareWalkoverRequestDTO,
+    DeclareWalkoverResponseDTO,
+    DeleteRoundRequestDTO,
+    DeleteRoundResponseDTO,
+    GenerateMatchesBodyDTO,
+    GenerateMatchesRequestDTO,
+    GenerateMatchesResponseDTO,
+    GetMatchDetailRequestDTO,
+    GetMatchDetailResponseDTO,
+    GetScheduleRequestDTO,
+    GetScheduleResponseDTO,
+    ReassignMatchPlayersBodyDTO,
+    ReassignMatchPlayersRequestDTO,
+    ReassignMatchPlayersResponseDTO,
+    TakeTeeWindowPlaceBodyDTO,
+    TeeWindowPlaceResponseDTO,
+    UpdateMatchStatusBodyDTO,
+    UpdateMatchStatusRequestDTO,
+    UpdateMatchStatusResponseDTO,
+    UpdateRoundBodyDTO,
+    UpdateRoundRequestDTO,
+    UpdateRoundResponseDTO,
+    WaitingListEntryDTO,
+)
+from src.modules.competition.application.exceptions import (
+    NotCompetitionCreatorError as ReassignNotCreatorError,
+    PairingPlayerNotInTeamError,
+)
+from src.modules.competition.application.services.baja_de_la_competicion import (
+    DraftInProgressError,
+)
+from src.modules.competition.application.services.bloqueos_al_generar import (
+    NoGolfCourseForHandicapError,
+    NoTeamAssignmentError,
+)
+from src.modules.competition.application.services.equipos_formados import TeamsFormedError
+from src.modules.competition.application.services.jugadores_de_la_partida import (
+    JugadoresSinBarraError,
+    JugadoresSinHandicapError,
+)
+from src.modules.competition.application.services.jugadores_del_partido import (
+    PlayerNotEnrolledError as ReassignPlayerNotEnrolledError,
+)
+from src.modules.competition.application.services.lo_jugado_de_una_privada import (
+    NoPuedeVerloError,
+)
+from src.modules.competition.application.services.match_players_builder import TeeColorNotFoundError
+from src.modules.competition.application.use_cases.assign_teams_use_case import (
+    AssignTeamsUseCase,
+    DuplicatePlayerInTeamsError,
+    InsufficientPlayersError as AssignTeamsInsufficientError,
+    OddPlayersError,
+    PlayerNotEnrolledError,
+)
+from src.modules.competition.application.use_cases.configure_schedule_use_case import (
+    ConfigureScheduleUseCase,
+)
+from src.modules.competition.application.use_cases.create_round_use_case import (
+    CreateRoundUseCase,
+)
+from src.modules.competition.application.use_cases.declare_walkover_use_case import (
+    DeclareWalkoverUseCase,
+)
+from src.modules.competition.application.use_cases.delete_round_use_case import (
+    DeleteRoundUseCase,
+)
+from src.modules.competition.application.use_cases.generate_matches_use_case import (
+    GenerateMatchesUseCase,
+    InsufficientPlayersError as GenMatchesInsufficientError,
+    motivo_apuntado,
+)
+from src.modules.competition.application.use_cases.get_match_detail_use_case import (
+    GetMatchDetailUseCase,
+)
+from src.modules.competition.application.use_cases.get_schedule_use_case import (
+    GetScheduleUseCase,
+)
+from src.modules.competition.application.use_cases.listas_de_espera_use_case import (
+    DejarDeEsperarUseCase,
+    EntendidoUseCase,
+    EsperarUseCase,
+    MisPlazasAsignadasUseCase,
+)
+from src.modules.competition.application.use_cases.plazas_en_franjas_use_case import (
+    CogerPlazaUseCase,
+    SoltarPlazaUseCase,
+)
+from src.modules.competition.application.use_cases.reassign_match_players_use_case import (
+    MatchNotFoundError as ReassignMatchNotFoundError,
+    MatchNotScheduledError,
+    NoTeamAssignmentError as ReassignNoTeamAssignmentError,
+    PlayerNotInTeamError,
+    ReassignMatchPlayersUseCase,
+    WrongNumberOfPlayersError,
+)
+from src.modules.competition.application.use_cases.undo_teams_use_case import (
+    NoTeamsError,
+    TeamsLockedError,
+    UndoTeamsUseCase,
+)
+from src.modules.competition.application.use_cases.update_match_status_use_case import (
+    UpdateMatchStatusUseCase,
+)
+from src.modules.competition.application.use_cases.update_round_use_case import (
+    UpdateRoundUseCase,
+)
+from src.modules.competition.domain.value_objects.match_generation_block import (
+    MatchGenerationBlock,
+)
+from src.modules.competition.domain.value_objects.round_id import RoundId
+from src.modules.competition.domain.value_objects.ryder_cup_setup import (
+    CaptainMissingError,
+    CaptainOnWrongTeamError,
+)
+from src.modules.competition.infrastructure.api.v1.competition_state_routes import (
+    respuesta_con_jugadores,
+)
+from src.modules.competition.infrastructure.api.v1.correo_de_quien_mira import correo_de_quien_mira
+from src.modules.competition.infrastructure.api.v1.puerta_de_lo_jugado import solo_quien_participa
+from src.modules.user.application.dto.user_dto import UserResponseDTO
+from src.modules.user.domain.value_objects.user_id import UserId
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+# ======================================================================================
+# ROUNDS CRUD ENDPOINTS
+# ======================================================================================
+
+
+@router.post(
+    "/{competition_id}/rounds",
+    response_model=CreateRoundResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear ronda",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("10/minute")
+async def create_round(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    body: CreateRoundBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CreateRoundUseCase = Depends(get_create_round_use_case),
+):
+    """
+    Crea una nueva ronda/sesión de competición.
+
+    **Restricciones:**
+    - El creador o admin puede crear rondas
+    - La competición no puede haber terminado ni estar cancelada (BE #365)
+    - El campo de golf debe estar asociado a la competición
+    - No puede haber sesión duplicada (misma fecha + tipo de sesión)
+
+    **Returns:**
+    - 201: Ronda creada exitosamente
+    - 400: Estado inválido, sesión duplicada, fecha fuera de rango, o campo no asociado
+    - 403: Usuario no es el creador ni admin
+    - 404: Competición no encontrada
+    """
+    current_user_id = UserId(current_user.id)
+    request_dto = CreateRoundRequestDTO(
+        competition_id=competition_id,
+        golf_course_id=body.golf_course_id,
+        round_date=body.round_date,
+        session_type=body.session_type,
+        match_format=body.match_format,
+        handicap_mode=body.handicap_mode,
+        allowance_percentage=body.allowance_percentage,
+        tee_sheet=body.tee_sheet,
+    )
+    return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+
+@router.put(
+    "/rounds/{round_id}",
+    response_model=UpdateRoundResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Actualizar ronda",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("10/minute")
+async def update_round(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    body: UpdateRoundBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: UpdateRoundUseCase = Depends(get_update_round_use_case),
+):
+    """
+    Actualiza una ronda existente (campos opcionales).
+
+    **Restricciones:**
+    - El creador o admin puede modificar rondas
+    - La ronda debe estar en estado modificable (PENDING_TEAMS o PENDING_MATCHES)
+    - La competición no puede haber terminado ni estar cancelada (BE #365)
+
+    **Returns:**
+    - 200: Ronda actualizada
+    - 400: Estado no modificable, sesión duplicada, o campo no asociado
+    - 403: Usuario no es el creador ni admin
+    - 404: Ronda no encontrada
+    """
+    try:
+        current_user_id = UserId(current_user.id)
+        request_dto = UpdateRoundRequestDTO(
+            round_id=round_id,
+            round_date=body.round_date,
+            session_type=body.session_type,
+            golf_course_id=body.golf_course_id,
+            match_format=body.match_format,
+            handicap_mode=body.handicap_mode,
+            allowance_percentage=body.allowance_percentage,
+            clear_allowance=body.clear_allowance,
+            tee_sheet=body.tee_sheet,
+        )
+        return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+    # Otro campo para una franja con partidas: alguien sin barras en él (#251)
+    except JugadoresSinBarraError as e:
+        return respuesta_con_jugadores("PLAYERS_WITHOUT_TEE", e.players)
+    except JugadoresSinHandicapError as e:
+        return respuesta_con_jugadores("PLAYERS_WITHOUT_HANDICAP", e.players)
+
+
+@router.delete(
+    "/rounds/{round_id}",
+    response_model=DeleteRoundResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Eliminar ronda",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("10/minute")
+async def delete_round(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: DeleteRoundUseCase = Depends(get_delete_round_use_case),
+):
+    """
+    Elimina una ronda y sus partidos asociados.
+
+    **Restricciones:**
+    - El creador o admin puede eliminar rondas
+    - La ronda debe estar en estado modificable (PENDING_TEAMS o PENDING_MATCHES)
+    - La competición no puede haber terminado ni estar cancelada (BE #365)
+
+    **Returns:**
+    - 200: Ronda eliminada
+    - 400: Estado no modificable
+    - 403: Usuario no es el creador ni admin
+    - 404: Ronda no encontrada
+    """
+    current_user_id = UserId(current_user.id)
+    request_dto = DeleteRoundRequestDTO(round_id=round_id)
+    return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+
+@router.get(
+    "/{competition_id}/schedule",
+    response_model=GetScheduleResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Obtener schedule de competición",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("20/minute")
+async def get_schedule(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetScheduleUseCase = Depends(get_get_schedule_use_case),
+):
+    """
+    Obtiene el schedule completo de una competición con rondas agrupadas por día.
+
+    En cada franja, quien mira ve a quien le deja la regla de la release
+    social 2 (sus amigos hasta que se publica), con las plazas ocupadas reales.
+
+    **Returns:**
+    - 200: Schedule con días, rondas, partidos y asignación de equipos
+    - 404: Competición no encontrada
+    """
+    request_dto = GetScheduleRequestDTO(competition_id=competition_id)
+    return await use_case.execute(
+        request_dto,
+        viewer_id=UserId(str(current_user.id)),
+        viewer_is_admin=current_user.is_admin,
+        viewer_email=correo_de_quien_mira(current_user),
+    )
+
+
+# ======================================================================================
+# MATCH ENDPOINTS
+# ======================================================================================
+
+
+@router.get(
+    "/matches/{match_id}",
+    response_model=GetMatchDetailResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Obtener detalle de partido",
+    tags=["Competitions - Matches"],
+)
+@limiter.limit("20/minute")
+async def get_match_detail(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    match_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetMatchDetailUseCase = Depends(get_get_match_detail_use_case),
+):
+    """
+    Obtiene el detalle completo de un partido.
+
+    **Returns:**
+    - 200: Detalle del partido con jugadores, handicaps y resultado
+    - 403: Partido de una privada en la que no está (tabla del 27 oct 2026)
+    - 404: Partido no encontrado
+    """
+    try:
+        request_dto = GetMatchDetailRequestDTO(match_id=match_id)
+        return await use_case.execute(
+            request_dto, quien=UserId(str(current_user.id)), es_admin=current_user.is_admin
+        )
+    except NoPuedeVerloError:
+        return solo_quien_participa()
+
+
+@router.put(
+    "/matches/{match_id}/status",
+    response_model=UpdateMatchStatusResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Actualizar estado de partido",
+    tags=["Competitions - Matches"],
+)
+@limiter.limit("10/minute")
+async def update_match_status(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    match_id: UUID,
+    body: UpdateMatchStatusBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: UpdateMatchStatusUseCase = Depends(get_update_match_status_use_case),
+):
+    """
+    Actualiza el estado de un partido (START o COMPLETE).
+
+    **Restricciones:**
+    - El creador o admin puede cambiar estados
+    - La competición debe estar IN_PROGRESS
+    - Acciones válidas: START (SCHEDULED→IN_PROGRESS), COMPLETE (IN_PROGRESS→COMPLETED)
+
+    **Returns:**
+    - 200: Estado actualizado
+    - 400: Acción inválida o competición no en progreso
+    - 403: Usuario no es el creador ni admin
+    - 404: Partido no encontrado
+    """
+    current_user_id = UserId(current_user.id)
+    request_dto = UpdateMatchStatusRequestDTO(
+        match_id=match_id,
+        action=body.action,
+        result=body.result,
+    )
+    return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+
+@router.post(
+    "/matches/{match_id}/walkover",
+    response_model=DeclareWalkoverResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Declarar walkover",
+    tags=["Competitions - Matches"],
+)
+@limiter.limit("10/minute")
+async def declare_walkover(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    match_id: UUID,
+    body: DeclareWalkoverBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: DeclareWalkoverUseCase = Depends(get_declare_walkover_use_case),
+):
+    """
+    Declara un walkover (victoria por incomparecencia) en un partido.
+
+    **Restricciones:**
+    - El creador o admin puede declarar walkovers
+    - La competición debe estar IN_PROGRESS
+    - El partido debe estar en estado válido para walkover
+
+    **Returns:**
+    - 200: Walkover declarado
+    - 400: Walkover inválido o competición no en progreso
+    - 403: Usuario no es el creador ni admin
+    - 404: Partido no encontrado
+    """
+    current_user_id = UserId(current_user.id)
+    request_dto = DeclareWalkoverRequestDTO(
+        match_id=match_id,
+        winning_team=body.winning_team,
+        reason=body.reason,
+    )
+    return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+
+@router.put(
+    "/matches/{match_id}/players",
+    response_model=ReassignMatchPlayersResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Reasignar jugadores de partido",
+    tags=["Competitions - Matches"],
+)
+@limiter.limit("10/minute")
+async def reassign_match_players(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    match_id: UUID,
+    body: ReassignMatchPlayersBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ReassignMatchPlayersUseCase = Depends(get_reassign_match_players_use_case),
+):
+    """
+    Reasigna los jugadores de un partido (recalcula handicaps).
+
+    **Restricciones:**
+    - El creador o admin puede reasignar jugadores
+    - El partido debe estar en estado SCHEDULED
+    - Los jugadores deben pertenecer a los equipos asignados
+
+    **Returns:**
+    - 200: Jugadores reasignados con handicaps recalculados
+    - 400: Partido no scheduled o jugadores no válidos
+    - 403: Usuario no es el creador ni admin
+    - 404: Partido no encontrado
+    """
+    try:
+        current_user_id = UserId(current_user.id)
+        request_dto = ReassignMatchPlayersRequestDTO(
+            match_id=match_id,
+            team_a_player_ids=body.team_a_player_ids,
+            team_b_player_ids=body.team_b_player_ids,
+        )
+        return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+    except ReassignMatchNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except ReassignNotCreatorError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e),
+        ) from e
+    except (
+        MatchNotScheduledError,
+        PlayerNotInTeamError,
+        ReassignNoTeamAssignmentError,
+        ReassignPlayerNotEnrolledError,
+        TeeColorNotFoundError,
+        WrongNumberOfPlayersError,
+    ) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        logging.exception("Error inesperado en reassign_match_players: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        ) from e
+
+
+# ======================================================================================
+# TEAMS & GENERATION ENDPOINTS
+# ======================================================================================
+
+
+@router.post(
+    "/{competition_id}/teams",
+    response_model=AssignTeamsResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Asignar equipos",
+    tags=["Competitions - Teams"],
+)
+@limiter.limit("10/minute")
+async def assign_teams(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    body: AssignTeamsBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: AssignTeamsUseCase = Depends(get_assign_teams_use_case),
+):
+    """
+    Asigna equipos para la competición (automático con snake draft o manual).
+
+    **Restricciones:**
+    - El creador o admin puede asignar equipos
+    - La competición debe estar en estado CLOSED
+    - Debe haber suficientes jugadores inscritos (mínimo 2)
+    - En modo MANUAL, los equipos deben estar balanceados
+
+    **Returns:**
+    - 201: Equipos asignados
+    - 400: Estado inválido, jugadores insuficientes, equipos desequilibrados,
+      un jugador en los dos equipos, o un capitán fuera de su equipo o sin pareja
+    - 403: Usuario no es el creador ni admin
+    - 404: Competición no encontrada
+    - 409: Con la sala de draft abierta (`DRAFT_IN_PROGRESS`) o con los equipos
+      ya formados (`TEAMS_FORMED`): tras quitar a alguien se pueden volver a
+      formar, si quedan pares
+    """
+    try:
+        current_user_id = UserId(current_user.id)
+        request_dto = AssignTeamsRequestDTO(
+            competition_id=competition_id,
+            mode=body.mode,
+            team_a_player_ids=body.team_a_player_ids,
+            team_b_player_ids=body.team_b_player_ids,
+        )
+        return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+    except (DraftInProgressError, TeamsFormedError) as e:
+        # Con su código en la raíz y un texto fijo por código (CodeQL)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": _NO_SE_FORMAN[e.error_code], "error_code": e.error_code},
+        )
+    except (
+        AssignTeamsInsufficientError,
+        OddPlayersError,
+        PlayerNotEnrolledError,
+        DuplicatePlayerInTeamsError,
+        CaptainMissingError,
+        CaptainOnWrongTeamError,
+        ValueError,
+    ) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+_NO_SE_FORMAN = {
+    DraftInProgressError.error_code: "Wait until the draft is over.",
+    TeamsFormedError.error_code: TeamsFormedError.MENSAJE,
+}
+
+
+@router.delete(
+    "/{competition_id}/teams",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Deshacer equipos",
+    tags=["Competitions - Teams"],
+)
+@limiter.limit("10/minute")
+async def undo_teams(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: UndoTeamsUseCase = Depends(get_undo_teams_use_case),
+):
+    """
+    Deshace los equipos para que pueda entrar alguien nuevo (30 oct 2026).
+
+    Con los equipos formados no se invita ni se vuelven a formar. Es el mismo
+    reinicio que al quitar a un jugador: fuera equipos, sala de draft, sobres y
+    subcapitanes; los capitanes se quedan y se repite el draft.
+
+    **Returns:**
+    - 204: Deshechos
+    - 403: Usuario no es el creador ni admin
+    - 404: Competición no encontrada
+    - 409: Sin equipos (`NO_TEAMS`), o con partidos, ya empezada o cancelada
+      (`TEAMS_LOCKED`)
+    """
+    try:
+        await use_case.execute(
+            competition_id, UserId(current_user.id), is_admin=current_user.is_admin
+        )
+    except (NoTeamsError, TeamsLockedError) as e:
+        # Con su código en la raíz y un texto fijo por código (CodeQL)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": _NO_SE_DESHACEN[e.error_code], "error_code": e.error_code},
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+_NO_SE_DESHACEN = {
+    NoTeamsError.error_code: NoTeamsError.MENSAJE,
+    TeamsLockedError.error_code: TeamsLockedError.MENSAJE,
+}
+
+
+def frase_del_bloqueo(motivo: MatchGenerationBlock) -> str:
+    """La frase del 400 para el cliente que aún no lee las claves (BE #360)."""
+    if motivo.players:
+        nombres = ", ".join(p.name or "un jugador" for p in motivo.players)
+        return f"No se pueden generar los partidos: faltan datos de {nombres}"
+    return "No se pueden generar los partidos: el motivo está en la sesión"
+
+
+@router.post(
+    "/rounds/{round_id}/matches/generate",
+    response_model=GenerateMatchesResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Generar partidos",
+    tags=["Competitions - Matches"],
+)
+@limiter.limit("10/minute")
+async def generate_matches(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    body: GenerateMatchesBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GenerateMatchesUseCase = Depends(get_generate_matches_use_case),
+):
+    """
+    Genera partidos para una ronda basándose en los equipos asignados.
+
+    **Restricciones:**
+    - El creador o admin puede generar partidos
+    - La ronda debe estar en estado PENDING_MATCHES
+    - Debe existir asignación de equipos
+    - La competición debe estar cerrada o en juego: los sobres de las sesiones
+      del segundo día se abren con el torneo empezado (BE #361)
+
+    **Returns:**
+    - 201: Partidos generados
+    - 400: Estado inválido, sin equipos, o jugadores insuficientes. Cuando es
+      uno de los motivos que la sesión apunta (`error_code`
+      `MATCH_GENERATION_BLOCKED`), va en claves en `match_generation_block`,
+      con la misma forma que en la agenda, y queda apuntado en la sesión
+      (BE #360). Los errores de los emparejamientos a mano no se apuntan en la
+      sesión (22 nov 2026): un emparejado a mano sin la inscripción aprobada da
+      el mismo 400 `MATCH_GENERATION_BLOCKED`, con el motivo
+      `NOT_ENOUGH_PLAYERS` y quién, antes que los lados, pero la sesión se
+      queda con el motivo que tuviera (o ninguno). Por eso, tras uno de esos,
+      la agenda puede enseñar otro motivo que el de esta respuesta
+    - 404: Ronda no encontrada
+    - 422: `PAIRING_PLAYER_NOT_IN_TEAM`: un emparejado a mano no está en ningún
+      equipo, o está en el lado del contrario; no se genera nada
+    """
+    try:
+        current_user_id = UserId(current_user.id)
+        request_dto = GenerateMatchesRequestDTO(
+            round_id=round_id,
+            manual_pairings=body.manual_pairings,
+        )
+        return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+    except PairingPlayerNotInTeamError as e:
+        # Texto fijo, no el de la excepción (CodeQL); no se apunta en la sesión
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": "Each paired player must be on their own team's side.",
+                "error_code": e.error_code,
+            },
+        )
+
+    except (
+        GenMatchesInsufficientError,
+        NoTeamAssignmentError,
+        TeeColorNotFoundError,
+        NoGolfCourseForHandicapError,
+    ) as e:
+        # El que se guardó en la sesión, con su hora: el mismo que da la agenda.
+        # Salvo el de un emparejamiento a mano (J1): ese no se guarda, y la
+        # agenda sigue con el que tuviera
+        motivo = motivo_apuntado(e)
+        if motivo is None:
+            # Un color que falta sin la lista de quién: no hay motivo que contar
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+        # Claves y no frases (decidido el 24 sep): la pantalla lo escribe en su
+        # idioma. `error_code` en la RAIZ, que es donde lo lee el cliente, como
+        # SCORING_NOT_OPEN_YET. `detail` es para quien aún no lo lee, y se
+        # compone aquí con el motivo, no con el mensaje de la excepción
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "detail": frase_del_bloqueo(motivo),
+                "error_code": "MATCH_GENERATION_BLOCKED",
+                "match_generation_block": block_to_dto(motivo).model_dump(mode="json"),
+            },
+        )
+
+
+@router.post(
+    "/{competition_id}/schedule/configure",
+    response_model=ConfigureScheduleResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Configurar schedule",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("10/minute")
+async def configure_schedule(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    competition_id: UUID,
+    body: ConfigureScheduleBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ConfigureScheduleUseCase = Depends(get_configure_schedule_use_case),
+):
+    """
+    Configura el schedule de la competición (automático o manual).
+
+    **Restricciones:**
+    - El creador o admin puede configurar el schedule
+    - La competición no puede haber terminado ni estar cancelada (BE #365)
+    - Con el torneo en juego no: empezaría por días ya jugados
+    - Ninguna sesión puede tener partidos: la automática las SUSTITUYE todas
+    - Debe tener al menos un campo de golf asociado (modo AUTO)
+
+    **Returns:**
+    - 200: Schedule configurado
+    - 400: Estado inválido, sesiones con partidos o sin campos de golf
+    - 403: Usuario no es el creador ni admin
+    - 404: Competición no encontrada
+    """
+    current_user_id = UserId(current_user.id)
+    request_dto = ConfigureScheduleRequestDTO(
+        competition_id=competition_id,
+        mode=body.mode,
+        total_sessions=body.total_sessions,
+        sessions_per_day=body.sessions_per_day,
+    )
+    return await use_case.execute(request_dto, current_user_id, is_admin=current_user.is_admin)
+
+
+# ======================================================================================
+# PLAZAS EN FRANJAS (#251)
+# ======================================================================================
+
+
+@router.post(
+    "/rounds/{round_id}/places",
+    response_model=TeeWindowPlaceResponseDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Coger plaza en una franja",
+    description=(
+        "Stableford o Medal. El jugador elige sus franjas mientras las inscripciones están "
+        "abiertas; el organizador coloca a cualquiera hasta iniciar. Una por jornada, hasta "
+        "el máximo de jornadas, y con `instead_of_round_id` se cambia de golpe."
+    ),
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("30/minute")
+async def take_tee_window_place(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    body: TakeTeeWindowPlaceBodyDTO,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CogerPlazaUseCase = Depends(get_coger_plaza_use_case),
+):
+    """201 con la plaza; 400 con el motivo si no se puede."""
+    quien = UserId(str(current_user.id))
+    jugador = UserId(str(body.user_id)) if body.user_id else quien
+    plaza = await use_case.execute(
+        RoundId(round_id),
+        jugador,
+        quien,
+        is_admin=current_user.is_admin,
+        en_lugar_de=RoundId(body.instead_of_round_id) if body.instead_of_round_id else None,
+    )
+    return TeeWindowPlaceResponseDTO(round_id=plaza.round_id.value, user_id=plaza.user_id.value)
+
+
+@router.delete(
+    "/rounds/{round_id}/places/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Soltar la plaza en una franja",
+    description="El propio jugador mientras las inscripciones están abiertas; el organizador hasta iniciar.",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("30/minute")
+async def leave_tee_window_place(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    user_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: SoltarPlazaUseCase = Depends(get_soltar_plaza_use_case),
+):
+    """204 aunque no la tuviera."""
+    await use_case.execute(
+        RoundId(round_id),
+        UserId(str(user_id)),
+        UserId(str(current_user.id)),
+        is_admin=current_user.is_admin,
+    )
+
+
+# ======================================================================================
+# LISTAS DE ESPERA (#251)
+# ======================================================================================
+
+
+@router.post(
+    "/rounds/{round_id}/waiting-list",
+    response_model=WaitingListEntryDTO,
+    status_code=status.HTTP_201_CREATED,
+    summary="Apuntarse a la lista de espera de una franja",
+    description=(
+        "Stableford o Medal, mientras las inscripciones están abiertas: en una franja llena, "
+        "de un día en que no se juega. La plaza que se libere se asigna sola al primero."
+    ),
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("30/minute")
+async def join_waiting_list(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: EsperarUseCase = Depends(get_esperar_use_case),
+):
+    """201; 400 con el motivo si no se puede."""
+    yo = UserId(str(current_user.id))
+    await use_case.execute(RoundId(round_id), yo, yo)
+    return WaitingListEntryDTO(round_id=round_id, user_id=yo.value)
+
+
+@router.delete(
+    "/rounds/{round_id}/waiting-list/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Salir de la lista de espera de una franja",
+    description="El propio jugador, o el organizador.",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("30/minute")
+async def leave_waiting_list(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    user_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: DejarDeEsperarUseCase = Depends(get_dejar_de_esperar_use_case),
+):
+    """204 aunque no estuviera."""
+    await use_case.execute(
+        RoundId(round_id),
+        UserId(str(user_id)),
+        UserId(str(current_user.id)),
+        is_admin=current_user.is_admin,
+    )
+
+
+@router.get(
+    "/me/assigned-places",
+    response_model=list[AssignedPlaceDTO],
+    summary="Plazas que me asignó la lista de espera",
+    description="Para «Requiere tu atención»: las que aún no he visto («Entendido»).",
+    tags=["Competitions - Rounds"],
+)
+async def my_assigned_places(
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: MisPlazasAsignadasUseCase = Depends(get_mis_plazas_asignadas_use_case),
+):
+    """Las más antiguas primero."""
+    return await use_case.execute(UserId(str(current_user.id)))
+
+
+@router.post(
+    "/me/assigned-places/{round_id}/acknowledge",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Entendido: ya he visto la plaza que me asignó la lista",
+    tags=["Competitions - Rounds"],
+)
+@limiter.limit("30/minute")
+async def acknowledge_assigned_place(
+    request: Request,  # noqa: ARG001 - Required by @limiter decorator
+    round_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: EntendidoUseCase = Depends(get_entendido_use_case),
+):
+    """204; solo marca la suya."""
+    await use_case.execute(RoundId(round_id), UserId(str(current_user.id)))

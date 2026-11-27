@@ -1,0 +1,438 @@
+"""
+Tests de Integración para Refresh Token (Session Timeout - v1.8.0).
+
+Estos tests verifican que el sistema de refresh tokens funciona correctamente
+para mantener sesiones activas sin comprometer la seguridad (OWASP A01/A02/A07).
+
+Tests incluidos:
+1. POST /refresh-token con refresh token válido retorna nuevo access token
+2. POST /refresh-token sin cookie retorna 401 Unauthorized
+3. POST /refresh-token con token inválido retorna 401 Unauthorized
+4. POST /refresh-token con token revocado (después de logout) retorna 401
+5. POST /refresh-token con token expirado retorna 401
+6. POST /refresh-token establece nueva cookie access_token (httpOnly)
+7. POST /refresh-token rota el refresh token solo en la cookie (F-02; antes no lo renovaba)
+
+Arquitectura:
+- Capa: Integration Tests
+- Módulo: User (Authentication)
+- Feature: Session Timeout with Refresh Tokens (v1.8.0)
+"""
+
+import pytest
+from httpx import AsyncClient
+
+from src.modules.user.application.dto.user_dto import RegisterUserRequestDTO
+
+
+@pytest.mark.asyncio
+class TestRefreshTokenEndpoint:
+    """Tests de integración para POST /api/v1/auth/refresh-token."""
+
+    @pytest.fixture
+    def test_user_data(self) -> dict:
+        """Fixture con datos de usuario para tests de refresh tokens."""
+        return {
+            "email": "refresh_test@example.com",
+            "password": "SecureP@ssw0rd123",
+            "first_name": "Refresh",
+            "last_name": "Tester",
+        }
+
+    async def test_refresh_token_with_valid_token_returns_new_access_token(
+        self,
+        client: AsyncClient,
+        test_user_data: dict,
+    ):
+        """
+        Test: POST /refresh-token con refresh token válido retorna nuevo access token.
+
+        Given: Un usuario autenticado con refresh token válido en cookie
+        When: El usuario hace POST /refresh-token
+        Then:
+            - HTTP 200 OK
+            - Response body contiene nuevo access_token
+            - Response body contiene token_type "bearer"
+            - Response body contiene user data
+            - Response body contiene message de éxito
+            - Response headers contienen Set-Cookie con nuevo access_token
+        """
+        # Given: Registrar y hacer login (obtener refresh token)
+        register_payload = RegisterUserRequestDTO(
+            accept_terms=True,
+            email=test_user_data["email"],
+            password=test_user_data["password"],
+            first_name=test_user_data["first_name"],
+            last_name=test_user_data["last_name"],
+        )
+        await client.post("/api/v1/auth/register", json=register_payload.model_dump())
+
+        login_payload = {
+            "email": test_user_data["email"],
+            "password": test_user_data["password"],
+        }
+        login_response = await client.post("/api/v1/auth/login", json=login_payload)
+        assert login_response.status_code == 200
+
+        # When: Renovar el access token usando refresh token
+        response = await client.post("/api/v1/auth/refresh-token")
+
+        # Then: Verificar respuesta exitosa
+        assert response.status_code == 200
+        data = response.json()
+
+        # Los tokens, solo en las cookies (2.58.0)
+        assert "access_token" not in data
+        assert "token_type" not in data
+        assert "user" in data
+        assert data["user"]["email"] == test_user_data["email"]
+        assert data["user"]["first_name"] == test_user_data["first_name"]
+        assert data["user"]["last_name"] == test_user_data["last_name"]
+        assert "message" in data
+        assert "renovado" in data["message"].lower() or "refresh" in data["message"].lower()
+
+        # Verificar que el access token es un JWT válido
+        new_access_token = response.cookies["access_token"]
+        assert new_access_token is not None
+        assert len(new_access_token) > 0
+        # Nota: No comparamos con el original porque pueden ser idénticos si se crean en el mismo segundo
+
+        # Then: Verificar cookie httpOnly con nuevo access token
+        set_cookie_header = response.headers.get("set-cookie")
+        assert set_cookie_header is not None, "Set-Cookie header debe existir"
+        assert "access_token=" in set_cookie_header
+        assert "HttpOnly" in set_cookie_header
+
+    async def test_refresh_without_cookie_does_not_touch_the_refresh_cookie(
+        self,
+        client: AsyncClient,
+    ):
+        """
+        Given: Un refresco que llega sin cookie de refresh (por ejemplo, un formulario de
+               otra web: SameSite=Lax no la manda)
+        When: Responde el 401
+        Then: No envía ningún Set-Cookie del refresh: si lo borrara, cualquier web podría
+              cerrar la sesión de quien la visite (auditoría OWASP, 5 nov 2026)
+        """
+        client.cookies.clear()
+
+        response = await client.post("/api/v1/auth/refresh-token")
+
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "SESSION_ENDED"
+        assert not [
+            c for c in response.headers.get_list("set-cookie") if c.startswith("refresh_token=")
+        ]
+
+    async def test_refresh_token_without_cookie_returns_401(
+        self,
+        client: AsyncClient,
+    ):
+        """
+        Test: POST /refresh-token sin cookie refresh_token retorna 401 Unauthorized.
+
+        Given: Cliente sin refresh token cookie
+        When: El usuario hace POST /refresh-token
+        Then:
+            - HTTP 401 Unauthorized
+            - Response body contiene mensaje de error
+        """
+        # Given: Cliente nuevo sin refresh token cookie
+        from httpx import (
+            ASGITransport,
+            AsyncClient as FreshClient,
+        )
+
+        from main import app
+
+        async with FreshClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as fresh_client:
+            # When: Intentar renovar sin refresh token
+            response = await fresh_client.post("/api/v1/auth/refresh-token")
+
+            # Then: HTTP 401
+            assert response.status_code == 401
+            data = response.json()
+            assert "detail" in data
+            # El motivo, para que el front distinga una caducidad de un rechazo (FE #1042)
+            assert data["error_code"] == "SESSION_ENDED"
+            # El mensaje puede ser variado dependiendo de la validación
+            assert any(
+                keyword in data["detail"].lower()
+                for keyword in [
+                    "token",
+                    "inválido",
+                    "invalid",
+                    "expirado",
+                    "expired",
+                    "login",
+                ]
+            )
+
+    async def test_refresh_token_with_invalid_token_returns_401(
+        self,
+        client: AsyncClient,
+    ):
+        """
+        Test: POST /refresh-token con refresh token JWT inválido retorna 401.
+
+        Given: Cliente con refresh token cookie inválido (firma incorrecta)
+        When: El usuario hace POST /refresh-token
+        Then:
+            - HTTP 401 Unauthorized
+            - Response body contiene mensaje de error
+        """
+        # Given: Crear cliente con cookie inválida
+        client.cookies.set("refresh_token", "invalid.jwt.token")
+
+        # When: Intentar renovar con token inválido
+        response = await client.post("/api/v1/auth/refresh-token")
+
+        # Then: HTTP 401
+        assert response.status_code == 401
+        data = response.json()
+        assert "detail" in data
+        # El motivo, para que el front distinga una caducidad de un rechazo (FE #1042)
+        assert data["error_code"] == "SESSION_REJECTED"
+        assert any(
+            keyword in data["detail"].lower()
+            for keyword in [
+                "token",
+                "inválido",
+                "invalid",
+                "expirado",
+                "expired",
+                "login",
+            ]
+        )
+
+    async def test_refresh_token_after_logout_returns_401(
+        self,
+        client: AsyncClient,
+        test_user_data: dict,
+    ):
+        """
+        Test: POST /refresh-token después de logout retorna 401 (token revocado).
+
+        Given:
+            - Un usuario autenticado con refresh token válido
+            - Usuario hace logout (revoca refresh token en BD)
+        When: El usuario intenta renovar con el mismo refresh token
+        Then:
+            - HTTP 401 Unauthorized
+            - Response body contiene mensaje de error
+        """
+        # Given: Registrar y hacer login
+        register_payload = RegisterUserRequestDTO(
+            accept_terms=True,
+            email=test_user_data["email"],
+            password=test_user_data["password"],
+            first_name=test_user_data["first_name"],
+            last_name=test_user_data["last_name"],
+        )
+        await client.post("/api/v1/auth/register", json=register_payload.model_dump())
+
+        login_payload = {
+            "email": test_user_data["email"],
+            "password": test_user_data["password"],
+        }
+        login_response = await client.post("/api/v1/auth/login", json=login_payload)
+        assert login_response.status_code == 200
+
+        # Given: Hacer logout (revoca refresh token)
+        logout_payload = {}
+        logout_response = await client.post("/api/v1/auth/logout", json=logout_payload)
+        assert logout_response.status_code == 200
+
+        # When: Intentar renovar después de logout (token revocado)
+        response = await client.post("/api/v1/auth/refresh-token")
+
+        # Then: HTTP 401 (token revocado)
+        assert response.status_code == 401
+        data = response.json()
+        assert "detail" in data
+        # El motivo, para que el front distinga una caducidad de un rechazo (FE #1042)
+        # El logout borra la cookie: lo que llega después es un refresco sin ella
+        assert data["error_code"] == "SESSION_ENDED"
+
+    async def test_refresh_token_revoked_and_sent_again_returns_revoked_code_and_clears_cookie(
+        self,
+        client: AsyncClient,
+        test_user_data: dict,
+    ):
+        """
+        Given: Un refresh token revocado por el logout, que alguien vuelve a mandar
+        When: Pide renovar la sesión con él
+        Then: 401 con SESSION_REJECTED (BE #733: sin decir que se revocó), y la
+              respuesta borra la cookie: el siguiente es SESSION_ENDED, el final normal
+              (/code-review, 5 nov)
+        """
+        await client.post(
+            "/api/v1/auth/register",
+            json=RegisterUserRequestDTO(
+                accept_terms=True,
+                email=test_user_data["email"],
+                password=test_user_data["password"],
+                first_name=test_user_data["first_name"],
+                last_name=test_user_data["last_name"],
+            ).model_dump(),
+        )
+        await client.post(
+            "/api/v1/auth/login",
+            json={"email": test_user_data["email"], "password": test_user_data["password"]},
+        )
+        refresco = client.cookies.get("refresh_token")
+        assert refresco
+        await client.post("/api/v1/auth/logout", json={})
+
+        client.cookies.set("refresh_token", refresco)
+        response = await client.post("/api/v1/auth/refresh-token")
+
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "SESSION_REJECTED"
+        borrada = [
+            c for c in response.headers.get_list("set-cookie") if c.startswith("refresh_token=")
+        ]
+        assert borrada and ("Max-Age=0" in borrada[0] or 'refresh_token=""' in borrada[0])
+
+    async def test_refresh_token_can_be_used_to_access_protected_endpoints(
+        self,
+        client: AsyncClient,
+        test_user_data: dict,
+    ):
+        """
+        Test: El nuevo access token obtenido con /refresh-token funciona en endpoints protegidos.
+
+        Given: Un usuario que renovó su access token
+        When: El usuario hace request a endpoint protegido con el nuevo token
+        Then:
+            - HTTP 200 OK
+            - Autenticación exitosa
+        """
+        # Given: Registrar y hacer login
+        register_payload = RegisterUserRequestDTO(
+            accept_terms=True,
+            email=test_user_data["email"],
+            password=test_user_data["password"],
+            first_name=test_user_data["first_name"],
+            last_name=test_user_data["last_name"],
+        )
+        await client.post("/api/v1/auth/register", json=register_payload.model_dump())
+
+        login_payload = {
+            "email": test_user_data["email"],
+            "password": test_user_data["password"],
+        }
+        login_response = await client.post("/api/v1/auth/login", json=login_payload)
+        assert login_response.status_code == 200
+
+        # Given: Renovar access token
+        refresh_response = await client.post("/api/v1/auth/refresh-token")
+        assert refresh_response.status_code == 200
+
+        # When: Usar el nuevo access token para acceder a endpoint protegido
+        # La cookie ya está establecida automáticamente por httpx
+        response = await client.get("/api/v1/auth/current-user")
+
+        # Then: Autenticación exitosa
+        assert response.status_code == 200
+        data = response.json()
+        assert data["email"] == test_user_data["email"]
+
+    async def test_refresh_token_rotates_the_refresh_token_in_the_cookie_only(
+        self,
+        client: AsyncClient,
+        test_user_data: dict,
+    ):
+        """
+        Test: POST /refresh-token rota el refresh token (F-02), solo en la cookie.
+
+        Given: Un usuario autenticado con refresh token
+        When: El usuario renueva el access token
+        Then:
+            - Response NO contiene refresh_token en el cuerpo
+            - Set-Cookie trae un refresh_token nuevo, distinto del del login
+            - Y el access_token renovado
+        """
+        # Given: Registrar y hacer login
+        register_payload = RegisterUserRequestDTO(
+            accept_terms=True,
+            email=test_user_data["email"],
+            password=test_user_data["password"],
+            first_name=test_user_data["first_name"],
+            last_name=test_user_data["last_name"],
+        )
+        await client.post("/api/v1/auth/register", json=register_payload.model_dump())
+
+        login_payload = {
+            "email": test_user_data["email"],
+            "password": test_user_data["password"],
+        }
+        login_response = await client.post("/api/v1/auth/login", json=login_payload)
+        assert login_response.status_code == 200
+
+        original_refresh_token = login_response.cookies.get("refresh_token")
+        assert original_refresh_token is not None
+
+        # When: Renovar access token
+        response = await client.post("/api/v1/auth/refresh-token")
+
+        # Then: el cuerpo no lleva el refresh token
+        assert response.status_code == 200
+        assert "refresh_token" not in response.json()
+
+        # Then: la cookie sí, y es otro
+        set_cookies = response.headers.get_list("set-cookie")
+        assert any(c.startswith("access_token=") for c in set_cookies)
+        refrescos = [c for c in set_cookies if c.startswith("refresh_token=")]
+        assert len(refrescos) == 1
+        nuevo = refrescos[0].split(";", 1)[0].split("=", 1)[1]
+        assert nuevo and nuevo != original_refresh_token
+
+    async def test_refresh_token_sets_new_access_token_cookie(
+        self,
+        client: AsyncClient,
+        test_user_data: dict,
+    ):
+        """
+        Test: POST /refresh-token establece nueva cookie httpOnly para access_token.
+
+        Given: Un usuario autenticado
+        When: El usuario renueva su access token
+        Then:
+            - Response headers contienen Set-Cookie con access_token
+            - Cookie tiene flags: HttpOnly, SameSite=lax, Path=/, Max-Age=900
+        """
+        # Given: Registrar y hacer login
+        register_payload = RegisterUserRequestDTO(
+            accept_terms=True,
+            email=test_user_data["email"],
+            password=test_user_data["password"],
+            first_name=test_user_data["first_name"],
+            last_name=test_user_data["last_name"],
+        )
+        await client.post("/api/v1/auth/register", json=register_payload.model_dump())
+
+        login_payload = {
+            "email": test_user_data["email"],
+            "password": test_user_data["password"],
+        }
+        login_response = await client.post("/api/v1/auth/login", json=login_payload)
+        assert login_response.status_code == 200
+
+        # When: Renovar access token
+        response = await client.post("/api/v1/auth/refresh-token")
+
+        # Then: Verificar cookie httpOnly
+        assert response.status_code == 200
+
+        set_cookie_header = response.headers.get("set-cookie")
+        assert set_cookie_header is not None, "Set-Cookie header debe existir"
+
+        # Verificar flags de seguridad
+        assert "access_token=" in set_cookie_header
+        assert "HttpOnly" in set_cookie_header, "Cookie debe tener flag HttpOnly"
+        assert "SameSite=lax" in set_cookie_header, "Cookie debe tener SameSite=lax"
+        assert "Path=/" in set_cookie_header, "Cookie debe tener Path=/"
+        assert "Max-Age=900" in set_cookie_header, "Cookie debe expirar en 15 minutos"

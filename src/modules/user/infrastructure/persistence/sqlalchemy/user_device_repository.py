@@ -1,0 +1,307 @@
+# src/modules/user/infrastructure/persistence/sqlalchemy/user_device_repository.py
+"""
+User Device Repository - Infrastructure Layer
+
+Implementación SQLAlchemy del repositorio de dispositivos de usuario.
+Maneja persistencia async de dispositivos en PostgreSQL.
+
+Responsabilidades:
+- CRUD de dispositivos (save, find, revoke)
+- Queries optimizadas con índices
+- Reconstrucción de UserDevice desde BD con DeviceFingerprint
+- Manejo de errores de persistencia
+
+Patrón: Repository Pattern + Async SQLAlchemy
+"""
+
+from datetime import datetime
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.modules.user.domain.entities.user_device import UserDevice
+from src.modules.user.domain.repositories.user_device_repository_interface import (
+    UserDeviceRepositoryInterface,
+)
+from src.modules.user.domain.value_objects.user_device_id import UserDeviceId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.modules.user.infrastructure.persistence.sqlalchemy.user_device_mapper import (
+    user_devices_table,
+)
+from src.shared.infrastructure.persistence.filas_afectadas import filas_afectadas
+
+
+class SQLAlchemyUserDeviceRepository(UserDeviceRepositoryInterface):
+    """
+    Implementación SQLAlchemy del repositorio de dispositivos de usuario.
+
+    Características:
+    - Async/await con AsyncSession
+    - Reconstrucción de entidades con DeviceFingerprint desde columnas BD
+    - Queries optimizadas con índices (ix_user_devices_user_id)
+    - Manejo automático de TypeDecorators (UserDeviceId, UserId)
+
+    Diferencia clave vs UserRepository:
+    - DeviceFingerprint NO se mapea con composite() porque:
+      1. Tiene 4 campos (device_name, user_agent, ip_address, fingerprint_hash)
+      2. Contiene lógica de validación (generate_hash()) en constructor
+      3. Se reconstruye manualmente con reconstitute() al leer de BD
+
+    Examples:
+        >>> # Guardar dispositivo nuevo
+        >>> device = UserDevice.create(user_id, fingerprint)
+        >>> await repo.save(device)
+
+        >>> # Buscar dispositivo conocido
+        >>> existing = await repo.find_by_user_and_fingerprint(
+        ...     user_id, fingerprint.fingerprint_hash
+        ... )
+        >>> if existing:
+        ...     existing.update_last_used()
+        ...     await repo.save(existing)
+    """
+
+    def __init__(self, session: AsyncSession):
+        """
+        Inicializa el repositorio con una sesión async de SQLAlchemy.
+
+        Args:
+            session: AsyncSession activa (generalmente desde UoW)
+        """
+        self._session = session
+
+    async def add_unless_registered(self, device: UserDevice) -> UserDevice:
+        """
+        El alta en un SAVEPOINT: si otro inicio de sesión dio de alta el mismo
+        dispositivo entre medias, el índice único lo rechaza, se deshace solo el
+        SAVEPOINT y se devuelve el suyo (BE #692). El resto de la transacción sigue.
+        """
+        # Lo pendiente, antes: un fallo suyo no se confunde con el choque (revisor)
+        await self._session.flush()
+        try:
+            async with self._session.begin_nested():
+                self._session.add(device)
+        except IntegrityError:
+            ya = await self.find_by_user_and_fingerprint(device.user_id, device.fingerprint_hash)
+            if ya is None:
+                raise
+            return ya
+        return device
+
+    async def save(self, device: UserDevice) -> None:
+        """
+        Persiste un dispositivo en la base de datos.
+
+        Maneja tanto INSERT (dispositivo nuevo) como UPDATE (existente).
+        SQLAlchemy detecta automáticamente si el objeto está en la sesión.
+
+        Args:
+            device: UserDevice a persistir
+
+        Note:
+            - El mapper convierte automáticamente DeviceFingerprint → columnas
+        """
+        self._session.add(device)
+
+    async def find_by_id(self, device_id: UserDeviceId) -> UserDevice | None:
+        """
+        Busca un dispositivo por su ID.
+
+        Args:
+            device_id: UserDeviceId del dispositivo
+
+        Returns:
+            Optional[UserDevice]: Dispositivo si existe, None en caso contrario
+
+        Note:
+            - Usa session.get() que es más rápido que query
+            - Aprovecha caché de identidad de SQLAlchemy
+        """
+        return await self._session.get(UserDevice, device_id)
+
+    async def find_by_id_for_update(self, device_id: UserDeviceId) -> UserDevice | None:
+        """SELECT … FOR UPDATE del dispositivo, leyendo la fila actual (F-02)."""
+        return await self._session.get(
+            UserDevice, device_id, with_for_update=True, populate_existing=True
+        )
+
+    async def find_active_by_user_for_update(self, user_id: UserId) -> list[UserDevice]:
+        """SELECT … FOR UPDATE de los dispositivos activos, por id y leyendo la fila actual."""
+        statement = (
+            select(UserDevice)
+            .where(UserDevice._user_id == user_id)
+            .where(UserDevice._is_active == True)  # noqa: E712
+            .order_by(UserDevice._id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_id_and_user(
+        self, device_id: UserDeviceId, user_id: UserId
+    ) -> UserDevice | None:
+        """
+        Busca un dispositivo ACTIVO por ID validando ownership.
+
+        Este query es crítico para cookie-based device identification.
+        Valida que el dispositivo existe, pertenece al usuario, y está activo.
+
+        Args:
+            device_id: UserDeviceId del dispositivo (desde cookie)
+            user_id: UserId del propietario (desde JWT)
+
+        Returns:
+            Optional[UserDevice]: Dispositivo si existe, pertenece al usuario,
+                                 y está activo. None en caso contrario.
+
+        Security:
+            - OWASP A01: Previene horizontal privilege escalation
+            - El device_id viene de cookie httpOnly
+            - El user_id viene de JWT verificado
+
+        Note:
+            - NO retorna dispositivos revocados (is_active=False)
+            - La validación de ownership es crucial para seguridad
+        """
+        statement = (
+            select(UserDevice)
+            .where(UserDevice._id == device_id)
+            .where(UserDevice._user_id == user_id)
+            .where(UserDevice._is_active == True)  # noqa: E712
+        )
+        result = await self._session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def find_active_ids_of_user(
+        self, device_ids: list[UserDeviceId], user_id: UserId
+    ) -> list[UserDeviceId]:
+        """De estos ids, los de dispositivos activos de este usuario, en una consulta."""
+        if not device_ids:
+            return []
+        columnas = user_devices_table.c
+        statement = (
+            select(columnas.id)
+            .where(columnas.id.in_(device_ids))
+            .where(columnas.user_id == user_id)
+            .where(columnas.is_active.is_(True))
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_by_user_and_fingerprint(
+        self, user_id: UserId, fingerprint_hash: str
+    ) -> UserDevice | None:
+        """
+        Busca un dispositivo ACTIVO por usuario y hash de fingerprint.
+
+        Este es el query crítico para detectar dispositivos conocidos.
+        Usa el índice único parcial ix_user_devices_unique_active_fingerprint.
+
+        Args:
+            user_id: UserId del propietario
+            fingerprint_hash: Hash SHA256 del DeviceFingerprint
+
+        Returns:
+            Optional[UserDevice]: Dispositivo activo si existe, None en caso contrario
+
+        Note:
+            - Solo busca dispositivos con is_active=True
+            - Aprovecha índice único parcial para búsqueda rápida
+            - Usa atributos privados (_user_id, _fingerprint_hash) del mapper
+        """
+        statement = (
+            select(UserDevice)
+            .where(UserDevice._user_id == user_id)
+            .where(UserDevice._fingerprint_hash == fingerprint_hash)
+            .where(UserDevice._is_active == True)  # noqa: E712
+        )
+        result = await self._session.execute(statement)
+        return result.scalar_one_or_none()
+
+    async def find_active_by_user(self, user_id: UserId) -> list[UserDevice]:
+        """
+        Lista todos los dispositivos ACTIVOS de un usuario.
+
+        Retorna dispositivos ordenados por last_used_at descendente
+        (más recientes primero).
+
+        Args:
+            user_id: UserId del propietario
+
+        Returns:
+            List[UserDevice]: Lista de dispositivos activos (vacía si no hay)
+
+        Note:
+            - Usa índice ix_user_devices_user_id para búsqueda rápida
+            - Solo dispositivos con is_active=True
+            - Order by last_used_at DESC para mejor UX
+        """
+        statement = (
+            select(UserDevice)
+            .where(UserDevice._user_id == user_id)
+            .where(UserDevice._is_active == True)  # noqa: E712
+            .order_by(UserDevice._last_used_at.desc())
+        )
+        result = await self._session.execute(statement)
+        return list(result.scalars().all())
+
+    async def find_last_login_map(self, user_ids: list[UserId]) -> dict[str, datetime]:
+        """
+        Agrega MAX(last_used_at) por usuario entre todos sus dispositivos.
+
+        No filtra por is_active: un dispositivo revocado sigue reflejando
+        una conexión real pasada.
+
+        Args:
+            user_ids: IDs de usuario a consultar
+
+        Returns:
+            dict[str, datetime]: user_id (str) -> última conexión. Usuarios sin
+            dispositivos no aparecen en el dict.
+        """
+        if not user_ids:
+            return {}
+
+        statement = (
+            select(UserDevice._user_id, func.max(UserDevice._last_used_at))  # type: ignore[call-overload]
+            .where(UserDevice._user_id.in_(user_ids))
+            .group_by(UserDevice._user_id)
+        )
+        result = await self._session.execute(statement)
+        return {str(user_id): last_used_at for user_id, last_used_at in result.all()}
+
+    async def revoke(self, device_id: UserDeviceId) -> None:
+        """
+        Revoca un dispositivo (marca como inactivo).
+
+        Implementación eficiente: busca dispositivo y llama a device.revoke()
+        en lugar de UPDATE directo en BD (mantiene lógica en Domain Layer).
+
+        Args:
+            device_id: UserDeviceId del dispositivo a revocar
+
+        Raises:
+            ValueError: Si el dispositivo no existe
+            RuntimeError: Si el dispositivo ya estaba revocado
+
+        Note:
+            - NO hace commit (responsabilidad del UoW)
+            - El save() se hace implícitamente al estar en la sesión
+        """
+        device = await self.find_by_id(device_id)
+        if not device:
+            raise ValueError(f"Device {device_id} not found")
+
+        device.revoke()
+        # No necesitamos save() explícito: el objeto ya está en la sesión
+        # y SQLAlchemy detectará los cambios al commit
+
+    async def delete_unused_since(self, antes: datetime) -> int:
+        """Borra los dispositivos sin usar desde antes de `antes`; sus tokens caen en cascada."""
+        result = await self._session.execute(
+            delete(user_devices_table).where(user_devices_table.c.last_used_at < antes)
+        )
+        await self._session.flush()
+        return filas_afectadas(result) or 0

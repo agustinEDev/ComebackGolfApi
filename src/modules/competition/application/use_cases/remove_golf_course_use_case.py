@@ -1,0 +1,134 @@
+"""
+Caso de Uso: Eliminar Campo de Golf de Competicion.
+
+Permite desasociar un campo de golf de una competicion en estado DRAFT.
+Solo el creador puede realizar esta accion.
+"""
+
+from src.modules.competition.application.dto.competition_dto import (
+    RemoveGolfCourseRequestDTO,
+    RemoveGolfCourseResponseDTO,
+)
+from src.modules.competition.application.exceptions import (
+    CompetitionNotDraftError,
+    CompetitionNotFoundError,
+    GolfCourseHasRoundsError,
+    NotCompetitionCreatorError,
+)
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.shared.domain.services.instante_utc import ahora_en_utc
+
+
+class GolfCourseNotAssignedError(Exception):
+    """Excepcion lanzada cuando el campo de golf no esta asociado a la competicion."""
+
+    pass
+
+
+class RemoveGolfCourseFromCompetitionUseCase:
+    """
+    Caso de uso para eliminar un campo de golf de una competicion.
+
+    Restricciones:
+    - La competicion debe estar en estado DRAFT
+    - Solo el creador puede eliminar campos
+    - El campo debe estar actualmente asociado a la competicion
+
+    Orquesta:
+    1. Buscar la competicion por ID
+    2. Verificar que el usuario sea el creador
+    3. Verificar que este en estado DRAFT
+    4. Eliminar el campo de la competicion (validacion de existencia en el dominio)
+    5. Guardar la competicion actualizada
+    6. Commit de la transaccion
+    """
+
+    def __init__(self, uow: CompetitionUnitOfWorkInterface):
+        """
+        Constructor.
+
+        Args:
+            uow: Unit of Work para gestionar transacciones de Competition
+        """
+        self._uow = uow
+
+    async def execute(
+        self, request: RemoveGolfCourseRequestDTO, user_id: UserId, is_admin: bool = False
+    ) -> RemoveGolfCourseResponseDTO:
+        """
+        Ejecuta el caso de uso de eliminar campo de golf de competicion.
+
+        Args:
+            request: DTO con competition_id y golf_course_id
+            user_id: ID del usuario que solicita la operacion
+
+        Returns:
+            DTO con confirmacion de eliminacion
+
+        Raises:
+            CompetitionNotFoundError: Si la competicion no existe
+            NotCompetitionCreatorError: Si el usuario no es el creador
+            CompetitionNotDraftError: Si las inscripciones ya no estan abiertas
+            GolfCourseNotAssignedError: Si el campo no esta asociado a la competicion
+        """
+        async with self._uow:
+            # 1. Buscar la competicion, con bloqueo: un cambio de barras en ese campo
+            #    a la vez (barras por campo) espera, y no deja filas de un campo que
+            #    ya no es de la competición
+            competition_id = CompetitionId(request.competition_id)
+            competition = await self._uow.competitions.find_by_id_for_update(competition_id)
+
+            if not competition:
+                raise CompetitionNotFoundError(
+                    f"No existe competición con ID {request.competition_id}"
+                )
+
+            # 2. Verificar que el usuario sea el creador
+            if not is_admin and not competition.is_creator(user_id):
+                raise NotCompetitionCreatorError(
+                    "Solo el creador puede eliminar campos de golf de la competicion"
+                )
+
+            # 3. Verificar que este en estado DRAFT
+            if not competition.allows_modifications():
+                raise CompetitionNotDraftError(
+                    f"Solo se pueden eliminar campos mientras las inscripciones están "
+                    f"abiertas. Estado actual: {competition.status.value}"
+                )
+
+            # 4. Un campo con rondas programadas no se puede quitar: la ronda se
+            # quedaria sin donde jugarse. Antes no hacia falta mirarlo —no habia
+            # rondas hasta cerrar inscripciones, y entonces los campos ya no se
+            # tocaban—, pero ahora las dos cosas conviven (BE #323)
+            golf_course_id = GolfCourseId(request.golf_course_id)
+            rondas = await self._uow.rounds.find_by_competition(competition_id)
+            if any(r.golf_course_id == golf_course_id for r in rondas):
+                raise GolfCourseHasRoundsError(
+                    f"El campo {request.golf_course_id} tiene rondas programadas "
+                    f"en esta competición."
+                )
+
+            # 5. Eliminar el campo de la competicion (validacion en dominio)
+            try:
+                competition.remove_golf_course(golf_course_id)
+            except ValueError as e:
+                # El campo no esta asociado
+                raise GolfCourseNotAssignedError(str(e)) from e
+
+            # 5. Guardar la competicion actualizada
+            await self._uow.competitions.update(competition)
+            # Y sin los cambios de barras de ese campo (barras por campo, 20 nov
+            # 2026): quitarlo no borra el campo, así que no se van solos
+            await self._uow.barras_por_campo.borrar_del_campo(competition.id, golf_course_id)
+
+        # 6. Construir respuesta
+        return RemoveGolfCourseResponseDTO(
+            competition_id=request.competition_id,
+            golf_course_id=request.golf_course_id,
+            removed_at=ahora_en_utc(),
+        )

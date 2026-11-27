@@ -1,0 +1,107 @@
+"""Caso de Uso: Conceder un partido."""
+
+from typing import Any
+
+from src.modules.competition.application.exceptions import (
+    CompetitionNotFoundError,
+    MatchNotFoundError,
+    MatchNotScoringError,
+    NotMatchPlayerError,
+    RoundNotFoundError,
+)
+from src.modules.competition.application.ports.competition_activity_publisher_interface import (
+    CompetitionActivityPublisherInterface,
+)
+from src.modules.competition.application.services.avisos_de_actividad import AvisosDeActividad
+from src.modules.competition.application.services.competicion_en_juego import (
+    exigir_competicion_en_juego,
+    partido_no_anotable,
+)
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.services.scoring_service import ScoringService
+from src.modules.competition.domain.value_objects.match_id import MatchId
+from src.modules.competition.domain.value_objects.round_status import RoundStatus
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class ConcedeMatchUseCase:
+    """Concede un partido a favor del equipo contrario."""
+
+    def __init__(
+        self,
+        uow: CompetitionUnitOfWorkInterface,
+        scoring_service: ScoringService,
+        actividad: CompetitionActivityPublisherInterface | None = None,
+    ):
+        self._uow = uow
+        self._scoring_service = scoring_service
+        # Los avisos de Actividad (BE-2); sin el, no se avisa
+        self._actividad = AvisosDeActividad(actividad)
+
+    async def execute(
+        self,
+        match_id_str: str,
+        user_id: UserId,
+        conceding_team: str,
+        reason: str | None = None,
+        is_admin: bool = False,
+    ) -> dict[str, Any]:
+        async with self._uow:
+            match_id = MatchId(match_id_str)
+            # Bloqueada: la regla del retirado se mira con lo de ahora, no con una
+            # retirada que llega a la vez (code-review)
+            match = await self._uow.matches.find_by_id_for_update(match_id)
+            if not match:
+                raise MatchNotFoundError(f"No existe partido con ID {match_id_str}")
+
+            if not match.status.can_record_scores():
+                raise MatchNotScoringError(
+                    f"Partido no esta en estado para conceder. Estado: {match.status.value}"
+                )
+
+            round_entity = await self._uow.rounds.find_by_id(match.round_id)
+            if not round_entity:
+                raise RoundNotFoundError("La ronda asociada no existe")
+
+            competition = await self._uow.competitions.find_by_id(round_entity.competition_id)
+            if not competition:
+                raise CompetitionNotFoundError("La competicion asociada no existe")
+
+            # Auth: player can only concede own team; creator and admin can concede any
+            player_team = match.get_player_team(user_id)
+            is_creator = is_admin or competition.is_creator(user_id)
+
+            if player_team is None and not is_creator:
+                raise NotMatchPlayerError(
+                    "No eres jugador de este partido ni creador de la competicion"
+                )
+
+            if player_team is not None and not is_creator and player_team != conceding_team:
+                raise NotMatchPlayerError("Solo puedes conceder tu propio equipo")
+            # Retirado del fourball, ya no decide por el bando: concede su pareja
+            # (Agustín, 25 oct 2026)
+            if not is_creator and user_id in match.withdrawn_player_ids:
+                raise NotMatchPlayerError("Estás retirado de este partido: concede tu pareja")
+            # Con la competición terminada, cancelada o reabierta no se decide nada (SB-03)
+            exigir_competicion_en_juego(competition, partido_no_anotable)
+
+            match.concede(conceding_team, reason)
+            await self._uow.matches.update(match)
+
+            # Auto-complete round
+            all_matches = await self._uow.matches.find_by_round(match.round_id)
+            all_finished = all(m.is_finished() for m in all_matches)
+            if all_finished and round_entity.status == RoundStatus.IN_PROGRESS:
+                round_entity.complete()
+                await self._uow.rounds.update(round_entity)
+
+        # Concedido y guardado: a cada jugador, su resultado en Actividad (BE-2)
+        await self._actividad.match_finished(competition, round_entity, match)
+
+        return {
+            "match_id": str(match.id),
+            "new_status": match.status.value,
+            "result": match.result,
+        }

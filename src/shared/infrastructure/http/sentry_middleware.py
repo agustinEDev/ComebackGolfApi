@@ -1,0 +1,136 @@
+"""
+Sentry User Context Middleware
+
+Middleware para capturar contexto de usuario en eventos de Sentry.
+
+Funcionalidad:
+- Extrae el JWT de la cookie httpOnly de acceso (desde la 2.58.0, solo de ahí)
+- Decodifica el token para obtener el user_id
+- Establece contexto de usuario en Sentry (sentry_sdk.set_user)
+- Silencioso: Si falla la decodificación, continúa sin usuario (request anónimo)
+
+Contexto capturado:
+- id: UUID del usuario. Solo el id: ni email ni IP salen hacia Sentry (ADR-041)
+
+Beneficios:
+- Errores en Sentry muestran qué usuario fue afectado
+- Facilita debugging y soporte al usuario
+- Permite identificar patrones de errores por usuario
+
+Excepción: en las rutas de las muestras anónimas de hoyo (BE #532, 16 oct 2026)
+no se pone usuario, para que ni los errores ni las trazas digan quién mandó una
+muestra.
+
+OWASP Coverage:
+- A09: Logging & Monitoring (contexto completo en eventos)
+"""
+
+import logging
+import re
+
+import jwt
+import sentry_sdk
+from fastapi import Request
+from jwt.exceptions import InvalidTokenError
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from src.config.settings import settings
+from src.shared.infrastructure.security.cookie_handler import read_access_token
+
+logger = logging.getLogger(__name__)
+
+# POST /golf-courses/{id}/hole-map/samples/{hole}, GET .../samples y POST
+# .../reports/{hole} (entrega 7), con o sin barra final, que FastAPI redirige
+_ANONYMOUS_PATH = re.compile(
+    r"^/api/v1/golf-courses/[^/]+/hole-map/(samples(/[^/]*)?|reports/[^/]+)/?$"
+)
+
+
+def is_anonymous_path(path: str) -> bool:
+    """Las rutas en las que Sentry no debe saber quién hace la petición."""
+    return _ANONYMOUS_PATH.match(path) is not None
+
+
+class SentryUserContextMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware para añadir contexto de usuario a eventos de Sentry.
+
+    Extrae información del token JWT (si existe) y la registra en Sentry.
+    Si no hay token o es inválido, el request se procesa como anónimo.
+    """
+
+    def _extract_token_from_request(self, request: Request) -> str | None:
+        """
+        Extrae el token JWT del request.
+
+        Solo la cookie httpOnly "access_token" (2.58.0: el Bearer ya no cuenta).
+
+        Args:
+            request: Request de FastAPI
+
+        Returns:
+            Token JWT o None si no se encuentra
+        """
+        # La misma regla que get_current_user: solo la cookie
+        return read_access_token(request)
+
+    def _decode_token(self, token: str) -> dict | None:
+        """
+        Decodifica el token JWT para extraer el payload.
+
+        Args:
+            token: Token JWT
+
+        Returns:
+            Payload del token o None si falla la decodificación
+        """
+        try:
+            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+            # Solo un token de acceso da usuario, como en `verify_access_token` (SB-04):
+            # un refresh o cualquier otro JWT de la API no atribuye errores a nadie
+            return payload if payload.get("type") == "access" else None
+        except InvalidTokenError as e:
+            logger.debug(f"Failed to decode JWT token for Sentry context: {e}")
+            return None
+
+    async def dispatch(self, request: Request, call_next):
+        """
+        Procesa el request y añade contexto de usuario a Sentry.
+
+        Args:
+            request: Request de FastAPI
+            call_next: Siguiente middleware/handler en la cadena
+
+        Returns:
+            Response del handler
+        """
+        # Extraer token JWT del request (no en las rutas anónimas: ni se mira)
+        token = (
+            None
+            if is_anonymous_path(request.url.path)
+            else self._extract_token_from_request(request)
+        )
+
+        if token:
+            # Decodificar token para obtener user_id y email
+            payload = self._decode_token(token)
+
+            if payload:
+                # Establecer contexto de usuario en Sentry
+                # Solo el id: ni email ni IP salen hacia Sentry (ADR-041),
+                # igual que en el front desde el 25 oct 2026
+                sentry_sdk.set_user({"id": payload.get("sub")})
+            else:
+                # Token inválido o expirado -> request anónimo
+                sentry_sdk.set_user(None)
+        else:
+            # Sin token -> request anónimo
+            sentry_sdk.set_user(None)
+
+        # Procesar el request
+        response = await call_next(request)
+
+        # Limpiar contexto de usuario para el siguiente request
+        sentry_sdk.set_user(None)
+
+        return response

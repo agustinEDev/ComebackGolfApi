@@ -1,0 +1,668 @@
+import logging
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
+
+from src.config.dependencies import (
+    get_accept_terms_use_case,
+    get_cancel_email_change_use_case,
+    get_competition_uow,
+    get_confirm_email_change_use_case,
+    get_current_user,
+    get_find_user_use_case,
+    get_get_player_stats_use_case,
+    get_get_recent_matches_use_case,
+    get_search_users_use_case,
+    get_update_profile_use_case,
+    get_update_security_use_case,
+)
+from src.config.rate_limit import (
+    NEW_EMAIL_REQUESTS_LIMIT,
+    USER_SEARCH_BY_EMAIL_LIMIT,
+    cabe,
+    clave_de_usuario,
+)
+from src.config.settings import settings
+from src.config.terms_guard import TERMS_EXEMPT_ROUTES
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.competition.domain.value_objects.competition_id import CompetitionId
+from src.modules.golf_course.domain.value_objects.golf_course_id import GolfCourseId
+from src.modules.user.application.dto.player_stats_dto import (
+    PlayerStatsResponseDTO,
+    RecentMatchesResponseDTO,
+    ScoringBreakdownResponseDTO,
+)
+from src.modules.user.application.dto.user_dto import (
+    AcceptTermsRequestDTO,
+    FindUserRequestDTO,
+    FindUserResponseDTO,
+    SearchUsersRequestDTO,
+    SearchUsersResponseDTO,
+    UpdateProfileRequestDTO,
+    UpdateProfileResponseDTO,
+    UpdateSecurityRequestDTO,
+    UpdateSecurityResponseDTO,
+    UserResponseDTO,
+    UserRolesResponseDTO,
+)
+from src.modules.user.application.use_cases.accept_terms_use_case import AcceptTermsUseCase
+from src.modules.user.application.use_cases.cancel_email_change_use_case import (
+    CancelEmailChangeUseCase,
+)
+from src.modules.user.application.use_cases.confirm_email_change_use_case import (
+    ConfirmEmailChangeUseCase,
+)
+from src.modules.user.application.use_cases.find_user_use_case import FindUserUseCase
+from src.modules.user.application.use_cases.get_player_stats_use_case import (
+    GetPlayerStatsUseCase,
+)
+from src.modules.user.application.use_cases.get_recent_matches_use_case import (
+    GetRecentMatchesUseCase,
+)
+from src.modules.user.application.use_cases.search_users_use_case import SearchUsersUseCase
+from src.modules.user.application.use_cases.update_profile_use_case import (
+    UpdateProfileUseCase,
+)
+from src.modules.user.application.use_cases.update_security_use_case import (
+    UpdateSecurityUseCase,
+)
+from src.modules.user.domain.errors.user_errors import (
+    DuplicateEmailError,
+    InvalidCredentialsError,
+)
+from src.modules.user.domain.exceptions import (
+    EmailChangeEmailInUseError,
+    EmailChangeExpiredError,
+    EmailChangeInvalidError,
+)
+from src.modules.user.domain.value_objects.password import InvalidPasswordError
+from src.modules.user.domain.value_objects.user_id import UserId
+from src.modules.user.infrastructure.api.authorization import (
+    is_admin,
+    is_creator_of,
+    is_player_in,
+)
+from src.modules.user.infrastructure.api.v1.codigos_de_cuenta import (
+    CURRENT_PASSWORD_INCORRECT,
+    EMAIL_ALREADY_IN_USE,
+    TEXTOS as TEXTOS_DE_CUENTA,
+)
+from src.modules.user.infrastructure.api.v1.limite_de_seguridad import (
+    DEMASIADOS_CAMBIOS,
+    DEMASIADOS_CORREOS_NUEVOS,
+    cabe_otro_cambio,
+    demasiados,
+)
+from src.modules.user.infrastructure.api.v1.password_errors import coded_bad_request
+from src.shared.infrastructure.api.respuesta_con_codigo import respuesta_con_codigo
+from src.shared.infrastructure.http.http_context_validator import (
+    get_trusted_client_ip,
+    get_user_agent,
+)
+from src.shared.infrastructure.security.cookie_handler import (
+    set_auth_cookie,
+    set_csrf_cookie,
+    set_refresh_token_cookie,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Se genera desde TERMS_EXEMPT_ROUTES para que la documentación no se desactualice
+_ACCEPT_TERMS_DESCRIPTION = (
+    "Guarda que el usuario autenticado acepta la versión vigente de los Términos, "
+    "con la fecha, y deja la aceptación en el historial (IP y navegador). "
+    "Idempotente: si ya la tenía aceptada no cambia nada, tampoco la fecha. "
+    "Devuelve el usuario como current-user. Sin aceptarla, toda ruta con sesión "
+    "responde 403 con error_code TERMS_NOT_ACCEPTED, salvo estas: "
+    + ", ".join(f"{method} {path}" for method, path in sorted(TERMS_EXEMPT_ROUTES))
+    + "."
+)
+
+
+# ============================================================================
+# HELPER FUNCTIONS - Removed (v1.13.1)
+# ============================================================================
+# NOTA: get_client_ip() y get_user_agent() movidas a helper centralizado
+# src/shared/infrastructure/http/http_context_validator.py
+# Ahora se usa get_trusted_client_ip() para prevenir IP spoofing
+# ============================================================================
+
+
+@router.get(
+    "/search-autocomplete",
+    response_model=SearchUsersResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Autocompletar busqueda de usuarios",
+    description="Busca usuarios por nombre o alias parcial para autocompletado.",
+    tags=["Users"],
+)
+async def search_users_autocomplete(
+    query: str = Query(..., min_length=2, max_length=100, description="Texto de busqueda parcial"),
+    use_case: SearchUsersUseCase = Depends(get_search_users_use_case),
+    current_user: UserResponseDTO = Depends(get_current_user),
+):
+    """
+    Endpoint de autocompletado para buscar usuarios por nombre parcial.
+    Devuelve hasta 10 resultados que coincidan parcialmente con el nombre, el
+    apellido o el alias. Cada resultado lleva el alias junto al nombre real:
+    es lo que permite distinguir a dos jugadores parecidos. Quien busca no
+    sale en sus propios resultados (FE #938).
+    """
+    return await use_case.execute(
+        SearchUsersRequestDTO(query=query, viewer_id=str(current_user.id))
+    )
+
+
+DEMASIADAS_BUSQUEDAS = "TOO_MANY_USER_SEARCHES"
+# Sin el límite ni la ventana: no es asunto de quien llama
+_TEXTOS_DE_LA_BUSQUEDA = {
+    DEMASIADAS_BUSQUEDAS: "Has hecho demasiadas búsquedas por correo. Inténtalo más tarde.",
+}
+
+
+@router.get(
+    "/search",
+    response_model=FindUserResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Buscar usuario",
+    description=(
+        "Busca un usuario por email o nombre completo y devuelve su ID y datos básicos. "
+        "Una cuenta desactivada responde como un correo que no existe. Por correo, 20 "
+        "búsquedas por hora y usuario (429 con `error_code` TOO_MANY_USER_SEARCHES)."
+    ),
+    responses={
+        404: {"description": "No hay ninguna cuenta activa con ese correo o nombre."},
+        429: {"description": "`error_code` TOO_MANY_USER_SEARCHES: demasiadas por correo."},
+    },
+    tags=["Users"],
+)
+async def find_user(
+    email: str | None = Query(None, description="Email del usuario a buscar"),
+    full_name: str | None = Query(None, description="Nombre completo del usuario a buscar"),
+    use_case: FindUserUseCase = Depends(get_find_user_use_case),
+    current_user: UserResponseDTO = Depends(get_current_user),
+):
+    """
+    Endpoint para buscar un usuario por email o nombre completo.
+
+    Permite encontrar usuarios utilizando:
+    - Email: Búsqueda exacta por dirección de correo electrónico
+    - Nombre completo: Búsqueda por nombre y apellidos
+
+    Al menos uno de los dos parámetros debe ser proporcionado.
+
+    El correo del encontrado solo vuelve si se buscó por ese mismo correo o es
+    uno mismo; vacío en otro caso (BE #531).
+    """
+    # Por correo, cada búsqueda cuenta antes de buscar, encuentre o no (F-01b): 20 por
+    # hora y usuario. Por nombre no gasta este cupo
+    if email and not cabe(
+        USER_SEARCH_BY_EMAIL_LIMIT, "user-search-by-email", clave_de_usuario(str(current_user.id))
+    ):
+        return respuesta_con_codigo(
+            status.HTTP_429_TOO_MANY_REQUESTS, _TEXTOS_DE_LA_BUSQUEDA, DEMASIADAS_BUSQUEDAS
+        )
+
+    try:
+        # Validar que al menos un parámetro sea proporcionado
+        if not email and not full_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debe proporcionar al menos 'email' o 'full_name' para la búsqueda.",
+            )
+
+        # Crear el DTO de request
+        request = FindUserRequestDTO(email=email, full_name=full_name)
+
+        # Ejecutar el caso de uso
+        return await use_case.execute(request, viewer_id=UserId(str(current_user.id)))
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+EMAIL_CHANGE_INVALID = "EMAIL_CHANGE_INVALID"
+EMAIL_CHANGE_EXPIRED = "EMAIL_CHANGE_EXPIRED"
+_TEXTOS_DEL_CAMBIO_DE_CORREO = {
+    EMAIL_CHANGE_INVALID: "This confirmation link is not valid for your account.",
+    EMAIL_CHANGE_EXPIRED: "This confirmation link has expired. Ask for the change again.",
+    EMAIL_ALREADY_IN_USE: TEXTOS_DE_CUENTA[EMAIL_ALREADY_IN_USE],
+}
+
+
+class ConfirmEmailChangeRequestDTO(BaseModel):
+    """El token del enlace que llegó al correo nuevo."""
+
+    token: str = Field(..., min_length=1, max_length=255)
+
+
+@router.post(
+    "/me/email-change/confirm",
+    response_model=UserResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Confirmar el correo nuevo pendiente",
+    description=(
+        "Confirma, con la sesión de la cuenta, el correo nuevo pendiente con el token de "
+        "su enlace (24 h). 400 EMAIL_CHANGE_INVALID o EMAIL_CHANGE_EXPIRED; 409 "
+        "EMAIL_ALREADY_IN_USE si otra cuenta lo tiene ya (el cambio se anula)."
+    ),
+    tags=["Users"],
+)
+async def confirm_email_change(
+    request: Request,
+    datos: ConfirmEmailChangeRequestDTO,
+    use_case: ConfirmEmailChangeUseCase = Depends(get_confirm_email_change_use_case),
+    anula: CancelEmailChangeUseCase = Depends(get_cancel_email_change_use_case),
+    current_user: UserResponseDTO = Depends(get_current_user),
+):
+    """Confirma el cambio de correo de la cuenta con sesión (#749)."""
+    try:
+        return await use_case.execute(
+            str(current_user.id),
+            datos.token,
+            ip_address=get_trusted_client_ip(
+                request, settings.TRUSTED_PROXIES, settings.TRUST_CLOUDFLARE_HEADERS
+            ),
+            user_agent=get_user_agent(request),
+        )
+    except EmailChangeExpiredError:
+        codigo, estado = EMAIL_CHANGE_EXPIRED, status.HTTP_400_BAD_REQUEST
+    except EmailChangeEmailInUseError:
+        codigo, estado = EMAIL_ALREADY_IN_USE, status.HTTP_409_CONFLICT
+    except EmailChangeInvalidError:
+        codigo, estado = EMAIL_CHANGE_INVALID, status.HTTP_400_BAD_REQUEST
+    except IntegrityError:
+        # Otra cuenta lo ocupó entre la comprobación y el guardado (la restricción
+        # única de users.email): como el otro 409, el cambio queda anulado
+        await anula.execute(str(current_user.id), token=datos.token)
+        codigo, estado = EMAIL_ALREADY_IN_USE, status.HTTP_409_CONFLICT
+    return respuesta_con_codigo(estado, _TEXTOS_DEL_CAMBIO_DE_CORREO, codigo)
+
+
+@router.delete(
+    "/me/email-change",
+    response_model=UserResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Anular el correo nuevo pendiente",
+    description="Anula el cambio de correo pendiente: su enlace deja de valer (#749).",
+    tags=["Users"],
+)
+async def cancel_email_change(
+    use_case: CancelEmailChangeUseCase = Depends(get_cancel_email_change_use_case),
+    current_user: UserResponseDTO = Depends(get_current_user),
+):
+    """Anula el cambio de correo pendiente de la cuenta con sesión."""
+    return await use_case.execute(str(current_user.id))
+
+
+@router.post(
+    "/me/accept-terms",
+    response_model=UserResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Aceptar los Términos de uso vigentes",
+    description=_ACCEPT_TERMS_DESCRIPTION,
+    tags=["Users"],
+)
+async def accept_terms(
+    request: Request,
+    use_case: AcceptTermsUseCase = Depends(get_accept_terms_use_case),
+    current_user: UserResponseDTO = Depends(get_current_user),
+):
+    """Acepta los Términos vigentes en nombre del usuario autenticado."""
+    # La IP y el navegador van al historial de aceptaciones: los mismos
+    # helpers que el login y el logout (IP de confianza tras el proxy, ADR-038)
+    accept_request = AcceptTermsRequestDTO(
+        user_id=str(current_user.id),
+        current_user=current_user,
+        ip_address=get_trusted_client_ip(
+            request, settings.TRUSTED_PROXIES, settings.TRUST_CLOUDFLARE_HEADERS
+        ),
+        user_agent=get_user_agent(request),
+    )
+    return await use_case.execute(accept_request)
+
+
+@router.patch(
+    "/profile",
+    response_model=UpdateProfileResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Actualizar perfil del usuario",
+    description=(
+        "Actualiza la información personal del usuario autenticado: nombre, apellidos, "
+        "país, género y/o alias. Devuelve 409 si el alias pedido ya lo tiene otra persona."
+    ),
+    tags=["Users"],
+    responses={
+        status.HTTP_409_CONFLICT: {"description": "El alias ya está en uso por otro usuario."},
+    },
+)
+async def update_profile(
+    request: UpdateProfileRequestDTO,
+    use_case: UpdateProfileUseCase = Depends(get_update_profile_use_case),
+    current_user: UserResponseDTO = Depends(get_current_user),
+):
+    """
+    Endpoint para actualizar información personal del usuario.
+
+    Permite al usuario autenticado actualizar:
+    - Nombre (first_name)
+    - Apellidos (last_name)
+    - Código de país (country_code) - ISO 3166-1 alpha-2
+    - Género (gender)
+    - Alias (alias) - apodo público, único entre todos los usuarios
+
+    Al menos uno de los campos debe ser proporcionado.
+    Enviar `alias` como cadena vacía lo borra y devuelve al usuario a su nombre real.
+    NO requiere contraseña actual (solo autenticación JWT).
+    """
+    try:
+        # Ejecutar el caso de uso con el user_id del token JWT
+        user_id = str(current_user.id)
+        response = await use_case.execute(user_id, request)
+        return response
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+def _fuera_del_limite_de_seguridad(user_id: str, pide_correo: bool) -> str | None:
+    """El código del límite que se pasa, o None. El del correo solo cuenta si lo pide."""
+    if not cabe_otro_cambio(user_id):
+        return DEMASIADOS_CAMBIOS
+    if pide_correo and not cabe(
+        NEW_EMAIL_REQUESTS_LIMIT, "new-email-requests", clave_de_usuario(user_id)
+    ):
+        return DEMASIADOS_CORREOS_NUEVOS
+    return None
+
+
+@router.patch(
+    "/security",
+    response_model=UpdateSecurityResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Actualizar datos de seguridad",
+    description=(
+        "Actualiza la contraseña y/o pide un correo nuevo, que queda pendiente hasta "
+        "confirmarlo desde su dirección (ADR-045). Requiere la contraseña actual. "
+        "Límite por usuario: 10 por hora, y 3 por hora pidiendo un correo nuevo (429 con "
+        "`error_code` TOO_MANY_SECURITY_CHANGES o TOO_MANY_EMAIL_CHANGE_REQUESTS)."
+    ),
+    responses={
+        400: {
+            "description": "La contraseña nueva no cumple la política (con `error_code`) "
+            "o los datos no valen."
+        },
+        401: {
+            "description": "`error_code` CURRENT_PASSWORD_INCORRECT: la contraseña actual "
+            "no es. Sin código: la sesión no es válida."
+        },
+        403: {
+            "description": "`error_code` TERMS_NOT_ACCEPTED: faltan los Términos vigentes "
+            "(o falla el CSRF)."
+        },
+        404: {"description": "El usuario ya no existe."},
+        409: {"description": "`error_code` EMAIL_ALREADY_IN_USE: otra cuenta ya usa ese correo."},
+        429: {"description": "Demasiadas peticiones; `error_code` dice cuál."},
+    },
+    tags=["Users"],
+)
+async def update_security(
+    http_request: Request,
+    request: UpdateSecurityRequestDTO,
+    response: Response,
+    use_case: UpdateSecurityUseCase = Depends(get_update_security_use_case),
+    current_user: UserResponseDTO = Depends(get_current_user),
+):
+    """
+    Endpoint para actualizar datos de seguridad del usuario.
+
+    Permite al usuario autenticado actualizar:
+    - Email (new_email)
+    - Password (new_password + confirm_password)
+
+    REQUIERE:
+    - current_password: Contraseña actual para verificación
+    - Al menos uno de: new_email o new_password
+
+    Si se cambia password, se debe proporcionar confirm_password.
+
+    Security Logging (v1.8.0):
+    - Registra cambios de contraseña (severity HIGH)
+    - Registra cambios de email (severity HIGH)
+    - Revoca refresh tokens si cambia contraseña
+    """
+    # Antes de mirar la contraseña: cada petición cuenta, salga bien o mal (BE #753)
+    fuera = _fuera_del_limite_de_seguridad(str(current_user.id), bool(request.new_email))
+    if fuera:
+        return demasiados(fuera)
+
+    try:
+        # Security Logging (v1.8.0): Extraer contexto HTTP para audit trail
+        # SEGURIDAD: Usa get_trusted_client_ip() para prevenir IP spoofing
+        request.ip_address = get_trusted_client_ip(
+            http_request, settings.TRUSTED_PROXIES, settings.TRUST_CLOUDFLARE_HEADERS
+        )
+        request.user_agent = get_user_agent(http_request)
+
+        # El dispositivo del token, ya comprobado; nunca el que mande el cliente (B-05)
+        request.dispositivo_actual = getattr(http_request.state, "dispositivo_actual", None)
+
+        # Ejecutar el caso de uso con el user_id del token JWT
+        user_id = str(current_user.id)
+        resultado = await use_case.execute(user_id, request)
+        # Con la contraseña cambiada, la sesión nueva de este dispositivo, en cookies:
+        # sigue dentro y las de antes ya no valen (B-05)
+        if resultado.sesion_nueva is not None:
+            set_auth_cookie(response, resultado.sesion_nueva.access_token)
+            set_refresh_token_cookie(response, resultado.sesion_nueva.refresh_token)
+            set_csrf_cookie(response, resultado.sesion_nueva.csrf_token)
+        return resultado
+
+    except InvalidCredentialsError:
+        # Con su código, para que la app lo diga en su idioma
+        return respuesta_con_codigo(
+            status.HTTP_401_UNAUTHORIZED, TEXTOS_DE_CUENTA, CURRENT_PASSWORD_INCORRECT
+        )
+    except DuplicateEmailError:
+        return respuesta_con_codigo(
+            status.HTTP_409_CONFLICT, TEXTOS_DE_CUENTA, EMAIL_ALREADY_IN_USE
+        )
+    except InvalidPasswordError as e:
+        # Con el código de la regla, para traducirlo (BE #519)
+        return coded_bad_request(e)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/me/roles/{competition_id}",
+    response_model=UserRolesResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Consultar roles del usuario en una competición",
+    description="Retorna los roles del usuario actual en una competición específica (admin, creator, player).",
+    tags=["Users"],
+)
+async def get_my_roles_in_competition(
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    uow: CompetitionUnitOfWorkInterface = Depends(get_competition_uow),
+):
+    """
+    Endpoint para consultar los roles del usuario actual en una competición.
+
+    **Roles retornados:**
+    - `is_admin`: Usuario es administrador del sistema (rol global)
+    - `is_creator`: Usuario creó esta competición (rol contextual)
+    - `is_player`: Usuario está enrollado con status APPROVED (rol contextual)
+
+    **Casos de uso (Frontend):**
+    - Mostrar/ocultar botón "Editar Competición" (solo creator o admin)
+    - Mostrar/ocultar botón "Gestionar Inscripciones" (solo creator o admin)
+    - Mostrar/ocultar botón "Anotar Scores" (solo players)
+    - Mostrar badge "Admin" o "Creator" en UI
+
+    **Seguridad:**
+    - Solo el usuario autenticado puede consultar sus propios roles
+    - La autorización real se valida en backend (este endpoint es solo para UX)
+
+    **Returns:**
+    - Objeto con flags de roles (is_admin, is_creator, is_player)
+    """
+    try:
+        competition_vo_id = CompetitionId(competition_id)
+        user_vo_id = UserId(str(current_user.id))
+
+        # Obtener la competición para validar que existe y verificar creator
+        async with uow:
+            competition = await uow.competitions.find_by_id(competition_vo_id)
+
+            if not competition:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Competition with id {competition_id} not found",
+                )
+
+            # Verificar roles usando authorization helpers
+            user_is_admin = is_admin(current_user)
+            user_is_creator = is_creator_of(current_user, competition)
+            user_is_player = await is_player_in(user_vo_id, competition_vo_id, uow)
+
+            return UserRolesResponseDTO(
+                is_admin=user_is_admin,
+                is_creator=user_is_creator,
+                is_player=user_is_player,
+                competition_id=str(competition_id),
+            )
+
+    except HTTPException:
+        # Re-raise HTTPExceptions (404, etc.)
+        raise
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            # Sin el texto: aquí puede caer un ValueError de dentro (B-15)
+            detail="Invalid competition ID format",
+        ) from e
+    except Exception as e:
+        # El detalle, al log y a Sentry; al cliente, nada de lo de dentro (B-15)
+        logger.exception("Error al consultar los roles en la competición %s", competition_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        ) from e
+
+
+@router.get(
+    "/me/stats",
+    response_model=PlayerStatsResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Estadísticas del jugador",
+    description="Resumen de rendimiento del usuario actual para el panel.",
+    tags=["Users"],
+)
+async def get_my_stats(
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetPlayerStatsUseCase = Depends(get_get_player_stats_use_case),
+):
+    """
+    Resumen agregado del jugador: hándicap, media respecto al par, rondas y
+    torneos.
+
+    Una cuenta sin historial devuelve ceros y `null`, no un 404: el panel de un
+    usuario nuevo es un caso normal, no un error.
+
+    `handicap_trend` va siempre a `null` mientras no exista histórico de
+    hándicap; el campo está para no cambiar el contrato cuando lo haya.
+    """
+    return await use_case.execute(UserId(str(current_user.id)))
+
+
+@router.get(
+    "/me/stats/breakdown",
+    response_model=ScoringBreakdownResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Desglose de golpes del jugador",
+    description="Dónde gana y dónde pierde golpes: por par, por mitad de vuelta y por campo.",
+    tags=["Users"],
+)
+async def get_my_scoring_breakdown(
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetPlayerStatsUseCase = Depends(get_get_player_stats_use_case),
+):
+    """
+    Desglose de golpes (BE #168).
+
+    Va aparte de `/me/stats` y no dentro porque son bastantes datos y el panel
+    no siempre los necesita. Lo que ahorra es la serialización, no el trabajo de
+    base de datos: recorre las mismas vueltas que el resumen, así que una
+    pantalla que pida los dos endpoints hace ese recorrido dos veces. Si algún
+    día pesa, la salida es un endpoint que devuelva ambos, no cachear este.
+
+    Mide sobre las mismas vueltas que la media, con el mismo tope de doble bogey
+    neto. Una cuenta sin historial devuelve ceros y listas vacías, no un 404.
+    """
+    return await use_case.execute_breakdown(UserId(str(current_user.id)))
+
+
+@router.get(
+    "/me/stats/golf-courses/{golf_course_id}",
+    response_model=PlayerStatsResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Estadísticas del jugador en un campo",
+    description="Mismo resumen, restringido a las rondas jugadas en un campo concreto.",
+    tags=["Users"],
+)
+async def get_my_stats_for_golf_course(
+    golf_course_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetPlayerStatsUseCase = Depends(get_get_player_stats_use_case),
+):
+    """
+    Desglose por campo.
+
+    Los contadores de torneos vienen a cero: son globales del jugador y
+    repetirlos dentro de un campo daría a entender que jugó ahí esos torneos.
+    """
+    return await use_case.execute(
+        UserId(str(current_user.id)), golf_course_id=GolfCourseId(golf_course_id)
+    )
+
+
+@router.get(
+    "/me/matches",
+    response_model=RecentMatchesResponseDTO,
+    status_code=status.HTTP_200_OK,
+    summary="Historial de partidas del jugador",
+    description="Últimas partidas del usuario, mezclando torneo y partida rápida.",
+    tags=["Users"],
+)
+async def get_my_recent_matches(
+    limit: int = Query(default=10, ge=1, le=50, description="Número de partidas a devolver"),
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: GetRecentMatchesUseCase = Depends(get_get_recent_matches_use_case),
+):
+    """
+    Historial unificado, de la partida más reciente a la más antigua.
+
+    Partidos de torneo y partidas rápidas conviven en la misma lista, y cada
+    entrada deja en `null` lo que no le aplica: un partido de torneo no tiene
+    `scoring_format`, y una partida libre no tiene `result` de match play.
+
+    Las partidas que el propio jugador ocultó (#127) no aparecen aquí, pero
+    siguen apareciendo en el historial de los demás participantes.
+    """
+    return await use_case.execute(UserId(str(current_user.id)), limit=limit)

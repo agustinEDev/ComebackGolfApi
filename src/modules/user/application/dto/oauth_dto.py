@@ -1,0 +1,132 @@
+"""
+OAuth DTOs - Application Layer
+
+DTOs para los endpoints de Google OAuth (login, link, unlink).
+"""
+
+from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
+
+from .user_dto import UserResponseDTO
+
+# PKCE (FE-02, fase 3 del plan a 9, 10 nov 2026): el verifier es OPCIONAL en esta
+# release porque el front de hoy no lo manda; sin él, el canje es el de siempre. En
+# la release 3 pasa a OBLIGATORIO (quitar el default y exigirlo en el canje)
+
+
+class GoogleLoginRequestDTO(BaseModel):
+    """Request DTO para login/registro con Google."""
+
+    authorization_code: str = Field(
+        ..., min_length=1, description="Authorization code de Google OAuth"
+    )
+    code_verifier: str = Field(
+        ...,
+        min_length=43,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9\-._~]+$",
+        description=(
+            "PKCE (RFC 7636): el verifier del code_challenge con el que se pidió el "
+            "código. Obligatorio desde la 2.58.0."
+        ),
+    )
+    # Campos inyectados por la ruta (no vienen del body)
+    ip_address: str | None = Field(None, description="IP del cliente (inyectada por la ruta)")
+    user_agent: str | None = Field(
+        None, description="User-Agent del cliente (inyectado por la ruta)"
+    )
+    device_id_from_cookie: str | None = Field(
+        None, description="Device ID desde cookie httpOnly (inyectado por la ruta)"
+    )
+    installed_app: bool = Field(
+        default=False,
+        description="La app instalada (PWA), por la cabecera X-App-Mode: standalone (BE #737)",
+    )
+    country_code: str | None = Field(
+        default=None,
+        max_length=2,
+        description="País (ISO 3166 alfa-2) que da Cloudflare, solo con su secreto (BE #737)",
+    )
+
+
+class GoogleLoginResponseDTO(BaseModel):
+    """Response DTO para login/registro con Google."""
+
+    # Los tokens, solo para las cookies httpOnly de la ruta: ni en el cuerpo ni en el
+    # esquema (F-03, 2.58.0)
+    access_token: str = Field(..., exclude=True)
+    refresh_token: str = Field(..., exclude=True)
+    csrf_token: str = Field(
+        ...,
+        description="Token CSRF para double-submit (vale lo que el refresh token más 1 h; su cookie dura 15 minutos)",
+    )
+    user: UserResponseDTO = Field(..., description="Información del usuario autenticado")
+    is_new_user: bool = Field(
+        default=False,
+        description="True si el usuario fue creado en este login. Frontend debe redirigir a completar perfil.",
+    )
+    # El dispositivo de la sesión: toda sesión tiene uno (BE #737)
+    device_id: str = Field(..., description="ID del dispositivo de esta sesión")
+
+
+class ReauthenticateRequestDTO(BaseModel):
+    """La contraseña actual, antes de vincular Google (BE #753)."""
+
+    password: str = Field(..., min_length=1, max_length=128, description="Contraseña actual")
+    # Para el log de seguridad: la ruta los pone desde la petición; lo del cliente no cuenta
+    ip_address: SkipJsonSchema[str | None] = Field(default=None, max_length=45)
+    user_agent: SkipJsonSchema[str | None] = Field(default=None, max_length=500)
+
+
+class ReauthenticateResponseDTO(BaseModel):
+    """La marca queda en una cookie httpOnly; aquí, cuánto dura."""
+
+    expires_in: int = Field(..., description="Segundos que vale la marca")
+
+
+class LinkGoogleAccountRequestDTO(BaseModel):
+    """Request DTO para vincular cuenta de Google a usuario existente."""
+
+    authorization_code: str = Field(
+        ..., min_length=1, description="Authorization code de Google OAuth"
+    )
+    code_verifier: str = Field(
+        ...,
+        min_length=43,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9\-._~]+$",
+        description=(
+            "PKCE (RFC 7636): el verifier del code_challenge con el que se pidió el "
+            "código. Obligatorio desde la 2.58.0."
+        ),
+    )
+    # Para el log de seguridad (#750 punto 3): la ruta los pone siempre desde la
+    # petición, como en el login; lo que mande el cliente no cuenta
+    # Fuera del esquema público, como en el desbloqueo
+    ip_address: SkipJsonSchema[str | None] = Field(default=None, max_length=45)
+    user_agent: SkipJsonSchema[str | None] = Field(default=None, max_length=500)
+
+
+class LinkGoogleAccountResponseDTO(BaseModel):
+    """Response DTO para vinculación de cuenta Google."""
+
+    message: str = Field(..., description="Mensaje de confirmación")
+    provider: str = Field(..., description="Proveedor OAuth vinculado")
+    provider_email: str = Field(..., description="Email de la cuenta Google vinculada")
+
+
+class UnlinkGoogleAccountRequestDTO(BaseModel):
+    """Request DTO para desvincular la cuenta de Google del usuario autenticado."""
+
+    user_id: str = Field(..., min_length=1, description="ID del usuario autenticado (del JWT)")
+    # Para el log de seguridad, como al vincular: la ruta los pone desde la petición, y
+    # sin cabecera válida llegan a None (el log dice «unknown»)
+    ip_address: str | None = Field(default=None, max_length=45)
+    user_agent: str | None = Field(default=None, max_length=500)
+
+
+class UnlinkGoogleAccountResponseDTO(BaseModel):
+    """Response DTO para desvinculación de cuenta Google."""
+
+    message: str = Field(..., description="Mensaje de confirmación")
+    provider: str = Field(..., description="Proveedor OAuth desvinculado")

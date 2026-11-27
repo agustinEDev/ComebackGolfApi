@@ -1,0 +1,188 @@
+"""Caso de Uso: Borrado definitivo de una cuenta de usuario (panel de administración)."""
+
+import logging
+from typing import Protocol
+
+from src.modules.competition.domain.repositories.competition_unit_of_work_interface import (
+    CompetitionUnitOfWorkInterface,
+)
+from src.modules.golf_course.domain.repositories.golf_course_unit_of_work_interface import (
+    GolfCourseUnitOfWorkInterface,
+)
+from src.modules.quick_match.domain.repositories.quick_match_unit_of_work_interface import (
+    QuickMatchUnitOfWorkInterface,
+)
+from src.modules.user.application.ports.security_audit_interface import ISecurityAuditLogger
+from src.modules.user.application.services.registra_sin_romper import registra_sin_romper
+from src.modules.user.domain.errors.user_errors import UserNotFoundError
+from src.modules.user.domain.exceptions import UserHasActivityException
+from src.modules.user.domain.repositories.user_unit_of_work_interface import (
+    UserUnitOfWorkInterface,
+)
+from src.modules.user.domain.value_objects.user_id import UserId
+
+
+class QuickMatchPurge(Protocol):
+    """Lo que este caso de uso necesita de las partidas rapidas tras borrar una cuenta."""
+
+    async def execute(self, gone_player_id: str) -> int: ...
+
+
+logger = logging.getLogger(__name__)
+
+
+class AdminDeleteUserUseCase:
+    """
+    Borra definitivamente la cuenta de un usuario (solo Admin).
+
+    Bloquea el borrado si la cuenta tiene actividad de la que dependen otros
+    usuarios o que rompería una restriccion de la base de datos:
+    - Ha creado alguna competicion (competitions.creator_id es ON DELETE CASCADE:
+      borraria el torneo entero para todos sus participantes).
+    - Ha creado alguna partida rapida (mismo motivo, quick_matches.creator_id CASCADE).
+    - Ha solicitado algun campo de golf (golf_courses.creator_id sin ON DELETE: fallaria).
+    - Tiene algun hole score registrado (hole_scores.player_user_id sin ON DELETE: la
+      base tambien lo impide, porque borrarlos falsearia el resultado del partido para
+      sus rivales; migracion e7b9d1f3a5c2).
+
+    En esos casos, el panel de administracion debe ofrecer "Desactivar" en su lugar
+    (ver AdminSetUserActiveUseCase).
+
+    Las invitaciones NO bloquean: ambas FKs de `invitations` hacia `users` son
+    ON DELETE CASCADE (migracion c7d1e4f8a2b6), asi que las invitaciones enviadas
+    y recibidas por la cuenta desaparecen con ella. Bloquear ahi dejaria al admin
+    sin salida, porque no existe forma de borrar invitaciones ajenas.
+
+    El borrado queda en el log de seguridad (F-20); uno rechazado, no.
+    """
+
+    def __init__(
+        self,
+        user_uow: UserUnitOfWorkInterface,
+        competition_uow: CompetitionUnitOfWorkInterface,
+        quick_match_uow: QuickMatchUnitOfWorkInterface,
+        golf_course_uow: GolfCourseUnitOfWorkInterface,
+        *,
+        security_audit: ISecurityAuditLogger,
+        quick_match_purge: QuickMatchPurge | None = None,
+    ):
+        """
+        Args:
+            user_uow: Unit of Work de usuarios
+            competition_uow: Para mirar competiciones, golpes, drafts y partidas
+            quick_match_uow: Para mirar partidas rápidas
+            golf_course_uow: Para mirar campos solicitados
+            security_audit: El log de seguridad, donde queda cada borrado (F-20)
+            quick_match_purge: La limpieza de sus partidas rapidas que, al irse el,
+                quedan tiradas a la papelera por todos (26 nov 2026)
+        """
+        self._user_uow = user_uow
+        self._competition_uow = competition_uow
+        self._quick_match_uow = quick_match_uow
+        self._golf_course_uow = golf_course_uow
+        self._security_audit = security_audit
+        self._quick_match_purge = quick_match_purge
+
+    async def execute(
+        self,
+        user_id_str: str,
+        *,
+        actor_user_id: str,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> None:
+        """Borra la cuenta si no tiene actividad y lo deja en el log de seguridad.
+
+        Raises:
+            UserNotFoundError: si no existe
+            UserHasActivityException: si tiene actividad de la que dependen otros
+        """
+        user_id = UserId(user_id_str)
+
+        async with self._user_uow:
+            user = await self._user_uow.users.find_by_id(user_id)
+            if not user:
+                raise UserNotFoundError(f"User not found: {user_id_str}")
+
+        reasons = await self._collect_activity_reasons(user_id)
+        if reasons:
+            raise UserHasActivityException(reasons)
+
+        # El historial de aceptaciones de los Términos sobrevive al borrado:
+        # lo desvincula y lo fecha la propia base de datos (FK SET NULL y
+        # trigger BEFORE DELETE ON users), sea cual sea el camino del borrado
+        async with self._user_uow:
+            borrada = await self._user_uow.users.delete_by_id(user_id)
+        # Otro administrador la borró entre la comprobación y aquí: no se borró nada,
+        # así que no se apunta (la ruta lo da como 404)
+        if not borrada:
+            raise UserNotFoundError(f"User not found: {user_id_str}")
+
+        # Ya borrada: si el log falla, el borrado vale igual
+        registra_sin_romper(
+            "Account deletion",
+            lambda: self._security_audit.log_account_deleted_by_admin(
+                user_id=actor_user_id,
+                deleted_user_id=str(user_id),  # el canónico, no lo que traía la ruta
+                ip_address=ip_address or "unknown",
+                user_agent=user_agent or "unknown",
+            ),
+        )
+
+        await self._purgar_sus_partidas_rapidas(user_id)
+
+    async def _purgar_sus_partidas_rapidas(self, user_id: UserId) -> None:
+        """
+        Una partida rapida se borra de verdad cuando la han tirado todos los que
+        siguen teniendo cuenta. Con esta ya borrada, puede haber partidas suyas
+        que los demas tenian en la papelera y el no: ahora cumplen la regla, y
+        como nadie las ve, nadie volveria a pulsar la papelera.
+
+        Despues del borrado y con fallo seguro: la cuenta ya no existe, y lo que
+        no se pueda limpiar se queda como estaba.
+        """
+        if self._quick_match_purge is None:
+            return
+        try:
+            await self._quick_match_purge.execute(str(user_id))
+        except Exception as error:
+            logger.error(
+                "Could not purge the trashed quick matches of a deleted account: %s",
+                type(error).__name__,
+            )
+
+    async def _collect_activity_reasons(self, user_id: UserId) -> list[str]:
+        reasons: list[str] = []
+
+        async with self._competition_uow:
+            competitions_created = await self._competition_uow.competitions.count_by_creator(
+                user_id
+            )
+            if competitions_created > 0:
+                reasons.append(f"has created {competitions_created} competition(s)")
+
+            has_scores = await self._competition_uow.hole_scores.exists_by_player(user_id)
+            if has_scores:
+                reasons.append("has recorded hole scores in one or more matches")
+
+            # Una sala de draft sin capitan no existe: se dice aqui, que si no
+            # el borrado se estrella contra la clave ajena y sale un 500
+            if await self._competition_uow.drafts.exists_by_captain(user_id):
+                reasons.append("is a captain in a live draft room")
+
+            # Lo jugado en stroke play no se borra: la clave ajena es RESTRICT (#251)
+            if await self._competition_uow.partidas.existe_con_jugador(user_id):
+                reasons.append("is in one or more tee groups")
+
+        async with self._quick_match_uow:
+            if await self._quick_match_uow.quick_matches.exists_created_by(user_id):
+                reasons.append("has created one or more quick matches")
+
+        async with self._golf_course_uow:
+            golf_courses_requested = await self._golf_course_uow.golf_courses.count_by_creator(
+                user_id
+            )
+            if golf_courses_requested > 0:
+                reasons.append(f"has requested {golf_courses_requested} golf course(s)")
+
+        return reasons

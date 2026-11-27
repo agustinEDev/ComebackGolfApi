@@ -1,0 +1,358 @@
+"""
+Invitation Routes - API REST Layer (Infrastructure).
+
+Endpoints FastAPI para gestion de invitaciones siguiendo Clean Architecture.
+"""
+
+import logging
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+from src.config.correo_verificado import usuario_con_correo_verificado
+from src.config.dependencies import (
+    get_cancel_invitation_use_case,
+    get_current_user,
+    get_list_competition_invitations_use_case,
+    get_list_my_invitations_use_case,
+    get_respond_to_invitation_use_case,
+    get_send_invitation_by_email_use_case,
+    get_send_invitation_by_user_id_use_case,
+)
+from src.config.rate_limit import INVITATIONS_PER_USER_LIMIT, cabe, clave_de_usuario
+from src.modules.competition.application.dto.invitation_dto import (
+    PaginatedInvitationResponseDTO,
+    RespondInvitationRequestDTO,
+    RespondInvitationResponseDTO,
+    SendInvitationByEmailRequestDTO,
+    SendInvitationByUserIdRequestDTO,
+)
+from src.modules.competition.application.services.equipos_formados import TeamsFormedError
+from src.modules.competition.application.use_cases.cancel_invitation_use_case import (
+    CancelInvitationUseCase,
+)
+from src.modules.competition.application.use_cases.list_competition_invitations_use_case import (
+    ListCompetitionInvitationsUseCase,
+)
+from src.modules.competition.application.use_cases.list_my_invitations_use_case import (
+    ListMyInvitationsUseCase,
+)
+from src.modules.competition.application.use_cases.respond_to_invitation_use_case import (
+    RespondToInvitationUseCase,
+)
+from src.modules.competition.application.use_cases.send_invitation_by_email_use_case import (
+    SendInvitationByEmailUseCase,
+)
+from src.modules.competition.application.use_cases.send_invitation_by_user_id_use_case import (
+    SendInvitationByUserIdUseCase,
+)
+from src.modules.competition.domain.exceptions.competition_violations import (
+    CompetitionFullViolation,
+    InvitationNoRoomViolation,
+    InvitationRateLimitViolation,
+    InvitationUserRateLimitViolation,
+)
+from src.modules.competition.domain.services.competition_policy import (
+    MAX_INVITATIONS_PER_USER_PER_HOUR,
+)
+from src.modules.competition.domain.value_objects.invitation_status import InvitationStatus
+from src.modules.user.application.dto.user_dto import UserResponseDTO
+from src.shared.domain.services.texto_sin_enlaces import contiene_enlace
+from src.shared.infrastructure.http.paginacion import parametro_page
+
+
+def _validate_status_filter(status_filter: str | None) -> str | None:
+    """Valida el status filter contra InvitationStatus antes de pasar al use case."""
+    if status_filter is None:
+        return None
+    try:
+        InvitationStatus(status_filter)
+        return status_filter
+    except ValueError:
+        valid = [s.value for s in InvitationStatus]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status filter: '{status_filter}'. Valid values: {valid}",
+        ) from None
+
+
+logger = logging.getLogger(__name__)
+# Lo que se dice al invitar sin plazas (BE #359). La pantalla lo traduce por el
+# `error_code`; esto es para quien lea la API
+SIN_PLAZAS = "The competition is full: there are no places left to invite."
+# Y al agotar el freno por hora: el texto de la excepcion lleva el id de la
+# competicion. La pantalla lo dice con el `limit`, en su idioma
+FRENO_POR_HORA = "Too many invitations sent in the last hour for this competition."
+
+
+# El de quien invita, sumando todas sus competiciones (auditoría de la fase 6, B-03)
+FRENO_DEL_ORGANIZADOR = "Too many invitations sent in the last hour."
+
+
+def _freno_por_hora(
+    e: InvitationRateLimitViolation | InvitationUserRateLimitViolation,
+) -> JSONResponse:
+    detalle = (
+        FRENO_DEL_ORGANIZADOR if isinstance(e, InvitationUserRateLimitViolation) else FRENO_POR_HORA
+    )
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"detail": detalle, "error_code": e.error_code, "limit": e.limit},
+    )
+
+
+def _freno_del_organizador() -> InvitationUserRateLimitViolation:
+    """El mismo 429 que el tope por filas, para el freno por peticiones."""
+    return InvitationUserRateLimitViolation(
+        "Too many invitation requests in the last hour.", limit=MAX_INVITATIONS_PER_USER_PER_HOUR
+    )
+
+
+router = APIRouter()
+
+
+# ======================================================================================
+# REQUEST BODY MODELS (Presentation Layer)
+# ======================================================================================
+
+
+class SendInvitationByUserIdBody(BaseModel):
+    """Body para enviar invitacion por user_id."""
+
+    invitee_user_id: UUID
+    personal_message: str | None = Field(None, max_length=500)
+
+    @field_validator("personal_message")
+    @classmethod
+    def sin_enlaces(cls, valor: str | None) -> str | None:
+        """Antes que el cupo de invitaciones: un enlace no gasta un intento (SB-05)."""
+        if contiene_enlace(valor):
+            raise ValueError("The message cannot contain links or web addresses.")
+        return valor
+
+
+class SendInvitationByEmailBody(BaseModel):
+    """Body para enviar invitacion por email."""
+
+    invitee_email: EmailStr
+    personal_message: str | None = Field(None, max_length=500)
+
+    @field_validator("personal_message")
+    @classmethod
+    def sin_enlaces(cls, valor: str | None) -> str | None:
+        """Antes que el cupo de invitaciones: un enlace no gasta un intento (SB-05)."""
+        if contiene_enlace(valor):
+            raise ValueError("The message cannot contain links or web addresses.")
+        return valor
+
+
+class RespondInvitationBody(BaseModel):
+    """Body para responder a una invitacion."""
+
+    action: str = Field(
+        ..., description="Action to perform: ACCEPT or DECLINE", pattern="^(ACCEPT|DECLINE)$"
+    )
+
+
+# ======================================================================================
+# ENDPOINTS
+# ======================================================================================
+
+
+@router.post(
+    "/competitions/{competition_id}/invitations",
+    status_code=status.HTTP_201_CREATED,
+    summary="Send invitation by user ID",
+    description="Creator sends an invitation to a registered user by their user ID 409 `TEAMS_FORMED` once teams are formed.",
+)
+async def send_invitation_by_user_id(
+    competition_id: UUID,
+    body: SendInvitationByUserIdBody,
+    current_user: UserResponseDTO = Depends(usuario_con_correo_verificado),  # B-17
+    use_case: SendInvitationByUserIdUseCase = Depends(get_send_invitation_by_user_id_use_case),
+):
+    try:
+        request_dto = SendInvitationByUserIdRequestDTO(
+            competition_id=competition_id,
+            inviter_id=current_user.id,
+            invitee_user_id=body.invitee_user_id,
+            personal_message=body.personal_message,
+        )
+        # Antes que nada: cada petición cuenta, salga bien o mal (B-03)
+        if not cabe(
+            INVITATIONS_PER_USER_LIMIT,
+            "invitations-per-user",
+            clave_de_usuario(str(current_user.id)),
+        ):
+            return _freno_por_hora(_freno_del_organizador())
+        return await use_case.execute(request_dto, is_admin=current_user.is_admin)
+
+    except (InvitationRateLimitViolation, InvitationUserRateLimitViolation) as e:
+        return _freno_por_hora(e)
+    # Con los equipos formados no podría aceptarse (30 oct 2026)
+    except TeamsFormedError as e:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": TeamsFormedError.MENSAJE, "error_code": e.error_code},
+        )
+    except CompetitionFullViolation as e:
+        # Sin plazas no se invita (BE #359): con su codigo en la raiz, para que
+        # la pantalla diga por que en su idioma. Con un texto fijo y no el de la
+        # excepcion, que lleva el id de la competicion y los recuentos (CodeQL)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": SIN_PLAZAS, "error_code": e.error_code},
+        )
+
+
+@router.post(
+    "/competitions/{competition_id}/invitations/by-email",
+    status_code=status.HTTP_201_CREATED,
+    summary="Send invitation by email",
+    description="Creator sends an invitation to an email address (registered or not) 409 `TEAMS_FORMED` once teams are formed.",
+)
+async def send_invitation_by_email(
+    competition_id: UUID,
+    body: SendInvitationByEmailBody,
+    current_user: UserResponseDTO = Depends(usuario_con_correo_verificado),  # B-17
+    use_case: SendInvitationByEmailUseCase = Depends(get_send_invitation_by_email_use_case),
+):
+    try:
+        request_dto = SendInvitationByEmailRequestDTO(
+            competition_id=competition_id,
+            inviter_id=current_user.id,
+            invitee_email=body.invitee_email,
+            personal_message=body.personal_message,
+        )
+        # Antes que nada: cada petición cuenta, salga bien o mal (B-03)
+        if not cabe(
+            INVITATIONS_PER_USER_LIMIT,
+            "invitations-per-user",
+            clave_de_usuario(str(current_user.id)),
+        ):
+            return _freno_por_hora(_freno_del_organizador())
+        return await use_case.execute(request_dto, is_admin=current_user.is_admin)
+
+    except (InvitationRateLimitViolation, InvitationUserRateLimitViolation) as e:
+        return _freno_por_hora(e)
+    # Con los equipos formados no podría aceptarse (30 oct 2026)
+    except TeamsFormedError as e:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": TeamsFormedError.MENSAJE, "error_code": e.error_code},
+        )
+    except CompetitionFullViolation as e:
+        # Sin plazas no se invita (BE #359): con su codigo en la raiz, para que
+        # la pantalla diga por que en su idioma. Con un texto fijo y no el de la
+        # excepcion, que lleva el id de la competicion y los recuentos (CodeQL)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": SIN_PLAZAS, "error_code": e.error_code},
+        )
+
+
+@router.get(
+    "/invitations/me",
+    response_model=PaginatedInvitationResponseDTO,
+    summary="List my invitations",
+    description="List invitations received by the authenticated user.",
+)
+async def list_my_invitations(
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ListMyInvitationsUseCase = Depends(get_list_my_invitations_use_case),
+    status_filter: str | None = Query(None, alias="status"),
+    page: int = parametro_page(),
+    limit: int = Query(20, ge=1, le=100),
+):
+    validated_status = _validate_status_filter(status_filter)
+    return await use_case.execute(
+        user_id=str(current_user.id),
+        status_filter=validated_status,
+        page=page,
+        limit=limit,
+    )
+
+
+@router.post(
+    "/invitations/{invitation_id}/respond",
+    response_model=RespondInvitationResponseDTO,
+    summary="Respond to invitation",
+    description="Accept or decline an invitation.",
+)
+async def respond_to_invitation(
+    invitation_id: UUID,
+    body: RespondInvitationBody,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: RespondToInvitationUseCase = Depends(get_respond_to_invitation_use_case),
+):
+    try:
+        request_dto = RespondInvitationRequestDTO(
+            invitation_id=invitation_id,
+            user_id=current_user.id,
+            action=body.action,
+        )
+        return await use_case.execute(request_dto)
+
+    except InvitationNoRoomViolation:
+        # Con su codigo en la raiz, para que la pantalla lo diga en su idioma
+        # (claves siempre, #360; BE #385). El texto, la constante de la clase y
+        # nunca el de la excepción (CodeQL, BE #562)
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": InvitationNoRoomViolation.MENSAJE,
+                "error_code": InvitationNoRoomViolation.error_code,
+            },
+        )
+    except TeamsFormedError as e:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": TeamsFormedError.MENSAJE, "error_code": e.error_code},
+        )
+
+
+@router.post(
+    "/invitations/{invitation_id}/cancel",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Cancel invitation",
+    description=(
+        "Withdraw a pending invitation. Only the competition creator, whoever sent it "
+        "or an admin. The invitee is not notified (BE #359)."
+    ),
+)
+async def cancel_invitation(
+    invitation_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: CancelInvitationUseCase = Depends(get_cancel_invitation_use_case),
+) -> Response:
+    await use_case.execute(invitation_id, current_user.id, is_admin=current_user.is_admin)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/competitions/{competition_id}/invitations",
+    response_model=PaginatedInvitationResponseDTO,
+    summary="List competition invitations",
+    description="List invitations sent for a competition (creator/admin only).",
+)
+async def list_competition_invitations(
+    competition_id: UUID,
+    current_user: UserResponseDTO = Depends(get_current_user),
+    use_case: ListCompetitionInvitationsUseCase = Depends(
+        get_list_competition_invitations_use_case
+    ),
+    status_filter: str | None = Query(None, alias="status"),
+    page: int = parametro_page(),
+    limit: int = Query(20, ge=1, le=100),
+):
+    validated_status = _validate_status_filter(status_filter)
+    return await use_case.execute(
+        competition_id=str(competition_id),
+        current_user_id=str(current_user.id),
+        is_admin=current_user.is_admin,
+        status_filter=validated_status,
+        page=page,
+        limit=limit,
+    )

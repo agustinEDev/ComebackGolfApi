@@ -1,0 +1,124 @@
+# ============================================================================
+# Docker Compose Configuration for Ryder Cup Backend
+# ============================================================================
+# IMPORTANT: When running from project root, use:
+#   docker-compose -f docker/docker-compose.yml --env-file .env up -d
+#
+# Variables de puerto (evita conflictos con K8s):
+#   - DOCKER_DATABASE_PORT=5433 (Docker) vs DATABASE_PORT=5434 (K8s)
+#   - DOCKER_APP_PORT=8001 (Docker) vs PORT=8000 (K8s)
+# ============================================================================
+
+services:
+  db:
+    image: postgres:15-alpine
+    ports:
+      - "${DOCKER_DATABASE_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+      - ./scripts/validate-postgres-env.sh:/validate-postgres-env.sh:ro
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Note: Defaults are ONLY for docker-compose syntax safety; validation scripts
+      # will fail-fast if actual .env values are missing (see validate-postgres-env.sh)
+      - POSTGRES_USER=${POSTGRES_USER:-MISSING_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-MISSING_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-MISSING_DB}
+    entrypoint: ["/bin/sh", "/validate-postgres-env.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "${DOCKER_APP_PORT:-8001}:8000"
+    volumes:
+      # Solo el código, para el hot-reload; no el checkout entero: montado sobre /app,
+      # el usuario de la app leía el .env y los secretos locales del Kind y se saltaba
+      # el .dockerignore. Lo demás de /app (requisitos instalados) es el de la imagen.
+      # En Linux, el checkout tiene que poder leerlo el uid 10001 de la imagen
+      # Solo carpetas: un fichero suelto montado (main.py, alembic.ini) deja de verse
+      # cuando el editor lo sustituye por uno nuevo y el hot-reload se pierde. Esos
+      # dos van en la imagen: si cambian, `docker compose build app`
+      - ../src:/app/src:ro
+      - ../alembic:/app/alembic:ro
+      - ../scripts:/app/scripts:ro
+      # Los logs, en su propio volumen: el de la imagen (uid 10001) los escribe
+      - app_logs:/app/logs
+      - ./scripts/validate-app-env.sh:/validate-app-env.sh:ro
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Database Configuration
+      # Note: Defaults are ONLY for docker-compose syntax safety; validation scripts
+      # will fail-fast if actual .env values are missing (see validate-app-env.sh)
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-MISSING_USER}:${POSTGRES_PASSWORD:-MISSING_PASSWORD}@db:5432/${POSTGRES_DB:-MISSING_DB}
+      - DATABASE_HOST=db
+      - DATABASE_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-MISSING_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-MISSING_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-MISSING_DB}
+
+      # Application Configuration
+      - PORT=${PORT:-8000}
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+
+      # JWT Configuration
+      # SECRET_KEY is REQUIRED - validation script will fail if missing
+      - SECRET_KEY=${SECRET_KEY:-MISSING_SECRET_KEY}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+
+      # Swagger/Docs Protection (optional - can be empty)
+      - DOCS_USERNAME=${DOCS_USERNAME:-}
+      - DOCS_PASSWORD=${DOCS_PASSWORD:-}
+
+      # Mailgun Configuration (Email Verification) (optional - can be empty)
+      - MAILGUN_API_KEY=${MAILGUN_API_KEY:-}
+      - MAILGUN_DOMAIN=${MAILGUN_DOMAIN:-}
+      - MAILGUN_FROM_EMAIL=${MAILGUN_FROM_EMAIL:-}
+      - MAILGUN_API_URL=${MAILGUN_API_URL:-https://api.eu.mailgun.net/v3}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:5173}
+
+      # Formulario de contacto: el buzón al que llegan los mensajes
+      - CONTACT_EMAIL=${CONTACT_EMAIL:-hola@comebackgolf.com}
+
+      # Los correos van a Mailpit (http://localhost:8025) y no se entregan: no gastan
+      # el cupo de Mailgun de producción (BE #563). EMAIL_TRANSPORT=mailgun para mandarlos
+      - EMAIL_TRANSPORT=${EMAIL_TRANSPORT:-mailpit}
+      - MAILPIT_URL=http://mailpit:8025
+      # Respaldos de Mailgun (vacío = sin respaldo): Resend, y el último Brevo, nunca
+      # para correos con token ni avisos de seguridad
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - BREVO_API_KEY=${BREVO_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+
+  # Buzón local: guarda los correos de desarrollo sin entregarlos (BE #563)
+  mailpit:
+    image: axllent/mailpit:v1.32.0
+    ports:
+      # Solo desde este ordenador: los correos de prueba llevan enlaces y tokens
+      - "127.0.0.1:8025:8025"
+    environment:
+      - MP_MAX_MESSAGES=500
+    # La API espera a que el buzón responda (CodeRabbit)
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  app_logs:

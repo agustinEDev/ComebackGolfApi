@@ -1,0 +1,1635 @@
+# ================================
+# CI/CD PIPELINE - COMEBACK GOLF API
+# ================================
+# Pipeline completo de integración continua y despliegue continuo
+# Ejecuta tests, security checks, linting y type checking en paralelo
+#
+# Jobs (todos en paralelo; el resumen espera al resto):
+# 1. Unit Tests - 662 tests (Python 3.12 + 3.14)
+# 2. Integration Tests - 72 tests (con PostgreSQL)
+# 3. Security Tests - 45+ tests (CSRF, XSS, SQLi, Auth Bypass)
+# 4. Security Checks - Bandit, pip-audit, Gitleaks
+# 5. Linting - Ruff (linter + formatter, los dos bloquean)
+# 6. Type Checking - Mypy
+# 7. Build - matriz: imagen Docker, arranque como Render y Trivy
+# 8. Dependency Review - blocks PRs that add a vulnerable dependency
+# 9. SBOM Generation - CycloneDX SBOM + dependency graph
+# 10. GPG Signature Verification - Validates all commits are signed
+# 11. Architecture Contracts - import-linter (.importlinter)
+# 12. API Contract - oasdiff contra la rama base (etiqueta api-breaking)
+# 13. OWASP Top 10 - Semgrep (owasp-top-ten + python)
+# 14. Summary - Reporte final
+
+name: CI/CD Pipeline
+
+# Triggers: Cuándo se ejecuta este workflow
+on:
+  push:
+    # Solo las ramas largas: una rama de trabajo ya se prueba por su pull_request,
+    # y con '**' cada commit de una PR corría el pipeline dos veces.
+    branches: [main, develop, 'release/**', 'hotfix/**']
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [main, develop]
+    # Sin labeled/unlabeled: Dependabot pone dos etiquetas al abrir, cada una
+    # lanzaba el pipeline entero y la concurrencia cancelaba las anteriores; los
+    # checks obligatorios cancelados dejaban la PR bloqueada (BE #444). El job
+    # del contrato lee `api-breaking` en el momento: tras ponerla, se relanza
+    # ese job a mano («Re-run»). Quitarla NO vuelve a poner el contrato en rojo
+    # hasta el siguiente push: aceptado (un solo desarrollador, decidido el 30
+    # sep 2026). Un workflow que relanzaba solo se descartó en la #445: esperar
+    # al pipeline y relanzarlo abría carreras
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Permissions for security scanning
+# Mínimos para todos; el job que sube SARIF (build, Trivy) pide security-events.
+permissions:
+  contents: read
+
+# Un push nuevo a la misma rama cancela la ejecución anterior, salvo en main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # ================================
+  # JOB 2: UNIT TESTS
+  # ================================
+  # Ejecuta 662+ tests unitarios (sin base de datos)
+  # Matriz: Python 3.12 + 3.14
+  # Coverage: XML + HTML reports
+
+  unit_tests:
+    name: 🧪 Unit ${{ matrix.python-version }}${{ matrix.experimental && ' exp' || '' }}
+    runs-on: ubuntu-24.04
+    # Columna 2 del gráfico: espera a la de análisis estático (30 sep 2026). Si algo
+    # de la columna 1 FALLA, esta se salta: no se gastan minutos de tests en una PR
+    # que no se puede mergear. Es seguro porque TODO lo de la columna 1 es check
+    # obligatorio en develop y main: un check obligatorio «saltado» cuenta como
+    # aprobado en GitHub, pero el fallo de la columna 1 ya bloquea el merge. Lo que
+    # solo se salta (API contract o Dependency Review en un push) no cuenta como fallo.
+    needs: [linting, type_checking, architecture, api_contract, owasp_semgrep, security_checks, dependency_review, gpg_verification]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    timeout-minutes: 15
+    # 3.14 es la versión a la que pasa la imagen de producción (Dependabot #423) y
+    # 3.12 la del entorno local: las dos bloquean. Para probar una versión futura sin bloquear,
+    # se añade en `include` con `experimental: true` (sale en rojo, no impide mergear).
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.14']
+        experimental: [false]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Restore pip cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements*.txt', 'requirements*.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      - name: Install Dependencies
+        run: |
+          # Lo mismo que la imagen y, encima, las herramientas de desarrollo (INF-05)
+          bash .github/scripts/instalar_dependencias.sh --dev
+
+      - name: Run Unit Tests with Coverage
+        run: |
+          echo "Running unit tests on Python ${{ matrix.python-version }}..."
+          # El JUnit XML solo lo lee la tarjeta del resumen (no cambia qué pasa o falla).
+          # Cobertura con ramas y un suelo en la 3.12: si baja del 88 % falla (re-auditoría
+          # F-10; el 17 nov 2026 estaba en el 89 %). Subirlo cuando suba la cobertura. En la
+          # 3.14 no: mide las ramas de otra forma (sys.monitoring) y daría otro total
+          SUELO=""
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then SUELO="--cov-fail-under=88"; fi
+          pytest tests/unit/ -v --cov=src --cov-branch $SUELO \
+            --cov-report=xml --cov-report=term-missing --cov-report=html \
+            --junitxml="$RUNNER_TEMP/junit.xml"
+
+      - name: Upload Coverage Report (XML)
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: coverage-report-xml
+          path: coverage.xml
+          retention-days: 7
+
+      - name: Upload Coverage Report (HTML)
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: coverage-report-html
+          path: htmlcov/
+          retention-days: 7
+
+      # Tarjeta en el resumen de la ejecución: qué hace el job y qué ha salido
+      - name: Summary card
+        if: always()
+        run: |
+          RESULT=$(python3 .github/scripts/ci_results.py pytest "$RUNNER_TEMP/junit.xml" coverage.xml || true)
+          python3 .github/scripts/summary_card.py \
+            --title '🧪 Unit tests ${{ matrix.python-version }}${{ matrix.experimental && ' exp' || '' }}' \
+            --what 'Runs the unit tests (domain and use cases, no database) with coverage on this Python version.${{ matrix.experimental && ' Experimental: a failure is shown but does not block the merge.' || '' }}' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'The failing tests are in the "Run Unit Tests with Coverage" step log. Reproduce with: pytest tests/unit/ -q' || true
+
+  # ================================
+  # JOB 3: INTEGRATION TESTS
+  # ================================
+  # Ejecuta 72+ tests de integración (con PostgreSQL)
+  # Incluye: API, Database, Use Cases
+
+  integration_tests:
+    # 3.14 (a la que pasa la imagen de producción, Dependabot #423) y 3.12 (el
+    # entorno local), las dos obligatorias y sobre la misma base de datos de servicio.
+    name: 🗄️ Integration ${{ matrix.python-version }}${{ matrix.experimental && ' exp' || '' }}
+    runs-on: ubuntu-24.04
+    # Columna 2 del gráfico: espera a la de análisis estático (30 sep 2026). Si algo
+    # de la columna 1 FALLA, esta se salta: no se gastan minutos de tests en una PR
+    # que no se puede mergear. Es seguro porque TODO lo de la columna 1 es check
+    # obligatorio en develop y main: un check obligatorio «saltado» cuenta como
+    # aprobado en GitHub, pero el fallo de la columna 1 ya bloquea el merge. Lo que
+    # solo se salta (API contract o Dependency Review en un push) no cuenta como fallo.
+    needs: [linting, type_checking, architecture, api_contract, owasp_semgrep, security_checks, dependency_review, gpg_verification]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.14']
+        experimental: [false]
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Restore pip cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt', 'requirements*.lock') }}
+
+      - name: Install Dependencies
+        run: |
+          # Lo mismo que la imagen y, encima, las herramientas de desarrollo (INF-05)
+          bash .github/scripts/instalar_dependencias.sh --dev
+
+      - name: Wait for PostgreSQL
+        run: |
+          echo "Waiting for PostgreSQL to be fully ready..."
+          sleep 5
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_db
+        run: |
+          echo "Running Alembic migrations..."
+          alembic upgrade head
+
+      - name: Run Integration Tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_db
+          DOCS_USERNAME: admin
+          DOCS_PASSWORD: testpassword123
+        run: |
+          echo "Running integration tests (with database)..."
+          # Mide también la cobertura de esta suite, la que llega a la infraestructura
+          # (repositorios, rutas). Se guarda como artefacto; aún sin suelo (re-auditoría F-10)
+          pytest tests/integration/ -v --maxfail=5 --junitxml="$RUNNER_TEMP/junit.xml" \
+            --cov=src --cov-branch --cov-report=xml:coverage-integration.xml
+
+      - name: Upload Integration Coverage Report (XML)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: coverage-integration-xml
+          path: coverage-integration.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Tarjeta en el resumen de la ejecución: qué hace el job y qué ha salido
+      - name: Summary card
+        if: always()
+        run: |
+          RESULT=$(python3 .github/scripts/ci_results.py pytest "$RUNNER_TEMP/junit.xml" || true)
+          python3 .github/scripts/summary_card.py \
+            --title '🗄️ Integration tests ${{ matrix.python-version }}${{ matrix.experimental && ' exp' || '' }}' \
+            --what 'Runs the API, repositories and use cases against a real PostgreSQL after applying every migration.${{ matrix.experimental && ' Experimental: a failure is shown but does not block the merge.' || '' }}' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'If the migrations failed, see the "Run Database Migrations" step; otherwise the failing tests are in the "Run Integration Tests" step log (stops after 5 failures).' || true
+
+  # ================================
+  # JOB 4: SECURITY TESTS
+  # ================================
+  # Ejecuta 45+ tests de seguridad (con PostgreSQL)
+  # Incluye: CSRF Protection, XSS Prevention, SQL Injection,
+  #          Auth Bypass, Rate Limiting
+  # OWASP Coverage: A01-A09
+
+  security_tests:
+    # 3.14 (a la que pasa la imagen de producción, Dependabot #423) y 3.12 (el
+    # entorno local), las dos obligatorias y sobre la misma base de datos de servicio.
+    name: 🔐 Security tests ${{ matrix.python-version }}${{ matrix.experimental && ' exp' || '' }}
+    runs-on: ubuntu-24.04
+    # Columna 2 del gráfico: espera a la de análisis estático (30 sep 2026). Si algo
+    # de la columna 1 FALLA, esta se salta: no se gastan minutos de tests en una PR
+    # que no se puede mergear. Es seguro porque TODO lo de la columna 1 es check
+    # obligatorio en develop y main: un check obligatorio «saltado» cuenta como
+    # aprobado en GitHub, pero el fallo de la columna 1 ya bloquea el merge. Lo que
+    # solo se salta (API contract o Dependency Review en un push) no cuenta como fallo.
+    needs: [linting, type_checking, architecture, api_contract, owasp_semgrep, security_checks, dependency_review, gpg_verification]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.14']
+        experimental: [false]
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Restore pip cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt', 'requirements*.lock') }}
+
+      - name: Install Dependencies
+        run: |
+          # Lo mismo que la imagen y, encima, las herramientas de desarrollo (INF-05)
+          bash .github/scripts/instalar_dependencias.sh --dev
+
+      - name: Wait for PostgreSQL
+        run: |
+          echo "Waiting for PostgreSQL to be fully ready..."
+          sleep 5
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_db
+        run: |
+          echo "Running Alembic migrations..."
+          alembic upgrade head
+
+      - name: Run Security Tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://test_user:test_password@localhost:5432/test_db
+          DOCS_USERNAME: admin
+          DOCS_PASSWORD: testpassword123
+        run: |
+          echo "🔐 Running security tests..."
+          echo "Tests: CSRF Protection, XSS Prevention, SQL Injection, Auth Bypass"
+          pytest tests/security/ -v --maxfail=1 --tb=short --junitxml="$RUNNER_TEMP/junit.xml"
+
+      # Tarjeta en el resumen de la ejecución (sustituye a la lista fija de antes,
+      # que daba números escritos a mano)
+      - name: Summary card
+        if: always()
+        run: |
+          RESULT=$(python3 .github/scripts/ci_results.py pytest "$RUNNER_TEMP/junit.xml" || true)
+          python3 .github/scripts/summary_card.py \
+            --title '🔐 Security tests ${{ matrix.python-version }}${{ matrix.experimental && ' exp' || '' }}' \
+            --what 'Runs the security test suite (CSRF, XSS, SQL injection, auth bypass, rate limiting) against the API with a real PostgreSQL.${{ matrix.experimental && ' Experimental: a failure is shown but does not block the merge.' || '' }}' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'The first failing test is in the "Run Security Tests" step log (stops at the first failure). Reproduce with: pytest tests/security -n 2' || true
+
+  # ================================
+  # JOB 5: SECURITY CHECKS
+  # ================================
+  # Ejecuta múltiples herramientas de seguridad
+
+  security_checks:
+    name: 🔒 Security Checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # Descargar todo el historial para Gitleaks
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.14'  # la versión a la que pasa la imagen de producción (#423)
+
+      - name: Restore pip cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-py314-${{ hashFiles('requirements*.txt', 'requirements*.lock') }}
+
+      - name: Install Dependencies
+        run: |
+          # Lo mismo que la imagen y, encima, las herramientas de desarrollo (INF-05)
+          bash .github/scripts/instalar_dependencias.sh --dev
+
+      - name: Run Bandit (Python Security Linter)
+        id: bandit
+        run: |
+          echo "🔒 Running Bandit - Python security linter..."
+          bandit -r src/ -f json -o bandit-report.json || true
+          # Bloquea con cualquier aviso (el 30 sep 2026 quedaba a cero). Un falso
+          # positivo se marca con `# nosec <id> - motivo` en la propia línea.
+          bandit -r src/ -f screen
+
+      - name: Run pip-audit (PyPA Official Audit)
+        id: pip-audit-check
+        # Cada herramienta corre aunque falle la anterior: que Bandit se queje no
+        # debe esconder una dependencia vulnerable ni un secreto
+        if: ${{ !cancelled() }}
+        run: |
+          # Para aceptar una vulnerabilidad concreta (sin arreglo instalable, por
+          # ejemplo): `--ignore-vuln <ID>` en las dos llamadas, con el motivo aquí.
+          # El informe JSON lo decide la puerta; el markdown es para leerlo en el log.
+          # pip-audit sale con 1 si encuentra algo: quien decide es la puerta, que
+          # también falla (con 2) si el informe no llega a escribirse
+          pip-audit --format json --output pip-audit-report.json || true
+          pip-audit --format markdown || true
+          # Cualquier identificador con arreglo bloquea (PYSEC, GHSA, CVE...): hasta el
+          # 30 sep 2026 solo contaba «CVE*» y dejaba pasar casi todo
+          python .github/scripts/pip_audit_gate.py pip-audit-report.json
+
+      # La config de gitleaks tiene que detectar algo: hasta el 16 nov 2026 no cargaba
+      # ninguna regla y el escaneo de abajo pasaba siempre (INF-01). Mismo gitleaks que
+      # usa la acción, descargado con su sha256 de la release.
+      - name: Gitleaks self-test
+        id: gitleaks-self-test
+        if: ${{ !cancelled() }}
+        env:
+          GITLEAKS_VERSION: 8.24.3
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          PATH="$RUNNER_TEMP/gitleaks:$PATH" bash .github/scripts/gitleaks_self_test.sh
+
+      # Todo el historial, no solo los commits de la PR (INF-R3-02, auditoría del 18 nov
+      # 2026: había una clave de Mailgun en commits viejos que nadie volvió a mirar). Con
+      # el binario que acaba de pasar la autoprueba. Lo ya revisado y sin valor está en
+      # .gitleaksignore, huella a huella. Bloquea: un secreto nuevo no entra
+      - name: Check for Secrets with Gitleaks
+        id: gitleaks
+        if: ${{ !cancelled() && steps.gitleaks-self-test.outcome == 'success' }}
+        run: |
+          # --log-opts: todo el historial y TAMBIÉN el cambio que mete cada merge (un
+          # secreto puesto al resolver un conflicto no está en ninguno de los padres; sin
+          # --diff-merges git log no saca parche de los merges). --verbose: commit,
+          # fichero, línea y regla de cada hallazgo, con el valor tapado (--redact)
+          "$RUNNER_TEMP/gitleaks/gitleaks" git . --config .gitleaks.toml \
+            --log-opts="--full-history --all --diff-merges=first-parent" \
+            --no-banner --redact --verbose --exit-code 1
+
+      - name: Upload Security Reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            pip-audit-report.json
+          retention-days: 30
+
+      # Tarjeta en el resumen de la ejecución, con los números de las tres herramientas
+      - name: Summary card
+        if: always()
+        env:
+          BANDIT_OUTCOME: ${{ steps.bandit.outcome }}
+          AUDIT_OUTCOME: ${{ steps.pip-audit-check.outcome }}
+          AUDIT_TOTAL: ${{ steps.pip-audit-check.outputs.total_vulnerabilities }}
+          AUDIT_FIXABLE: ${{ steps.pip-audit-check.outputs.fixable_vulnerabilities }}
+          AUDIT_UNFIXABLE: ${{ steps.pip-audit-check.outputs.unfixable_vulnerabilities }}
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+        run: |
+          if [ "$BANDIT_OUTCOME" = skipped ] || [ -z "$BANDIT_OUTCOME" ]; then
+            BANDIT="Bandit did not run"
+          elif N=$(jq -e '.results | length' bandit-report.json 2>/dev/null); then
+            BANDIT="Bandit: $N issue(s)"
+          else
+            BANDIT="Bandit: no readable report, see the step log"
+          fi
+          if [ -n "$AUDIT_TOTAL" ]; then
+            AUDIT="pip-audit: $AUDIT_TOTAL known vulnerabilities ($AUDIT_FIXABLE with a fix, blocking; $AUDIT_UNFIXABLE without a fix, warning only)"
+          elif [ "$AUDIT_OUTCOME" = skipped ] || [ -z "$AUDIT_OUTCOME" ]; then
+            AUDIT="pip-audit did not run"
+          else
+            AUDIT="pip-audit: no readable report, see the step log"
+          fi
+          case "$GITLEAKS_OUTCOME" in
+            success) LEAKS="Gitleaks: no secrets found" ;;
+            failure) LEAKS="Gitleaks: a secret was found or the scan failed, see its step" ;;
+            *) LEAKS="Gitleaks did not run" ;;
+          esac
+          python3 .github/scripts/summary_card.py \
+            --title '🔒 Security Checks' \
+            --what 'Bandit looks for insecure Python patterns in src/, pip-audit for installed dependencies with known vulnerabilities, and Gitleaks for secrets committed to git.' \
+            --status "${{ job.status }}" \
+            --result "$BANDIT · $AUDIT · $LEAKS" \
+            --if-fails 'Open the failing tool step. Bandit: fix it or add "# nosec <id> - reason" on the line. pip-audit: upgrade the package to the fixed version. Gitleaks (its step lists commit, file, line and rule): rotate the secret first; if the commit is only in your branch, remove it from those commits; if it is already in shared history, the scan keeps seeing it, so after rotating add its exact fingerprint to .gitleaksignore. Reports are in the security-reports artifact.' || true
+
+  # ================================
+  # JOB 5: LINTING
+  # ================================
+  # Verifica calidad de código con Ruff
+
+  linting:
+    name: 📝 Lint & format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Restore pip cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt', 'requirements*.lock') }}
+
+      - name: Install Dependencies
+        run: |
+          # Lo mismo que la imagen y, encima, las herramientas de desarrollo (INF-05)
+          bash .github/scripts/instalar_dependencias.sh --dev
+
+      - name: Run Ruff Linter
+        id: lint
+        run: |
+          # pipefail: sin él, el tee se comería el código de salida de ruff
+          set -o pipefail
+          echo "🔍 Running Ruff linter..."
+          ruff check src/ tests/ --output-format=github 2>&1 | tee "$RUNNER_TEMP/ruff-check.txt"
+
+      - name: Run Ruff Formatter Check
+        id: format
+        run: |
+          set -o pipefail
+          echo "📝 Checking code formatting..."
+          ruff format --check src/ tests/ 2>&1 | tee "$RUNNER_TEMP/ruff-format.txt"
+
+      # Tarjeta en el resumen de la ejecución: qué hace el job y qué ha salido
+      - name: Summary card
+        if: always()
+        env:
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          FORMAT_OUTCOME: ${{ steps.format.outcome }}
+        run: |
+          if [ ! -f "$RUNNER_TEMP/ruff-check.txt" ]; then
+            CHECK="ruff check did not run"
+          else
+            N=$(grep -c '^::error' "$RUNNER_TEMP/ruff-check.txt" || true)
+            if [ "$LINT_OUTCOME" = failure ] && [ "$N" = 0 ]; then
+              CHECK="ruff check failed without listing findings, see the step log"
+            else
+              CHECK="ruff check: $N finding(s)"
+            fi
+          fi
+          LINE=$(grep -E '[0-9]+ files? (already formatted|would be reformatted)' "$RUNNER_TEMP/ruff-format.txt" 2>/dev/null | tail -n 1 || true)
+          if [ -n "$LINE" ]; then
+            FORMAT="ruff format: $LINE"
+          elif [ "$FORMAT_OUTCOME" = skipped ] || [ -z "$FORMAT_OUTCOME" ]; then
+            FORMAT="ruff format did not run (the lint step failed first)"
+          else
+            FORMAT="ruff format: could not read its summary, see the step log"
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title '📝 Lint & format' \
+            --what 'Ruff checks src/ and tests/ against the lint rules in ruff.toml and that every file is already formatted. Both block the merge.' \
+            --status "${{ job.status }}" \
+            --result "$CHECK · $FORMAT" \
+            --if-fails 'The findings are annotated on the diff. Fix locally with: ruff check src/ tests/ --fix && ruff format src/ tests/' || true
+
+  # ================================
+  # JOB 6: TYPE CHECKING
+  # ================================
+  # Verifica consistencia de tipos con Mypy
+
+  type_checking:
+    name: 🔬 Types (mypy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Restore pip cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt', 'requirements*.lock') }}
+
+      - name: Install Dependencies
+        run: |
+          # Lo mismo que la imagen y, encima, las herramientas de desarrollo (INF-05)
+          bash .github/scripts/instalar_dependencias.sh --dev
+
+      - name: Run Mypy Type Checker
+        id: mypy
+        run: |
+          set -o pipefail
+          echo "🔬 Running Mypy type checker..."
+          mypy src/ --show-error-codes --pretty 2>&1 | tee "$RUNNER_TEMP/mypy.txt"
+
+      # Tarjeta en el resumen de la ejecución: la última línea de mypy
+      - name: Summary card
+        if: always()
+        run: |
+          LINE=$(grep -E '^(Success: no issues found|Found [0-9]+ errors?) ' "$RUNNER_TEMP/mypy.txt" 2>/dev/null | tail -n 1 || true)
+          if [ -n "$LINE" ]; then
+            RESULT="${LINE#Success: }"
+          elif [ -f "$RUNNER_TEMP/mypy.txt" ]; then
+            RESULT="mypy did not print its summary line, see the step log"
+          else
+            RESULT="mypy did not run"
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title '🔬 Types (mypy)' \
+            --what 'mypy checks the type hints of src/ (settings in mypy.ini), so wrong types are caught before they reach production.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'The errors, with file, line and code, are in the "Run Mypy Type Checker" step log. Reproduce with: mypy src/' || true
+
+  # El día (UTC) para APT_REFRESH, calculado UNA vez para las tres entradas de build:
+  # la capa del apt-get upgrade se rehace una vez al día aunque la caché la tenga
+  # (INF-02), y las tres construyen la misma imagen aunque una arranque pasada la
+  # medianoche (Trivy escanea la misma que guarda el build)
+  apt_refresh:
+    name: 📅 OS packages refresh key
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      day: ${{ steps.dia.outputs.day }}
+    steps:
+      - name: Today (UTC)
+        id: dia
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+  # ================================
+  # JOB 7: BUILD & CONTAINER SCAN
+  # ================================
+  # Tres comprobaciones de la imagen, cada una en su caja del gráfico (1 oct 2026):
+  # el build (con las migraciones en offline y el artefacto), el arranque como en
+  # Render y Trivy. Cada entrada construye su imagen a la vez, leyendo la caché de
+  # capas (gha) de la ejecución ANTERIOR: si cambian el Dockerfile o los
+  # requirements, las tres construyen desde cero.
+  # Solo ejecuta si: unit_tests + integration_tests + security_tests = success
+  # Trivy: Escanea vulnerabilidades en imagen Docker (OS + Python packages)
+
+  build:
+    name: ${{ matrix.nombre }}
+    strategy:
+      # Las tres a la vez y hasta el final: un fallo de Trivy no esconde si arranca
+      fail-fast: false
+      matrix:
+        include:
+          - comprobacion: build
+            nombre: 🐳 Docker build
+          - comprobacion: render
+            nombre: 🚀 Deploy like Render
+          - comprobacion: trivy
+            nombre: 🔍 Trivy
+    runs-on: ubuntu-24.04
+    # Columna 2 del gráfico: espera a la de análisis estático (30 sep 2026). Si algo
+    # de la columna 1 FALLA, esta se salta: no se gastan minutos de tests en una PR
+    # que no se puede mergear. Es seguro porque TODO lo de la columna 1 es check
+    # obligatorio en develop y main, y su fallo ya bloquea el merge. Ojo: al ser una
+    # matriz, si se salta no se despliega y sus tres checks se quedan «esperando»
+    # (no cuentan como aprobados). Lo que solo se salta (API contract o Dependency
+    # Review en un push) no cuenta como fallo.
+    needs: [linting, type_checking, architecture, api_contract, owasp_semgrep, security_checks, dependency_review, gpg_verification, apt_refresh]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write  # Subida del SARIF de Trivy
+    # La BD de verdad para arrancar como en Render (entrada «Deploy like Render»).
+    # Solo esa entrada la necesita; con image vacía GitHub no levanta el servicio
+    services:
+      postgres:
+        image: ${{ matrix.comprobacion == 'render' && 'postgres:15' || '' }}
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - name: Build Docker Image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: false
+          load: true
+          tags: comebackgolf:${{ github.sha }}
+          build-args: |
+            APT_REFRESH=${{ needs.apt_refresh.outputs.day }}
+          cache-from: type=gha
+          # Escribe la caché solo el build; las otras dos la leen
+          cache-to: ${{ matrix.comprobacion == 'build' && 'type=gha,mode=max' || '' }}
+
+      - name: Validate Alembic Migrations Syntax
+        id: alembic_sql
+        if: matrix.comprobacion == 'build'
+        run: |
+          echo "🔍 Validating Alembic migrations syntax (dry-run)..."
+
+          # Override entrypoint to run only Alembic (skip migrations execution)
+          docker run --rm \
+            --entrypoint alembic \
+            -e DATABASE_URL=postgresql+psycopg2://dummy:dummy@dummy:5432/dummy \
+            comebackgolf:${{ github.sha }} \
+            upgrade head --sql > alembic-output.sql
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Alembic migrations syntax is valid"
+            echo "📄 Generated SQL (first 20 lines):"
+            head -20 alembic-output.sql
+          else
+            echo "❌ Alembic migrations have syntax errors"
+            exit 1
+          fi
+
+      # El camino de Render, de principio a fin: entrypoint.sh → alembic upgrade
+      # head contra una BD real con una URL SIN driver → uvicorn → /health con la
+      # versión. El paso anterior lo saltaba (--entrypoint uvicorn, URL +asyncpg) y
+      # la v2.23.0 cayó en Render con todo esto en verde (hotfix 2.23.1). Ver
+      # .github/scripts/start-like-render.sh
+      - name: Start like Render
+        id: render
+        if: matrix.comprobacion == 'render'
+        run: |
+          VERSION=$(python3 -c 'import runpy; print(runpy.run_path("src/config/version.py")["APP_VERSION"])')
+          RED=host bash .github/scripts/start-like-render.sh "comebackgolf:${{ github.sha }}" \
+            "postgresql://test_user:test_password@localhost:5432/test_db" "$VERSION"
+
+      - name: Run Trivy Container Security Scan
+        if: matrix.comprobacion == 'trivy'
+        id: trivy_scan
+        # Fijada por commit: una etiqueta de esta acción ya se ha secuestrado antes
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        # Solo informa (pestaña Security); la puerta es el paso de abajo
+        continue-on-error: true
+        with:
+          image-ref: 'comebackgolf:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0'
+          trivyignores: '.trivyignore.yaml'  # las aceptadas, acotadas por purl (INF-02)
+
+      - name: Upload Trivy Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        if: matrix.comprobacion == 'trivy' && steps.trivy_scan.outcome == 'success' && hashFiles('trivy-results.sarif') != ''
+        with:
+          sarif_file: 'trivy-results.sarif'
+          # Categoría fija: sin ella GitHub la deriva del job y de los valores de
+          # la matriz, y cada cambio de matriz o de nombre deja una configuración
+          # vieja que avisa en cada PR de «configuration not found» (pasó con
+          # #457). Las viejas hay que borrarlas a mano en Security → Tool status
+          # → Trivy, DESPUÉS de que trivy-image haya subido en esa rama (en main,
+          # tras la siguiente release); antes, sus alertas se cerrarían y se
+          # volverían a abrir
+          category: trivy-image
+
+      - name: Trivy gate (HIGH or CRITICAL with a fix)
+        id: trivy_gate
+        if: matrix.comprobacion == 'trivy'
+        # Bloquea las HIGH y CRITICAL que ya tienen arreglo (INF-02, 16 nov 2026; antes
+        # solo las CRITICAL, y zlib1g y apt con HIGH arreglados pasaban). Las que no lo
+        # tienen no se pueden arreglar subiendo nada: siguen en el SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: 'comebackgolf:${{ github.sha }}'
+          format: 'table'
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: true
+          # Solo vulnerabilidades: un «secreto» de Trivy en site-packages no debe
+          # tumbar el build (los secretos del repo los vigila Gitleaks). Para
+          # aceptar una vulnerabilidad concreta, en .trivyignore.yaml con purl, motivo y caducidad
+          scanners: 'vuln'
+          exit-code: '1'
+          trivyignores: '.trivyignore.yaml'
+
+      - name: Save Docker Image (artifact)
+        if: matrix.comprobacion == 'build'
+        run: |
+          echo "💾 Saving Docker image as artifact..."
+          docker save comebackgolf:${{ github.sha }} | gzip > comebackgolf-image.tar.gz
+
+      - name: Upload Docker Image Artifact
+        id: image_artifact
+        if: matrix.comprobacion == 'build'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: docker-image
+          path: comebackgolf-image.tar.gz
+          retention-days: 7
+
+      # Una tarjeta por entrada de la matriz, en el resumen de la ejecución
+      - name: Summary card
+        if: always()
+        env:
+          COMPROBACION: ${{ matrix.comprobacion }}
+          NOMBRE: ${{ matrix.nombre }}
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+          ALEMBIC_OUTCOME: ${{ steps.alembic_sql.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.image_artifact.outcome }}
+          RENDER_OUTCOME: ${{ steps.render.outcome }}
+          RENDER_SECONDS: ${{ steps.render.outputs.segundos }}
+          RENDER_VERSION: ${{ steps.render.outputs.version }}
+          SCAN_OUTCOME: ${{ steps.trivy_scan.outcome }}
+          GATE_OUTCOME: ${{ steps.trivy_gate.outcome }}
+        run: |
+          if [ "$IMAGE_OUTCOME" != success ]; then
+            RESULT="The image was not built, see the \"Build Docker Image\" step"
+          else
+            case "$COMPROBACION" in
+              build)
+                RESULT="Image comebackgolf:${GITHUB_SHA:0:7} built"
+                if [ "$ALEMBIC_OUTCOME" = success ] && [ -f alembic-output.sql ]; then
+                  RESULT="$RESULT · offline migration SQL generated ($(wc -l < alembic-output.sql | tr -d ' ') lines)"
+                else
+                  RESULT="$RESULT · offline migration SQL not generated, see the \"Validate Alembic Migrations Syntax\" step"
+                fi
+                if [ "$ARTIFACT_OUTCOME" = success ]; then RESULT="$RESULT · saved as the docker-image artifact"; fi
+                ;;
+              render)
+                if [ "$RENDER_OUTCOME" = success ] && [ -n "$RENDER_SECONDS" ]; then
+                  RESULT="Migrations ran, /health answered in ${RENDER_SECONDS} s with version ${RENDER_VERSION}"
+                elif [ "$RENDER_OUTCOME" = success ]; then
+                  RESULT="Migrations ran and /health answered with the expected version (timing not reported, see the step log)"
+                else
+                  RESULT="The container did not start, or /health did not answer with the expected version"
+                fi
+                ;;
+              trivy)
+                COUNTS=$(python3 .github/scripts/ci_results.py trivy trivy-results.sarif || true)
+                case "$COUNTS" in
+                  [0-9]*) RESULT="Reported to the Security tab: $COUNTS" ;;
+                  *) RESULT="${COUNTS:-No readable Trivy SARIF, see the step log}" ;;
+                esac
+                case "$GATE_OUTCOME" in
+                  success) RESULT="$RESULT · gate passed: no HIGH or CRITICAL vulnerability with a fix" ;;
+                  failure) RESULT="$RESULT · gate FAILED: a HIGH or CRITICAL vulnerability has a fix, or the scan could not run (e.g. its database download), see the step log" ;;
+                  *) RESULT="$RESULT · gate did not run" ;;
+                esac
+                ;;
+            esac
+          fi
+          case "$COMPROBACION" in
+            render)
+              WHAT='Starts the image exactly like Render: entrypoint.sh, alembic upgrade head against a real PostgreSQL with a driverless URL, then uvicorn, and waits for /health to report the expected version.'
+              IF_FAILS='The container log is printed in the "Start like Render" step. Reproduce locally with .github/scripts/start-like-render.sh' ;;
+            trivy)
+              WHAT='Trivy scans the image (OS and Python packages) for HIGH and CRITICAL vulnerabilities; findings go to the Security tab, and a HIGH or CRITICAL one that already has a fix blocks.'
+              IF_FAILS='The fixable HIGH/CRITICAL vulnerabilities are listed in the "Trivy gate" step: upgrade the base image or the package, or accept one in .trivyignore.yaml (purl, reason, expiry).' ;;
+            *)
+              WHAT='Builds the production image from docker/Dockerfile, generates the migration SQL offline (alembic upgrade head --sql) and keeps the image as the docker-image artifact.'
+              IF_FAILS='See the failing step: the Dockerfile or requirements for the build, a migration for the offline SQL. Reproduce with: docker build -f docker/Dockerfile .' ;;
+          esac
+          if [ "$IMAGE_OUTCOME" != success ]; then
+            IF_FAILS='The build error is in the "Build Docker Image" step: check docker/Dockerfile and the requirements. Reproduce with: docker build -f docker/Dockerfile .'
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title "$NOMBRE" \
+            --what "$WHAT" \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails "$IF_FAILS" || true
+
+  # ================================
+  # JOB 8: DEPENDENCY REVIEW
+  # ================================
+  # Sustituye a Snyk (cuota agotada desde hace meses). Solo en PRs: falla si la PR
+  # añade o sube una dependencia con una vulnerabilidad conocida, moderada o más,
+  # o con una licencia vetada (Snyk también revisaba licencias).
+  # Lo que ya está en develop lo vigilan pip-audit (Security Checks) y Dependabot;
+  # el código, CodeQL.
+
+  dependency_review:
+    name: 🔎 Dependency Review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Review dependency changes
+        id: review
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec  # v5.0.1
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: never
+          # Lista de PERMITIDAS, no de prohibidas: con deny-licenses (obsoleta) una
+          # expresión compuesta como "GPL-3.0 AND GPL-3.0-only" pasaba sin aviso
+          # (probado el 28 sep con una PR de prueba). Fuera quedan la GPL y la AGPL:
+          # la AGPL obligaría a publicar el código del servicio. La LGPL se admite
+          # porque psycopg2 es LGPL-3.0 y usarla desde un servidor no obliga a nada
+          # (el frontend sí veta la LGPL-3.0: su código se distribuye al navegador).
+          # Solo mira las dependencias de runtime que la PR añade o cambia; una
+          # licencia desconocida (NOASSERTION) se informa pero no falla.
+          allow-licenses: >-
+            MIT, MIT-CMU, MIT-0, Apache-2.0, BSD-2-Clause, BSD-3-Clause, 0BSD, ISC,
+            PSF-2.0, Python-2.0, CNRI-Python, MPL-2.0, Unlicense, CC0-1.0, Zlib, HPND,
+            BlueOak-1.0.0, LGPL-2.0-only, LGPL-2.0-or-later, LGPL-2.1-only,
+            LGPL-2.1-or-later, LGPL-3.0-only, LGPL-3.0-or-later
+          # Excepciones, paquete a paquete y con su motivo (una licencia de GitHub que
+          # no coincide con la del paquete instalado):
+          # - secure: GitHub registra CC-BY-SA-2.5/4.0 AND MIT, por textos del repo;
+          #   el paquete que se instala declara MIT (License-Expression y su fichero
+          #   LICENSE; deps.dev también dice MIT). Comprobado el 30 sep 2026, #441.
+          # - typing-extensions: GitHub registra «Python-2.0 AND GPL-1.0-or-later AND
+          #   BSD-3-Clause AND 0BSD», por la historia de la licencia de Python que copia
+          #   su LICENSE; el paquete declara PSF-2.0 (License-Expression de la 4.16.0) y
+          #   deps.dev también. Salió al enviar el SBOM desde main (2.70.0). 16 nov 2026.
+          allow-dependencies-licenses: pkg:pypi/secure, pkg:pypi/typing-extensions
+
+      # Tarjeta en el resumen de la ejecución (solo en PRs: en un push el job se salta)
+      - name: Summary card
+        if: always()
+        env:
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          CHANGES: ${{ steps.review.outputs.dependency-changes }}
+          VULNERABLE: ${{ steps.review.outputs.vulnerable-changes }}
+          LICENSES: ${{ steps.review.outputs.invalid-license-changes }}
+        run: |
+          contar() { printf '%s' "$1" | jq -e 'if type == "array" then length else error end' 2>/dev/null; }
+          # invalid-license-changes es un objeto {forbidden, unresolved, unlicensed}
+          contar_licencias() { printf '%s' "$1" | jq -e 'if type == "array" then length elif type == "object" then ([.[] | arrays | length] | add // 0) else error end' 2>/dev/null; }
+          if N=$(contar "$CHANGES"); then REVIEWED="$N dependency change(s) reviewed"; else REVIEWED="number of changes not reported"; fi
+          case "$REVIEW_OUTCOME" in
+            success) RESULT="Passed: no changed dependency with a moderate or worse vulnerability or a license outside the allow-list ($REVIEWED)" ;;
+            failure)
+              if V=$(contar "$VULNERABLE") && L=$(contar_licencias "$LICENSES"); then
+                RESULT="Failed: $V vulnerable change(s), $L with a license outside the allow-list ($REVIEWED)"
+              else
+                RESULT="Failed, see the step log for the dependency and the reason"
+              fi ;;
+            *) RESULT="The review did not run" ;;
+          esac
+          python3 .github/scripts/summary_card.py \
+            --title '🔎 Dependency Review' \
+            --what 'On pull requests, checks every dependency the PR adds or changes for known vulnerabilities (moderate or worse) and for licenses outside the allow-list.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'Use a version without the vulnerability, or another package if the license is not allowed. Exceptions go in allow-dependencies-licenses with the reason.' || true
+
+  # ================================
+  # JOB 9: SBOM GENERATION
+  # ================================
+  # Genera Software Bill of Materials (SBOM) en formato CycloneDX
+  # Cumple con OWASP A08:2021 Software and Data Integrity Failures
+  # Ejecuta solo en main/develop para evitar overhead en feature branches
+
+  sbom_generation:
+    name: 📦 SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Solo lectura: el envío al grafo de dependencias, que necesita escribir, va en
+    # sbom_submission, otra máquina que no instala ni ejecuta nada de aquí (INF-04)
+    permissions:
+      contents: read
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || contains(github.ref, 'release/')
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          # La versión a la que pasa la imagen de producción (#423). Y la de
+          # .github/sbom-tools.lock: compilado con 3.14, en 3.12 le faltaría
+          # typing-extensions y --require-hashes no instalaría
+          python-version: '3.14'
+
+      # Solo el generador, desde su lock con hashes (también sus dependencias): lee
+      # requirements.lock sin instalar lo que lista (INF-04)
+      - name: Install SBOM generator
+        run: pip install --require-hashes -r .github/sbom-tools.lock
+
+      - name: Generate SBOM (CycloneDX JSON)
+        run: |
+          echo "📦 Generating SBOM in CycloneDX format..."
+          mkdir -p sbom
+
+          cyclonedx-py requirements requirements.lock -o sbom/sbom.json
+
+      - name: Generate SBOM Metadata
+        run: |
+          COMPONENT_COUNT=$(jq '.components | length' sbom/sbom.json)
+          SBOM_SHA256=$(sha256sum sbom/sbom.json | awk '{print $1}')
+
+          cat > sbom/sbom-metadata.txt << EOF
+          SBOM Metadata
+          =============
+          Generated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Format: CycloneDX 1.6 (JSON)
+          Source: requirements.lock
+          Tool: cyclonedx-py
+          Project: Comeback Golf API
+          Version: 2.0.0
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+
+          Statistics:
+          - Components: $COMPONENT_COUNT
+          - SHA256: $SBOM_SHA256
+
+          OWASP Compliance:
+          - A08:2021 Software and Data Integrity Failures
+          - NIST SP 800-161r1 (Supply Chain Risk Management)
+          EOF
+
+      - name: Validate SBOM
+        run: |
+          echo "🔍 Validating SBOM structure..."
+
+          # Check if SBOM is valid JSON
+          jq empty sbom/sbom.json
+
+          # Check required fields
+          SPEC_VERSION=$(jq -r '.specVersion' sbom/sbom.json)
+          SERIAL_NUMBER=$(jq -r '.serialNumber' sbom/sbom.json)
+
+          echo "✅ SBOM validation passed"
+          echo "   Spec version: $SPEC_VERSION"
+          echo "   Serial number: $SERIAL_NUMBER"
+
+      - name: Generate SBOM Summary
+        run: |
+          echo "=========================================="
+          echo "📦 SBOM GENERATION SUMMARY"
+          echo "=========================================="
+          echo ""
+
+          COMPONENT_COUNT=$(jq '.components | length' sbom/sbom.json)
+          DIRECT_DEPS=$(grep -E -c "^[[:alnum:]._-]+[[:space:]]*==" requirements.txt || echo "0")
+          TRANSITIVE_DEPS=$((COMPONENT_COUNT - DIRECT_DEPS))
+
+          echo "📊 Statistics:"
+          echo "   Total components: $COMPONENT_COUNT"
+          echo "   Direct dependencies: $DIRECT_DEPS"
+          echo "   Transitive dependencies: $TRANSITIVE_DEPS"
+          echo ""
+          echo "📄 Files generated:"
+          echo "   - sbom/sbom.json ($(wc -l < sbom/sbom.json) lines)"
+          echo "   - sbom/sbom-metadata.txt"
+          echo ""
+          echo "🔒 Security:"
+          echo "   - Full supply chain visibility"
+          echo "   - Vulnerability tracking enabled"
+          echo "   - OWASP A08:2021 compliance"
+          echo ""
+          echo "=========================================="
+
+      - name: Upload SBOM as Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: sbom-cyclonedx
+          path: |
+            sbom/sbom.json
+            sbom/sbom-metadata.txt
+          retention-days: 90
+
+      # Tarjeta en el resumen de la ejecución: cuántos componentes lleva el SBOM
+      - name: Summary card
+        if: always()
+        run: |
+          if N=$(jq -e '(.components // error("sin components")) | length' sbom/sbom.json 2>/dev/null); then
+            RESULT="CycloneDX SBOM with $N components, kept 90 days as the sbom-cyclonedx artifact"
+          else
+            RESULT="No readable SBOM was generated, see the step log"
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title '📦 SBOM' \
+            --what 'Lists every runtime dependency (direct and transitive) as a CycloneDX SBOM, for supply-chain audits. Informational: it does not block the pipeline.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'See the failing step; the most common cause is a requirements.lock line cyclonedx-py cannot parse.' || true
+
+  # El envío del SBOM al grafo de dependencias de GitHub, en una máquina aparte: es el
+  # único job con permiso de escritura y no instala ni ejecuta nada del que lo genera.
+  # Si compartieran job, una dependencia comprometida del generador podría dejar algo
+  # en $GITHUB_ENV, $GITHUB_PATH o el checkout y correr con el token (INF-04)
+  sbom_submission:
+    name: 📦 SBOM submission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [sbom_generation]
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write  # La API REST del grafo de dependencias
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false  # el token va por env al envío; git no lo necesita
+
+      - name: Download SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: sbom-cyclonedx
+          path: sbom
+
+      - name: Submit SBOM to GitHub Dependency Graph
+        id: submit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/submit-sbom-to-github.sh \
+            sbom/sbom.json \
+            ${{ github.repository_owner }} \
+            ${{ github.event.repository.name }} \
+            ${{ github.sha }} \
+            ${{ github.ref }}
+
+      - name: Summary card
+        if: always()
+        env:
+          SUBMIT_OUTCOME: ${{ steps.submit.outcome }}
+        run: |
+          case "$SUBMIT_OUTCOME" in
+            success) RESULT="Submitted to the GitHub dependency graph as requirements.lock" ;;
+            failure) RESULT="Submission to the dependency graph FAILED, see the step log" ;;
+            *) RESULT="The submission did not run" ;;
+          esac
+          python3 .github/scripts/summary_card.py \
+            --title '📦 SBOM submission' \
+            --what 'Sends the SBOM of main to the GitHub dependency graph, so Dependabot alerts cover every shipped package. The only job with write access, and it runs no installed tool.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'See the submit step: usually a token or API error; the SBOM itself is in the sbom-cyclonedx artifact.' || true
+
+  # ================================
+  # JOB 10: GPG SIGNATURE VERIFICATION
+  # ================================
+  # Verifica que todos los commits estén firmados con GPG
+  # Cumple con OWASP A08:2021 Software and Data Integrity Failures
+  # Ejecuta en todos los pushes y PRs (security critical)
+
+  gpg_verification:
+    name: 🔏 Signed commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # Fetch full history for commit range verification
+
+      - name: Import GPG Public Key
+        env:
+          GPG_PUBLIC_KEY: ${{ secrets.GPG_PUBLIC_KEY }}
+        run: |
+          echo "🔑 Checking GPG public key availability..."
+
+          if [ -n "$GPG_PUBLIC_KEY" ]; then
+            echo "✅ GPG_PUBLIC_KEY found, importing..."
+            echo "$GPG_PUBLIC_KEY" | gpg --import --batch --yes
+          else
+            echo "⚠️  GPG_PUBLIC_KEY not available (forked PR or missing secret)"
+            echo "   Verification will use system keyring only"
+          fi
+
+          echo ""
+          echo "📋 Available GPG keys:"
+          gpg --list-keys
+
+      - name: Verify Commit Signatures
+        id: verify
+        env:
+          PR_BASE: ${{ github.base_ref }}  # Empty on push events
+          # Merge and GitHub web-flow commits are checked against GitHub's verification
+          # (audit phase 6, INF-06); reading commits only needs the default read token
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🔍 Verifying GPG signatures on commits..."
+          chmod +x scripts/verify-gpg-signatures.sh
+
+          # For PRs and pushes: verify ONLY commits in THIS specific push event
+          # NOT the entire PR history, NOT the entire branch history
+          BASE_REF="${{ github.event.before }}"
+          # In a PR, the head of the branch and never github.sha: on opened/reopened that
+          # is GitHub's temporary merge commit, which nobody signs (audit phase 6, INF-06)
+          HEAD_REF="${{ github.event.pull_request.head.sha || github.event.after || github.sha }}"
+
+          echo "📋 Signature Verification Scope: CURRENT PUSH ONLY"
+          echo "   Commits included: Those added in this specific push event"
+          echo "   Base (before push): $BASE_REF"
+          echo "   Head (after push): $HEAD_REF"
+
+          # Force push (rebase, amend): "before" is the rewritten commit, which no
+          # longer exists in this clone, and the script died with exit 128. Verify
+          # every commit the PR adds over its base branch instead: after a rebase
+          # all of them are new, not just the last one.
+          if [ -n "$BASE_REF" ] && [ "$BASE_REF" != "0000000000000000000000000000000000000000" ] \
+             && ! git cat-file -e "${BASE_REF}^{commit}" 2>/dev/null; then
+            echo "⚠️  Base $BASE_REF no longer exists (rewritten by a force push)"
+            if [ -n "$PR_BASE" ] && MERGE_BASE=$(git merge-base "origin/$PR_BASE" "$HEAD_REF" 2>/dev/null); then
+              echo "   Verifying every commit since the merge-base with $PR_BASE: $MERGE_BASE"
+              BASE_REF="$MERGE_BASE"
+            else
+              BASE_REF=""  # Falls through to the initial-push handling below
+            fi
+          fi
+
+          # A PR just opened or reopened has no "before": every commit it adds over
+          # its base branch, from their merge-base
+          if [ -n "$PR_BASE" ] && { [ -z "$BASE_REF" ] || [ "$BASE_REF" == "0000000000000000000000000000000000000000" ]; } \
+             && MERGE_BASE=$(git merge-base "origin/$PR_BASE" "$HEAD_REF" 2>/dev/null); then
+            echo "   PR opened or reopened: every commit since the merge-base with $PR_BASE: $MERGE_BASE"
+            BASE_REF="$MERGE_BASE"
+          fi
+
+          # Handle initial push or forced push (no previous commit)
+          if [ "$BASE_REF" == "0000000000000000000000000000000000000000" ] || [ -z "$BASE_REF" ]; then
+            echo "⚠️  Initial/forced push detected"
+            # Check if HEAD_REF has a parent commit
+            if git rev-parse --verify "${HEAD_REF}^" &>/dev/null; then
+              echo "   Verifying only HEAD commit: $HEAD_REF"
+              BASE_REF="$HEAD_REF~1"  # Verify only the last commit
+            else
+              echo "   HEAD_REF is the first commit (no parent)"
+              BASE_REF=""  # Empty BASE_REF means verify only HEAD_REF
+            fi
+          fi
+
+          # Run verification script (pipefail: el tee no debe tapar su código de salida)
+          set -o pipefail
+          ./scripts/verify-gpg-signatures.sh "$BASE_REF" "$HEAD_REF" | tee "$RUNNER_TEMP/gpg.txt"
+
+      # Tarjeta en el resumen de la ejecución, con las cuentas del script
+      - name: Summary card
+        if: always()
+        run: |
+          OUT="$RUNNER_TEMP/gpg.txt"
+          dato() { sed -n -E "s/^ *$1: ([0-9]+).*/\1/p" "$OUT" 2>/dev/null | head -n 1; }
+          TOTAL=$(dato 'Total commits'); VALID=$(dato 'Valid signatures'); MERGES=$(dato 'Merge commits \(verified by GitHub\)')
+          UNSIGNED=$(dato 'Unsigned commits'); INVALID=$(dato 'Invalid signatures')
+          # Anclado al mensaje del script, no a un asunto de commit que lo contenga
+          # (sin los códigos de color que imprime el script)
+          if sed 's/\x1b\[[0-9;]*m//g' "$OUT" 2>/dev/null | grep -qE '^[^[:alnum:]]*No new commits to verify$'; then
+            RESULT="No new commits to verify in this push or PR"
+          elif [ -n "$TOTAL" ] && [ -n "$VALID" ]; then
+            RESULT="$VALID of $TOTAL commit(s) verified (${MERGES:-0} merge commit(s), verified by GitHub)"
+            if [ "${UNSIGNED:-0}" != 0 ] || [ "${INVALID:-0}" != 0 ]; then
+              RESULT="$RESULT · ${UNSIGNED:-0} unsigned, ${INVALID:-0} with an invalid signature"
+            fi
+          else
+            RESULT="Could not read the verification counts, see the \"Verify Commit Signatures\" step"
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title '🔏 Signed commits' \
+            --what 'Checks that every commit added by this push or PR carries a valid GPG signature; main and develop reject unsigned commits.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'The unsigned commits are listed in the "Verify Commit Signatures" step. Sign them with: git rebase --exec "git commit --amend --no-edit -n -S" origin/develop, then force-push.' || true
+
+  # ================================
+  # ARQUITECTURA Y CONTRATO DE LA API
+  # ================================
+  # Antes en su propio workflow (architecture_and_api_contract.yml): aquí salen en el
+  # gráfico del pipeline y en su resumen. Ver .importlinter y la etiqueta api-breaking.
+
+  architecture:
+    name: 🏛️ Architecture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install import-linter
+        # Las versiones salen de requirements-dev.txt, para que local y CI no diverjan.
+        # grimp también, exacta: import-linter solo pide grimp>=X y pip cogería la última.
+        # Por fichero y -r, no por argumentos: un comentario al final de la línea no rompe
+        run: |
+          grep -E '^(import-linter|grimp)==' requirements-dev.txt > "$RUNNER_TEMP/arquitectura.txt"
+          [ "$(wc -l < "$RUNNER_TEMP/arquitectura.txt")" -eq 2 ] || { echo "::error::requirements-dev.txt needs exactly one import-linter== and one grimp== line"; exit 1; }
+          pip install -r "$RUNNER_TEMP/arquitectura.txt"
+
+      - name: Check architecture contracts
+        run: |
+          set -o pipefail
+          lint-imports 2>&1 | tee "$RUNNER_TEMP/lint-imports.txt"
+
+      # Tarjeta en el resumen de la ejecución: contratos que se cumplen y que no
+      - name: Summary card
+        if: always()
+        run: |
+          LINE=$(grep -E '^Contracts: [0-9]+ kept, [0-9]+ broken' "$RUNNER_TEMP/lint-imports.txt" 2>/dev/null | tail -n 1 || true)
+          if [ -n "$LINE" ]; then
+            RESULT=$(printf '%s' "$LINE" | sed -E 's/^Contracts: ([0-9]+) kept, ([0-9]+) broken.*/\1 contracts kept, \2 broken/')
+          else
+            RESULT="Could not read the contracts summary, see the step log"
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title '🏛️ Architecture' \
+            --what 'import-linter enforces the layer rules in .importlinter: the domain imports no framework, use cases never import infrastructure, and modules do not reach into each other.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'The broken contract and the offending import chain are in the "Check architecture contracts" step. Reproduce with: lint-imports' || true
+
+  api_contract:
+    name: 📜 API contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Solo en PRs: compara con la rama base (github.base_ref), que en un push no
+    # existe. Al moverlo aquí desde su workflow propio (#434), el push a develop
+    # fallaba con `fatal: invalid reference: origin/`.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read  # leer la etiqueta api-breaking en el momento
+    env:
+      OASDIFF_VERSION: '1.32.1'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # Hace falta la rama base para generar su OpenAPI
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.lock
+
+      - name: Install Dependencies
+        run: |
+          bash .github/scripts/instalar_dependencias.sh
+
+      - name: Install oasdiff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP"
+          gh release download "v${OASDIFF_VERSION}" -R oasdiff/oasdiff \
+            -p "oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" -p checksums.txt
+          grep "oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" checksums.txt | sha256sum -c -
+          tar xzf "oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" oasdiff
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Generate OpenAPI (this PR and its base)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          # Sin ENVIRONMENT la app cuenta como producción y pide FRONTEND_ORIGINS
+          # (auditoría de la fase 6, B-09); el esquema no depende del entorno
+          ENVIRONMENT: development
+        run: |
+          # La app genera su esquema sin base de datos ni secretos: en el CI no hay .env
+          GEN='import json; from main import app; json.dump(app.openapi(), open(__import__("sys").argv[1], "w"), sort_keys=True)'
+          python -c "$GEN" "$RUNNER_TEMP/revision.json"
+          # La base se genera con las dependencias de la PR. Si la base importa un
+          # paquete que la PR ha quitado, este paso falla: es un aviso, no un bug.
+          git worktree add --detach "$RUNNER_TEMP/base" "origin/${BASE_REF}"
+          (cd "$RUNNER_TEMP/base" && python -c "$GEN" "$RUNNER_TEMP/base.json")
+
+      - name: Check for breaking changes
+        id: oasdiff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set +e
+          oasdiff breaking "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/revision.json" --fail-on ERR > report.txt
+          CODE=$?
+          set -e
+          cat report.txt
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+          # El detalle va plegado debajo de la tarjeta del resumen (último paso)
+          {
+            echo "<details><summary>oasdiff: breaking changes and changelog</summary>"
+            echo ""
+            echo "Breaking changes:"
+            echo '```'
+            cat report.txt
+            echo '```'
+            echo ""
+            echo "Changelog (all changes, breaking or not):"
+            echo '```'
+            oasdiff changelog "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/revision.json" || true
+            echo '```'
+            echo "</details>"
+            echo ""
+          } > "$RUNNER_TEMP/api-contract-detail.md"
+
+          if [ "$CODE" -ne 0 ]; then
+            # Las etiquetas de AHORA, no las del evento: al relanzar el job tras
+            # poner la etiqueta, el evento sigue siendo el de antes. Solo se
+            # preguntan aquí, para que un fallo de la API no tumbe una PR sin
+            # cambios incompatibles; si falla, el paso falla (set -e)
+            ALLOW_BREAKING=$(gh pr view "$PR_NUMBER" -R "$GITHUB_REPOSITORY" --json labels \
+              --jq '[.labels[].name] | index("api-breaking") != null')
+            if [ "$ALLOW_BREAKING" = "true" ]; then
+              echo "accepted=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::Breaking API changes accepted by the 'api-breaking' label. Plan both deploys back to back."
+              exit 0
+            fi
+            echo "::error::Breaking API changes. If deliberate, add the 'api-breaking' label, re-run this job and plan the release (backend first, both deploys back to back)."
+            exit 1
+          fi
+
+      # Tarjeta en el resumen de la ejecución, con el detalle de oasdiff plegado debajo
+      - name: Summary card
+        if: always()
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          CODE: ${{ steps.oasdiff.outputs.code }}
+          ACCEPTED: ${{ steps.oasdiff.outputs.accepted }}
+        run: |
+          # Primera línea de oasdiff: «N changes: E error, W warning, I info»
+          COUNTS=$(grep -m 1 -E '^[0-9]+ changes: [0-9]+ error' report.txt 2>/dev/null || true)
+          COUNTS=${COUNTS:-"no change counts in the report, see the step log"}
+          if [ -z "$CODE" ]; then
+            RESULT="The comparison did not run (oasdiff could not be installed, or the OpenAPI of this PR or of $BASE_REF could not be generated), see the step log"
+          elif [ "$CODE" = 0 ]; then
+            if grep -qE '^[0-9]+ changes:' report.txt 2>/dev/null; then
+              RESULT="No breaking changes against $BASE_REF (oasdiff: $COUNTS)"
+            else
+              RESULT="No breaking changes against $BASE_REF"
+            fi
+          elif [ "$ACCEPTED" = true ]; then
+            RESULT="Breaking changes against $BASE_REF ($COUNTS), accepted by the api-breaking label: release the backend first and both deploys back to back"
+          else
+            RESULT="Breaking changes against $BASE_REF ($COUNTS)"
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title '📜 API contract' \
+            --what 'Compares the OpenAPI of this PR with the base branch (oasdiff) so a change that would break the deployed frontend cannot be merged by accident.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'For a deliberate breaking change, add the api-breaking label and re-run this job, then plan the release: backend first, both deploys back to back. If the comparison did not run, the base branch may import a package this PR removed (see "Generate OpenAPI").' || true
+          if [ -f "$RUNNER_TEMP/api-contract-detail.md" ]; then
+            cat "$RUNNER_TEMP/api-contract-detail.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # OWASP Top 10 con Semgrep (p/owasp-top-ten, p/python): SQL construido a mano con
+  # text(f"..."), shell=True, eval... Bloquea con cualquier aviso (el 30 sep 2026 el
+  # código estaba limpio) y sube el SARIF a la pestaña Security. Complementa a
+  # CodeQL y a Bandit.
+  owasp_semgrep:
+    name: 🛡️ OWASP (Semgrep)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write  # Subida del SARIF a la pestaña Security
+    env:
+      SEMGREP_VERSION: '1.178.0'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Semgrep
+        run: pip install "semgrep==${SEMGREP_VERSION}"
+
+      - name: Scan (OWASP Top 10, Python)
+        id: semgrep
+        run: |
+          set -o pipefail
+          # La regla de Django sobre cursor.execute se excluye: aquí todos los casos de
+          # uso se llaman con .execute(request...), y no hay Django. La inyección SQL
+          # real con SQLAlchemy (text() con f-strings) la cubre avoid-sqlalchemy-text.
+          semgrep scan \
+            --config p/owasp-top-ten --config p/python \
+            --exclude-rule python.django.security.injection.sql.sql-injection-using-db-cursor-execute.sql-injection-db-cursor-execute \
+            --metrics off --error \
+            --sarif-output=semgrep.sarif \
+            src main.py 2>&1 | tee "$RUNNER_TEMP/semgrep.txt"
+
+      - name: Upload results to the Security tab
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      # Tarjeta en el resumen de la ejecución: hallazgos del SARIF y alcance del escaneo
+      - name: Summary card
+        if: always()
+        run: |
+          if N=$(jq -e '[.runs[].results[]] | length' semgrep.sarif 2>/dev/null); then
+            RESULT="$N finding(s)"
+          else
+            RESULT="No readable SARIF, see the step log"
+          fi
+          # Semgrep cierra con «Ran R rules on F files: N findings.»
+          SCOPE=$(grep -m 1 -oE 'Ran [0-9]+ rules? on [0-9]+ files?' "$RUNNER_TEMP/semgrep.txt" 2>/dev/null || true)
+          if [ -n "$SCOPE" ]; then
+            RESULT="$RESULT · $(printf '%s' "$SCOPE" | sed -E 's/^Ran ([0-9]+) rules? on ([0-9]+) files?/\2 file(s) scanned with \1 rule(s)/')"
+          else
+            RESULT="$RESULT · scan scope not found in the log"
+          fi
+          python3 .github/scripts/summary_card.py \
+            --title '🛡️ OWASP (Semgrep)' \
+            --what 'Semgrep scans src/ and main.py with the OWASP Top 10 and Python rule sets (SQL built from strings, shell=True, eval...). Any finding blocks; findings also go to the Security tab.' \
+            --status "${{ job.status }}" \
+            --result "$RESULT" \
+            --if-fails 'Each finding, with rule, file and line, is in the "Scan (OWASP Top 10, Python)" step and in the Security tab. Fix the code; a false positive gets "# nosemgrep: <rule-id>" with the reason.' || true
+
+  # ================================
+  # JOB 11: SUMMARY
+  # ================================
+  # Job final que depende de todos los anteriores
+
+  pipeline_summary:
+    name: 📊 Summary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [unit_tests, integration_tests, security_tests, security_checks, linting, type_checking, build, dependency_review, sbom_generation, gpg_verification, architecture, api_contract, owasp_semgrep]
+    if: always()
+
+    steps:
+      - name: Generate Pipeline Summary
+        run: |
+          # Índice de la ejecución: veredicto, una fila por check y su estado. El
+          # detalle de cada uno está en su propia tarjeta (paso «Summary card»).
+          UNIT_TESTS="${{ needs.unit_tests.result }}"
+          INTEGRATION_TESTS="${{ needs.integration_tests.result }}"
+          SECURITY_TESTS="${{ needs.security_tests.result }}"
+          SECURITY_CHECKS="${{ needs.security_checks.result }}"
+          DEPENDENCY_REVIEW="${{ needs.dependency_review.result }}"
+          SBOM_GEN="${{ needs.sbom_generation.result }}"
+          GPG_VERIFY="${{ needs.gpg_verification.result }}"
+          LINTING="${{ needs.linting.result }}"
+          TYPE_CHECKING="${{ needs.type_checking.result }}"
+          BUILD="${{ needs.build.result }}"
+          ARCHITECTURE="${{ needs.architecture.result }}"
+          API_CONTRACT="${{ needs.api_contract.result }}"
+          OWASP="${{ needs.owasp_semgrep.result }}"
+
+          estado() {
+            case "$1" in
+              success) echo "✅ success" ;;
+              failure) echo "❌ failure" ;;
+              cancelled) echo "⏹️ cancelled" ;;
+              skipped) echo "⏭️ skipped" ;;
+              *) echo "❔ ${1:-unknown}" ;;
+            esac
+          }
+          # Todo lo obligatorio cuenta, y un cancelado no es un aprobado
+          no_paso() { [ "$1" == "failure" ] || [ "$1" == "cancelled" ]; }
+
+          # Checks que no pasaron: los obligatorios y el build (el SBOM es informativo)
+          FALLOS=0
+          for RESULTADO in "$UNIT_TESTS" "$INTEGRATION_TESTS" "$SECURITY_TESTS" "$GPG_VERIFY" "$ARCHITECTURE" "$API_CONTRACT" "$OWASP" "$LINTING" "$TYPE_CHECKING" "$SECURITY_CHECKS" "$DEPENDENCY_REVIEW" "$BUILD"; do
+            if no_paso "$RESULTADO"; then FALLOS=$((FALLOS + 1)); fi
+          done
+          # Tests y build solo se saltan si algo de la primera columna no pasó: sin
+          # ellos no hay nada que dar por bueno
+          if [ "$FALLOS" -gt 0 ]; then
+            if [ "$FALLOS" -eq 1 ]; then
+              VEREDICTO="## ❌ Pipeline failed — 1 check did not pass"
+            else
+              VEREDICTO="## ❌ Pipeline failed — $FALLOS checks did not pass"
+            fi
+            SALIDA=1
+          elif [ "$BUILD" == "skipped" ]; then
+            VEREDICTO="## ❌ Pipeline failed — tests and build did not run"
+            SALIDA=1
+          else
+            VEREDICTO="## ✅ Pipeline passed"
+            SALIDA=0
+          fi
+
+          {
+            echo "$VEREDICTO"
+            echo ""
+            echo "| Check | What it does | Status |"
+            echo "|-------|--------------|--------|"
+            echo "| 📝 Lint & format | Ruff lint rules and formatting of src/ and tests/ | $(estado "$LINTING") |"
+            echo "| 🔬 Types (mypy) | Static type checking of src/ | $(estado "$TYPE_CHECKING") |"
+            echo "| 🏛️ Architecture | Layer and module import rules (import-linter) | $(estado "$ARCHITECTURE") |"
+            echo "| 📜 API contract | No breaking OpenAPI change against the base branch unless labelled api-breaking (PRs only) | $(estado "$API_CONTRACT") |"
+            echo "| 🛡️ OWASP (Semgrep) | OWASP Top 10 and Python security rules on the code | $(estado "$OWASP") |"
+            echo "| 🔒 Security Checks | Bandit, pip-audit (vulnerable dependencies) and Gitleaks (secrets) | $(estado "$SECURITY_CHECKS") |"
+            echo "| 🔎 Dependency Review | Vulnerabilities and licenses of the dependencies a PR changes (PRs only) | $(estado "$DEPENDENCY_REVIEW") |"
+            echo "| 🔏 Signed commits | Every new commit has a valid GPG signature | $(estado "$GPG_VERIFY") |"
+            echo "| 🧪 Unit tests (3.12, 3.14) | Domain and use-case tests, with coverage | $(estado "$UNIT_TESTS") |"
+            echo "| 🗄️ Integration tests (3.12, 3.14) | API and repositories against a real PostgreSQL | $(estado "$INTEGRATION_TESTS") |"
+            echo "| 🔐 Security tests (3.12, 3.14) | CSRF, XSS, SQL injection, auth bypass and rate limiting | $(estado "$SECURITY_TESTS") |"
+            echo "| 🐳 Image: Docker build, Deploy like Render, Trivy | Builds the image, starts it like Render and scans it for vulnerabilities | $(estado "$BUILD") |"
+            echo "| 📦 SBOM | CycloneDX bill of materials (main, develop, release/*; informational, never blocks) | $(estado "$SBOM_GEN") |"
+            echo ""
+            if [ "$BUILD" == "skipped" ] && [ "$SALIDA" -eq 1 ]; then
+              echo "Tests and build are skipped while a first-column check does not pass; they run again once it does."
+              echo ""
+            fi
+            echo "Details for each check are in its own card on this page."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$SALIDA"
