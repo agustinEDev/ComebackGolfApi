@@ -1,42 +1,30 @@
-# 🚀 Runbook - ComebackGolfApi
+# 🚀 Runbook - Comeback Golf API
 
-## Deployment
+Operación del día a día: dónde corre cada cosa, cómo mirar su estado y qué hacer
+cuando algo falla.
 
-### Docker (Local)
+| Entorno | Dónde | Cómo se despliega |
+| --- | --- | --- |
+| **Producción** | Render (API en Docker + PostgreSQL 15), `https://api.comebackgolf.com` | Solo al mover `main`: Render construye `docker/Dockerfile` y arranca `entrypoint.sh` (comprueba la configuración de seguridad → `alembic upgrade head` → uvicorn) |
+| **Kind (local)** | Clúster Kubernetes local `comebackgolf-cluster`, namespace `comebackgolf` | `k8s/scripts/*.sh` (ver [k8s/README.md](../k8s/README.md)) |
+| **Docker Compose (local)** | `docker/docker-compose.yml`: `db`, `app`, `mailpit` | `docker compose` (ver [docker/README.md](../docker/README.md)) |
+
+---
+
+## Producción (Render)
+
+### ¿Qué versión está desplegada?
+
 ```bash
-# Setup
-docker-compose up -d
-docker-compose exec app alembic upgrade head
-
-# Rebuild
-docker-compose up -d --build app
-
-# Reset
-docker-compose down -v && docker-compose up -d
+curl -s https://api.comebackgolf.com/health
+# {"status":"ok","version":"2.82.0","commit":"<sha>","branch":"main","environment":"production"}
 ```
 
-### Kubernetes (Producción)
-```bash
-# Deploy completo
-./k8s/scripts/deploy-cluster.sh
+`version` sale de `src/config/version.py` y `commit`/`branch` de las variables que
+Render inyecta (`RENDER_GIT_COMMIT`, `RENDER_GIT_BRANCH`). Comparar el `commit` con el
+de la release es la forma de saber si el despliegue ya llegó.
 
-# Actualizar backend
-./k8s/scripts/deploy-api.sh [version]
-
-# Actualizar frontend
-./k8s/scripts/deploy-front.sh
-
-# Deploy DB + migraciones
-./k8s/scripts/deploy-db.sh
-
-# Estado del cluster
-./k8s/scripts/cluster-status.sh
-
-# Destruir cluster
-./k8s/scripts/destroy-cluster.sh
-```
-
-### Render: paquetes del sistema de la imagen al día (INF-02)
+### Paquetes del sistema de la imagen al día (INF-02)
 
 Render construye la imagen con su propia caché de capas y no pasa `APT_REFRESH` (el CI le
 pasa el día, Render nada): la capa del `apt-get upgrade` del Dockerfile se queda como la
@@ -48,223 +36,93 @@ servicio del backend cuando:
 
 Es el mismo despliegue de siempre, solo que sin caché: tarda unos minutos más.
 
-### Comandos kubectl Esenciales
+---
+
+## Kind (local)
+
 ```bash
-# Pods y estado
+./k8s/scripts/deploy-cluster.sh        # Crear el clúster y desplegarlo todo
+./k8s/scripts/deploy-api.sh [version]  # Reconstruir y desplegar el backend
+./k8s/scripts/deploy-front.sh [version]
+./k8s/scripts/deploy-db.sh [--force]   # PostgreSQL + migraciones
+./k8s/scripts/cluster-status.sh        # Estado del clúster
+./k8s/scripts/restart-cluster.sh
+./k8s/scripts/restore-db.sh            # Restaurar una copia de k8s/backups/
+./k8s/scripts/destroy-cluster.sh
+```
+
+Puertos en el ordenador (de `k8s/kind-config.yaml`): API `localhost:8000`, web
+`localhost:8080`, PostgreSQL `localhost:5434`.
+
+```bash
+# Pods y eventos
 kubectl get pods -n comebackgolf
-kubectl describe pod -n comebackgolf <pod-name>
+kubectl describe pod -n comebackgolf <pod>
 kubectl get events -n comebackgolf --sort-by='.lastTimestamp'
 
-# Shell en pod
-kubectl exec -it -n comebackgolf deployment/api-deployment -- bash
-kubectl exec -it -n comebackgolf deployment/postgres -- psql -U postgres -d comebackgolf
+# Logs
+kubectl logs -f -n comebackgolf deployment/comebackgolf-api --tail=100
+kubectl logs -n comebackgolf <pod> --previous
 
-# Escalar
-kubectl scale deployment api-deployment -n comebackgolf --replicas=3
+# Shell y base de datos
+kubectl exec -it -n comebackgolf deployment/comebackgolf-api -- bash
+kubectl exec -it -n comebackgolf deployment/postgres -- sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 
-# Rollback
-kubectl rollout undo deployment/api-deployment -n comebackgolf
+# Migraciones
+kubectl exec -it -n comebackgolf deployment/comebackgolf-api -- alembic current
+kubectl exec -it -n comebackgolf deployment/comebackgolf-api -- alembic upgrade head
 
-# Port forwarding
-kubectl port-forward -n comebackgolf svc/api-service 8000:8000
-kubectl port-forward -n comebackgolf svc/frontend-service 3000:80
-kubectl port-forward -n comebackgolf svc/postgres 5432:5432
+# Reinicio o vuelta atrás
+kubectl rollout restart deployment/comebackgolf-api -n comebackgolf
+kubectl rollout undo deployment/comebackgolf-api -n comebackgolf
+
+# Servicios
+kubectl get svc,endpoints -n comebackgolf    # comebackgolf-api-service, comebackgolf-web-service, postgres-service, mailpit-service
+kubectl get pvc -n comebackgolf              # postgres-pvc
 ```
+
+El log de auditoría de seguridad se escribe en `logs/security_audit.log` dentro del
+contenedor de la API.
 
 ---
 
-## Logs
+## Docker Compose (local)
 
-### Docker
+Desde la raíz del repo, con `docker/.env` creado a partir de `docker/.env.example`:
+
 ```bash
-# Tiempo real
-docker-compose logs -f app
-docker-compose logs -f --tail=100 app
+COMPOSE="docker compose -f docker/docker-compose.yml --env-file docker/.env"
 
-# Filtrar
-docker-compose logs app | grep ERROR
-docker-compose logs app --since 5m
-docker-compose logs app > logs/app_$(date +%Y%m%d_%H%M%S).log
+$COMPOSE up -d --build            # db + app + mailpit (la app migra al arrancar)
+$COMPOSE ps
+$COMPOSE logs -f --tail=100 app
+$COMPOSE restart app
+$COMPOSE exec app alembic current
+$COMPOSE exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+$COMPOSE down                     # down -v borra también la base
 ```
 
-### Kubernetes
+| Servicio | URL |
+| --- | --- |
+| API | `http://localhost:8000` (`DOCKER_APP_PORT`; 8001 si no se define) |
+| Documentación | `http://localhost:8000/docs` (HTTP Basic con `DOCS_USERNAME` / `DOCS_PASSWORD`) |
+| PostgreSQL | `localhost:5433` (`DOCKER_DATABASE_PORT`) |
+| Mailpit (correos de prueba) | `http://127.0.0.1:8025` |
+
+### Copias
+
 ```bash
-# Tiempo real
-kubectl logs -f -n comebackgolf deployment/api-deployment
-kubectl logs -f -n comebackgolf deployment/postgres
-kubectl logs -f -n comebackgolf deployment/api-deployment --tail=50
-
-# Filtrar
-kubectl logs -n comebackgolf deployment/api-deployment --since=5m
-kubectl logs -n comebackgolf deployment/api-deployment | grep ERROR
-kubectl logs -n comebackgolf -l app=api --tail=100 --timestamps=true
-
-# Pod específico
-kubectl logs -n comebackgolf <pod-name>
-kubectl logs -n comebackgolf <pod-name> --previous
-
-# Guardar
-kubectl logs -n comebackgolf deployment/api-deployment > logs/k8s_api_$(date +%Y%m%d_%H%M%S).log
-
-# Eventos
-kubectl get events -n comebackgolf --sort-by='.lastTimestamp'
-kubectl get events -n comebackgolf --field-selector type!=Normal
-
-# Logs de aplicación
-kubectl exec -it -n comebackgolf deployment/api-deployment -- tail -f logs/security_audit.log
+$COMPOSE exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' | gzip > backup_$(date +%Y%m%d_%H%M%S).sql.gz
+gunzip -c backup_<fecha>.sql.gz | $COMPOSE exec -T db sh -c 'psql -U "$POSTGRES_USER" "$POSTGRES_DB"'
 ```
 
 ---
-
-## Troubleshooting
-
-### Docker
-```bash
-# Servicio no responde
-docker-compose ps
-docker-compose logs app --tail=100
-docker-compose restart app
-docker-compose down && docker-compose up -d --build
-
-# DB connection
-docker-compose exec db psql -U postgres
-docker-compose down -v && docker-compose up -d
-
-# Port ocupado
-lsof -i :8000
-kill -9 <PID>
-```
-
-### Kubernetes
-```bash
-# Pod crasheando
-kubectl logs -n comebackgolf <pod-name> --previous
-kubectl describe pod -n comebackgolf <pod-name>
-
-# ImagePullBackOff
-kubectl describe pod -n comebackgolf <pod-name>
-kubectl rollout restart deployment/api-deployment -n comebackgolf
-
-# Service no accesible
-kubectl get svc -n comebackgolf
-kubectl get endpoints -n comebackgolf
-kubectl port-forward -n comebackgolf svc/api-service 8000:8000
-
-# PVC issues
-kubectl get pvc -n comebackgolf
-kubectl describe pvc postgres-pvc -n comebackgolf
-```
-
-### Migraciones
-```bash
-# Docker
-docker-compose exec app alembic current
-docker-compose exec app alembic history
-docker-compose exec app alembic upgrade head
-docker-compose exec app alembic downgrade -1
-
-# Kubernetes
-kubectl exec -it -n comebackgolf deployment/api-deployment -- alembic current
-kubectl exec -it -n comebackgolf deployment/api-deployment -- alembic upgrade head
-kubectl exec -it -n comebackgolf deployment/api-deployment -- alembic downgrade -1
-```
-
----
-
-## Backups
-
-### Docker
-```bash
-# Crear
-docker-compose exec db pg_dump -U postgres comebackgolf > k8s/backups/db_backup_$(date +%Y%m%d_%H%M%S).sql
-docker-compose exec db pg_dump -U postgres comebackgolf | gzip > k8s/backups/db_backup_$(date +%Y%m%d_%H%M%S).sql.gz
-
-# Restaurar
-docker-compose exec -T db psql -U postgres comebackgolf < k8s/backups/db_backup_20260128.sql
-gunzip < k8s/backups/db_backup_20260128.sql.gz | docker-compose exec -T db psql -U postgres comebackgolf
-```
-
-### Kubernetes
-```bash
-# Crear
-kubectl exec -n comebackgolf deployment/postgres -- pg_dump -U postgres comebackgolf > k8s/backups/k8s_backup_$(date +%Y%m%d_%H%M%S).sql
-
-# Restaurar
-./k8s/scripts/restore-db.sh k8s/backups/k8s_backup_20260128.sql
-kubectl exec -i -n comebackgolf deployment/postgres -- psql -U postgres comebackgolf < k8s/backups/k8s_backup_20260128.sql
-```
-
-### Backup Automático (Cronjob)
-```bash
-# Añadir a crontab: crontab -e
-0 2 * * * cd /path/to/project && docker-compose exec db pg_dump -U postgres comebackgolf | gzip > k8s/backups/auto_backup_$(date +\%Y\%m\%d).sql.gz
-
-# Limpiar backups antiguos (>7 días)
-find k8s/backups/ -name "auto_backup_*.sql.gz" -mtime +7 -delete
-```
-
----
-
-## Monitoreo
-
-### Health Checks
-```bash
-# Docker
-curl http://localhost:8000/
-docker-compose ps
-
-# Kubernetes
-kubectl get pods -n comebackgolf
-kubectl top pods -n comebackgolf
-kubectl top nodes
-```
-
-### Performance
-```bash
-# Docker
-docker stats
-
-# Kubernetes
-kubectl top pods -n comebackgolf
-kubectl top nodes
-kubectl describe pod -n comebackgolf <pod-name> | grep -A 5 "Limits"
-
-# Query performance
-docker-compose exec db psql -U postgres comebackgolf -c "EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'test@example.com';"
-```
-
----
-
-## Quick Reference
-
-### Comandos Frecuentes
-```bash
-# Docker
-docker-compose up -d
-docker-compose logs -f app
-docker-compose ps
-docker-compose restart app
-docker-compose down -v
-
-# Kubernetes
-./k8s/scripts/deploy-cluster.sh
-./k8s/scripts/deploy-api.sh
-kubectl get pods -n comebackgolf
-kubectl logs -f -n comebackgolf deployment/api-deployment
-kubectl exec -it -n comebackgolf deployment/api-deployment -- bash
-```
-
-### URLs
-- Docker Backend: http://localhost:8000
-- Docker Docs: http://localhost:8000/docs
-- Docker PostgreSQL: localhost:5432
-- K8s (port-forward): kubectl port-forward -n comebackgolf svc/api-service 8000:8000
 
 ## Usuario de la API sin permisos de estructura (DB-01)
 
-La API puede entrar con `rydercup_app`, que solo lee y escribe filas; las migraciones del
-arranque entran con el dueño de la base. Sin `MIGRATIONS_DATABASE_URL` todo funciona como
-antes (las migraciones usan `DATABASE_URL`).
+La API puede entrar con su propio rol (el que crea `scripts/db/rol_de_la_api.sql`), que solo
+lee y escribe filas; las migraciones del arranque entran con el dueño de la base. Sin
+`MIGRATIONS_DATABASE_URL` todo funciona como antes (las migraciones usan `DATABASE_URL`).
 
 Ninguna contraseña va en la línea de órdenes (quedaría en el historial y en `ps`): psql la
 pide en su aviso.
@@ -278,43 +136,42 @@ pide en su aviso.
 3. **Crear el usuario.** `\set ON_ERROR_STOP on` y luego `\i scripts/db/rol_de_la_api.sql`
    (o `\i /s/rol_de_la_api.sql` con Docker). Va en una transacción: si algo falla no
    cambia nada. Se puede repetir y se niega si la base no está migrada. Después,
-   `SET password_encryption = 'scram-sha-256';` y `\password rydercup_app` (sin el SET,
-   Render la guarda en MD5: DB-R3-02). El script también quita a `n8n_lectura` la lectura automática
-   de las tablas futuras (DB-03); sus permisos sobre las de hoy los recorta
-   `scripts/db/rol_de_n8n.sql` (sección siguiente).
+   `SET password_encryption = 'scram-sha-256';` y `\password <rol de la API>` (sin el SET,
+   Render la guarda en MD5: DB-R3-02). El script también quita al rol de solo lectura del
+   informe la lectura automática de las tablas futuras (DB-03); sus permisos sobre las de
+   hoy los recorta `scripts/db/rol_de_n8n.sql` (sección siguiente).
 4. **Render, primero sin cambiar nada:** añadir `MIGRATIONS_DATABASE_URL` con el valor
    ACTUAL de `DATABASE_URL` y desplegar. Todo sigue igual.
 5. **Render, el cambio:** `DATABASE_URL` pasa a
-   `postgresql://rydercup_app:<contraseña>@<mismo host>:5432/<misma base>`, con la
+   `postgresql://<rol de la API>:<contraseña>@<mismo host>:5432/<misma base>`, con la
    contraseña codificada para URL si lleva `@ : / # ? %` (mejor elegir una sin ellos), y
    desplegar. Mirar `/health` y entrar en la app. Antes, todo esto en el Kind.
 6. **Volver atrás:** `DATABASE_URL` con el valor de `MIGRATIONS_DATABASE_URL` y desplegar.
 
-Las tablas que creen las migraciones futuras ya le dan permiso a `rydercup_app` solas (paso
-4 del script). `backup_ro` las lee por un permiso por defecto que ya tiene en producción y
-que el script no toca: comprobarlo antes del cambio con `\ddp` (tiene que salir
-`backup_ro=r` en las tablas del dueño); si no sale, las copias no llevarían las tablas
-nuevas.
+Las tablas que creen las migraciones futuras ya le dan permiso al rol de la API solas (paso
+4 del script). Si la copia diaria externa entra con un rol de solo lectura, ese rol tiene
+que leer también las tablas futuras por un permiso por defecto del dueño: comprobarlo antes
+del cambio con `\ddp` (tiene que salir `<rol de la copia>=r` en las tablas del dueño); si no
+sale, las copias no llevarían las tablas nuevas.
 
 ## n8n solo lee lo del informe (DB-01)
 
-`n8n_lectura` es el usuario con el que n8n saca el informe de los lunes. Tenía `SELECT` en
-42 de las 43 tablas (también `users` con los hashes, `refresh_tokens`, `password_history`).
-`scripts/db/rol_de_n8n.sql` le quita todo y le deja solo las columnas que lee la consulta
-del informe (`~/n8n-cbg/workflows/informe-semanal.json`, nodo «Datos de la app (solo
-lectura)»), solo lectura y con tiempos límite.
+El informe semanal de n8n entra con un rol de solo lectura. `scripts/db/rol_de_n8n.sql` le
+quita cualquier permiso de tabla entera y le deja solo las columnas que lee la consulta del
+informe, solo lectura y con tiempos límite. El script dice qué columnas son; si el informe
+pasa a leer otra, se añade allí.
 
 1. **Entrar como el dueño**, como en la sección anterior (pasos 1 y 2).
 2. `\set ON_ERROR_STOP on` y `\i scripts/db/rol_de_n8n.sql`. Va en una transacción y
    comprueba el resultado antes del `COMMIT`: si sale «conserva permisos de tabla entera»,
    esos permisos los dio otro usuario (el `REVOKE` solo quita los que dio quien lo
    ejecuta) y no ha cambiado nada; ejecutarlo como ese usuario.
-3. **Mirar las consultas del final:** ninguna tabla entera legible, exactamente las 11
-   columnas, `false` en hashes, correos, `refresh_tokens` y `password_history`, y los
-   cuatro ajustes del rol (`default_transaction_read_only=on`, `statement_timeout=30s`,
+3. **Mirar las consultas del final:** ninguna tabla entera legible, solo las columnas que
+   lista el script, `false` en hashes, correos, `refresh_tokens` y `password_history`, y
+   los cuatro ajustes del rol (`default_transaction_read_only=on`, `statement_timeout=30s`,
    `idle_in_transaction_session_timeout=60s`, `lock_timeout=5s`).
 4. **Probar el informe sin mandarlo:** en n8n, abrir el flujo del informe y ejecutar solo
-   el nodo «Datos de la app (solo lectura)». Tiene que devolver una fila con los números.
+   el nodo que lee la base. Tiene que devolver una fila con los números.
 5. **Volver atrás no hace falta para el informe:** si el paso 4 falla con «permission
    denied for ... column X», el informe ha pasado a leer una columna nueva; se añade al
    script (pasos 3 y 5) y se vuelve a ejecutar. Nunca devolver la tabla entera: un
@@ -322,20 +179,18 @@ lectura)»), solo lectura y con tiempos límite.
 
 ## Restaurar producción (DB-03)
 
-Para cuando la base de Render se pierde o se corrompe. La copia diaria del Mac
-(`~/.local/bin/copia_pro.sh`, 03:30; la carpeta de destino la dice el propio script) es `pg_dump -Fc
---no-owner --no-privileges`: trae tablas, datos y la versión de Alembic, pero **ni dueños,
-ni permisos, ni usuarios, ni sus ajustes**. Restaurarla sin más deja a la API
-(`rydercup_app`), a la copia (`backup_ro`) y a n8n (`n8n_lectura`) sin poder leer nada.
-El orden importa.
+Para cuando la base de Render se pierde o se corrompe. La copia diaria externa (fuera del
+repo) es `pg_dump -Fc --no-owner --no-privileges`: trae tablas, datos y la versión de
+Alembic, pero **ni dueños, ni permisos, ni usuarios, ni sus ajustes**. Restaurarla sin más
+deja a la API, a la copia y al informe sin poder leer nada. El orden importa.
 
 Ninguna contraseña va en la línea de órdenes: psql y pg_restore la piden en su aviso.
 
 1. **Parar las escrituras.** En Render, suspender el servicio de la API: lo que se
    escriba mientras tanto se perdería al restaurar.
 2. **Elegir la copia.** La más reciente que esté bien: `pg_restore --list <copia>.dump |
-   grep -c 'TABLE DATA'` tiene que dar el número de tablas de siempre (38 a 17 nov 2026,
-   más las que hayan añadido las migraciones).
+   grep -c 'TABLE DATA'` tiene que dar el mismo número de tablas que la base de origen
+   (el que tenga en la última migración).
 3. **La base de destino.** Si la de Render sigue viva, usar la misma (pasos 4 en adelante
    sobre ella). Si hay que crear otra: Postgres **15**, misma región; su usuario por
    defecto será el nuevo dueño.
@@ -353,28 +208,29 @@ Ninguna contraseña va en la línea de órdenes: psql y pg_restore la piden en s
 6. **Los usuarios y sus permisos**, en psql como el dueño, con `\set ON_ERROR_STOP on` y
    `SET password_encryption = 'scram-sha-256';` antes de cualquier `\password` (DB-R3-02):
    - `\i scripts/db/rol_de_la_api.sql` (sección «Usuario de la API sin permisos de
-     estructura»). En una base nueva el usuario no existe y se crea: solo entonces,
-     `\password rydercup_app`. En la misma base de antes NO cambiar la contraseña: la
+     estructura»). En una base nueva el rol de la API no existe y se crea: solo entonces,
+     `\password <rol de la API>`. En la misma base de antes NO cambiar la contraseña: la
      `DATABASE_URL` de Render sigue con la de siempre (si se cambia, cambiarla allí).
-   - En una base nueva, `n8n_lectura` tampoco existe y el script no lo crea: antes,
-     `CREATE ROLE n8n_lectura LOGIN;` y `\password n8n_lectura`, y poner esa contraseña
-     en la conexión de n8n. Después, `\i scripts/db/rol_de_n8n.sql` (sección «n8n solo
-     lee lo del informe»).
-   - `\i scripts/db/ajustes_de_la_base.sql`: tiempos límite de `rydercup_app`, sin
+   - En una base nueva, el rol de solo lectura del informe tampoco existe y el script no
+     lo crea: antes, `CREATE ROLE <rol del informe> LOGIN;` y `\password <rol del informe>`,
+     y poner esa contraseña en la conexión de n8n. Después, `\i scripts/db/rol_de_n8n.sql`
+     (sección «n8n solo lee lo del informe»).
+   - `\i scripts/db/ajustes_de_la_base.sql`: tiempos límite del rol de la API, sin
      tablas temporales ni creación en `public` para nadie más.
-   - `backup_ro` (no tiene script): `GRANT CONNECT ON DATABASE <base> TO backup_ro;`,
-     `GRANT USAGE ON SCHEMA public TO backup_ro;`, `GRANT SELECT ON ALL TABLES IN SCHEMA
-     public TO backup_ro;`, `GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO
-     backup_ro;`, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
-     backup_ro;` y `ALTER ROLE backup_ro SET default_transaction_read_only = on;`. En una
-     base nueva, crearlo antes con `CREATE ROLE backup_ro LOGIN` y `\password backup_ro`.
-7. **Render.** Si la base es nueva: `DATABASE_URL` con `rydercup_app` y
-   `MIGRATIONS_DATABASE_URL` con el dueño, los dos al host nuevo; en el Llavero del Mac,
-   la URL de `backup_ro` (la entrada del Llavero que lee `copia_pro.sh`, desde la app Terminal); y la
-   conexión de n8n. Reanudar la API.
+   - El rol de solo lectura de la copia (no tiene script), con `<rol de la copia>` en
+     lugar del nombre: `GRANT CONNECT ON DATABASE <base> TO <rol de la copia>;`,
+     `GRANT USAGE ON SCHEMA public TO <rol de la copia>;`, `GRANT SELECT ON ALL TABLES IN
+     SCHEMA public TO <rol de la copia>;`, `GRANT SELECT ON ALL SEQUENCES IN SCHEMA public
+     TO <rol de la copia>;`, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON
+     TABLES TO <rol de la copia>;` y `ALTER ROLE <rol de la copia> SET
+     default_transaction_read_only = on;`. En una base nueva, crearlo antes con
+     `CREATE ROLE <rol de la copia> LOGIN` y `\password <rol de la copia>`.
+7. **Render y el resto.** Si la base es nueva: `DATABASE_URL` con el rol de la API y
+   `MIGRATIONS_DATABASE_URL` con el dueño, los dos al host nuevo; la URL del rol de la
+   copia, donde la lea la copia diaria externa; y la conexión de n8n. Reanudar la API.
 8. **Comprobar.** `curl https://api.comebackgolf.com/health`, entrar en la app y ver un
-   torneo. Lanzar `~/.local/bin/copia_pro.sh` a mano: tiene que acabar bien. Ejecutar en
-   n8n solo el nodo «Datos de la app (solo lectura)».
+   torneo. Lanzar la copia diaria externa a mano: tiene que acabar bien. Ejecutar en n8n
+   solo el nodo del informe que lee la base.
 
 **Pendiente:** probarlo entero una vez contra una base de usar y tirar (la auditoría lo
 pide). La restauración de los datos ya se probó el 17 oct 2026 (86 146 filas idénticas);

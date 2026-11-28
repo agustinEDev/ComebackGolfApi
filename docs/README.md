@@ -1,232 +1,67 @@
-# 📚 Documentación - Comeback Golf
+# 📚 Documentación - Comeback Golf API
 
-Índice completo de documentación del proyecto.
-
----
-
-## 🚀 Kubernetes
-
-### Guías de Deployment
-
-| Documento | Descripción | Audiencia |
-|-----------|-------------|-----------|
-| [KUBERNETES_DEPLOYMENT_GUIDE.md](./KUBERNETES_DEPLOYMENT_GUIDE.md) | Guía completa de deployment (80+ páginas) | DevOps, Developers |
-| [KUBERNETES_QUICK_START.md](./KUBERNETES_QUICK_START.md) | Referencia rápida (1 página) | Todos |
-
-### Scripts de Automatización
-
-| Script | Descripción |
-|--------|-------------|
-| `scripts/deploy-cluster.sh` | Desplegar cluster automáticamente |
-| `scripts/cluster-status.sh` | Diagnóstico visual del cluster |
-| `scripts/destroy-cluster.sh` | Eliminar cluster completamente |
-
-Ver: [scripts/README.md](../scripts/README.md)
+Índice de la documentación del backend. La portada del proyecto es el
+[README](../README.md); el historial de versiones, el [CHANGELOG](../CHANGELOG.md).
 
 ---
 
-## 📖 Contenido de las Guías
+## 🧭 Empezar
 
-### KUBERNETES_DEPLOYMENT_GUIDE.md
+| Documento | Para qué |
+|-----------|----------|
+| [README](../README.md) | Qué es, stack, puesta en marcha rápida |
+| [MULTI_ENVIRONMENT_SETUP.md](MULTI_ENVIRONMENT_SETUP.md) | Variables de entorno y diferencias entre local, Kind y producción |
+| [project-structure.md](project-structure.md) | Cómo está organizado `src/` |
+| [tests/README.md](../tests/README.md) | Cómo se organizan y ejecutan los tests |
 
-**Secciones principales:**
+## 🏗️ Arquitectura y dominio
 
-1. **Resumen Ejecutivo**
-   - ¿Qué hemos construido?
-   - Estadísticas del deployment
-   - Mejoras aplicadas al código
+| Documento | Para qué |
+|-----------|----------|
+| [design-document.md](design-document.md) | Diseño general: Clean Architecture, DDD, módulos |
+| [modules/user-management.md](modules/user-management.md) | Módulo de usuarios |
+| [modules/competition-management.md](modules/competition-management.md) | Módulo de competiciones |
+| [DATABASE_ERD.md](DATABASE_ERD.md) | Modelo de datos |
+| [architecture/decisions/](architecture/decisions/) | ADRs: las decisiones de arquitectura, una por fichero |
 
-2. **Arquitectura**
-   - Diagramas de arquitectura
-   - Flujo de datos completo
+## 📡 API
 
-3. **Paso a Paso**
-   - Crear cluster Kind
-   - Aplicar manifiestos
-   - Verificación completa
+| Documento | Para qué |
+|-----------|----------|
+| [API.md](API.md) | Referencia de endpoints, autenticación, CSRF y límites de peticiones |
+| `/docs`, `/redoc`, `/openapi.json` | Documentación interactiva generada por la app (tras HTTP Basic) |
 
-4. **Comandos Importantes**
-   - Ver estado del cluster
-   - Ver logs
-   - Ejecutar comandos en pods
-   - Escalar réplicas
-   - Actualizar configuración
+## 🚀 Operación
 
-5. **Troubleshooting**
-   - Pods en Pending/CrashLoopBackOff
-   - CORS errors
-   - ConfigMaps no actualizan
-   - PostgreSQL no arranca
-   - Health checks fallan
+| Documento | Para qué |
+|-----------|----------|
+| [DEPLOYMENT.md](../DEPLOYMENT.md) | Despliegue: Docker Compose y Render |
+| [RUNBOOK.md](RUNBOOK.md) | Día a día: estado, logs, migraciones, copias, permisos de la base y restauración |
+| [ci-cd/PIPELINE_GUIDE.md](ci-cd/PIPELINE_GUIDE.md) | Qué comprueba el CI y cómo reproducirlo |
+| [k8s/README.md](../k8s/README.md) · [k8s/scripts/README.md](../k8s/scripts/README.md) | Clúster local con Kind |
+| [docker/README.md](../docker/README.md) · [docker/scripts/README.md](../docker/scripts/README.md) | Docker Compose local |
+| [RFEG_COURSE_IMPORT.md](RFEG_COURSE_IMPORT.md) | Importar los campos federados |
 
-6. **Gestión del Cluster**
-   - Pausar/Reiniciar
-   - Actualizar imágenes
-   - Backup de PostgreSQL
-   - Métricas
+## 🔐 Seguridad
 
----
+| Documento | Para qué |
+|-----------|----------|
+| [security/THREAT_MODEL.md](security/THREAT_MODEL.md) | Modelo de amenazas (STRIDE) de los flujos críticos |
+| [KNOWN_SECURITY_ISSUES.md](KNOWN_SECURITY_ISSUES.md) | Riesgos aceptados y resueltos |
 
-### KUBERNETES_QUICK_START.md
+## 🗺️ Producto
 
-**Contenido:**
+| Documento | Para qué |
+|-----------|----------|
+| [ROADMAP.md](../ROADMAP.md) | Lo que hay y lo que queda |
+| [pendientes-de-release.md](pendientes-de-release.md) | Decisiones que una release deja para otra |
+| [plan-de-pago-e-ia.md](plan-de-pago-e-ia.md) | Plan de pago e IA (aparcado) |
 
-- ⚡ Inicio rápido (5 minutos)
-- 📋 Comandos esenciales
-- 🛠️ Troubleshooting rápido
-- 📚 Referencias a documentación completa
+## 🗄️ Histórico
 
-**Ideal para:**
-- Referencia diaria
-- Quick reference card
-- Onboarding de nuevos developers
+Se conservan como registro; no describen el código de hoy.
 
----
-
-## 🎯 ¿Por Dónde Empezar?
-
-### Si eres nuevo en Kubernetes
-
-1. Lee: [KUBERNETES_DEPLOYMENT_GUIDE.md](./KUBERNETES_DEPLOYMENT_GUIDE.md) - Sección "Resumen Ejecutivo"
-2. Sigue: Paso a Paso completo
-3. Practica: Comandos importantes
-4. Referencia: [KUBERNETES_QUICK_START.md](./KUBERNETES_QUICK_START.md)
-
-### Si ya conoces Kubernetes
-
-1. Usa: `scripts/deploy-cluster.sh` para desplegar
-2. Referencia: [KUBERNETES_QUICK_START.md](./KUBERNETES_QUICK_START.md)
-3. Troubleshooting: [KUBERNETES_DEPLOYMENT_GUIDE.md](./KUBERNETES_DEPLOYMENT_GUIDE.md) - Sección "Troubleshooting"
-
-### Si solo quieres arrancar el cluster
-
-```bash
-./scripts/deploy-cluster.sh
-```
-
-¡Listo!
-
----
-
-## 🏗️ Arquitectura del Proyecto
-
-```
-ComebackGolfApi/
-├── docs/
-│   ├── KUBERNETES_DEPLOYMENT_GUIDE.md  # 📘 Guía completa
-│   ├── KUBERNETES_QUICK_START.md       # ⚡ Referencia rápida
-│   └── README.md                        # 📚 Este archivo
-├── k8s/
-│   ├── api-configmap.yaml              # ConfigMap backend
-│   ├── api-secret.yaml                 # Secret backend
-│   ├── api-deployment.yaml             # Deployment backend
-│   ├── api-service.yaml                # Service backend
-│   ├── frontend-configmap.yaml         # ConfigMap frontend
-│   ├── frontend-deployment.yaml        # Deployment frontend
-│   ├── frontend-service.yaml           # Service frontend
-│   ├── postgres-pvc.yaml               # PersistentVolumeClaim
-│   ├── postgres-deployment.yaml        # Deployment PostgreSQL
-│   └── postgres-service.yaml           # Service PostgreSQL
-└── scripts/
-    ├── deploy-cluster.sh               # 🚀 Desplegar cluster
-    ├── cluster-status.sh               # 🔍 Diagnóstico
-    ├── destroy-cluster.sh              # 🗑️ Eliminar cluster
-    └── README.md                        # 📖 Documentación scripts
-```
-
----
-
-## 📝 Convenciones
-
-### Nomenclatura de Archivos
-
-- **Deployment:** `<componente>-deployment.yaml`
-- **Service:** `<componente>-service.yaml`
-- **ConfigMap:** `<componente>-configmap.yaml`
-- **Secret:** `<componente>-secret.yaml`
-
-### Labels Kubernetes
-
-Todos los recursos usan labels consistentes:
-
-```yaml
-labels:
-  app: comebackgolf           # Aplicación
-  component: frontend     # Componente (frontend/api/database)
-  tier: presentation      # Capa (presentation/backend/data)
-```
-
-### Comandos con Labels
-
-```bash
-# Ver todos los recursos de la app
-kubectl get all -l app=comebackgolf
-
-# Ver solo frontend
-kubectl get all -l component=frontend
-
-# Ver solo backend
-kubectl get all -l component=api
-
-# Ver solo database
-kubectl get all -l component=database
-```
-
----
-
-## 🔍 Búsqueda Rápida
-
-### Encontrar un Tema
-
-| Tema | Documento | Sección |
-|------|-----------|---------|
-| Crear cluster | DEPLOYMENT_GUIDE | Paso 1 |
-| ConfigMaps | DEPLOYMENT_GUIDE | Paso 2 |
-| PostgreSQL | DEPLOYMENT_GUIDE | Paso 3-4 |
-| Port-forward | DEPLOYMENT_GUIDE | Acceder a la Aplicación |
-| CORS errors | DEPLOYMENT_GUIDE | Troubleshooting |
-| Health checks | DEPLOYMENT_GUIDE | Verificación |
-| Escalar réplicas | DEPLOYMENT_GUIDE | Comandos Importantes |
-| Backup PostgreSQL | DEPLOYMENT_GUIDE | Gestión del Cluster |
-
----
-
-## 🆘 Soporte
-
-### Problemas con el Deployment
-
-1. Revisa: [Troubleshooting](./KUBERNETES_DEPLOYMENT_GUIDE.md#troubleshooting)
-2. Ejecuta: `./scripts/cluster-status.sh` para diagnóstico
-3. Verifica logs: `kubectl logs -f deployment/<nombre>`
-
-### Documentación Adicional
-
-- **Backend (FastAPI):** Ver [README.md](../README.md)
-- **Frontend (React):** Ver [ComebackGolfWeb/README.md](../../ComebackGolfWeb/README.md)
-- **Kubernetes Oficial:** https://kubernetes.io/docs/
-
----
-
-## 📊 Estadísticas de Documentación
-
-- **Total páginas:** ~100 páginas
-- **Archivos creados:** 7 archivos
-- **Scripts:** 3 scripts automatizados
-- **Comandos documentados:** 50+ comandos
-- **Troubleshooting entries:** 8 problemas comunes
-
----
-
-## 🤝 Contribuir
-
-Si encuentras errores o quieres mejorar la documentación:
-
-1. Identifica el archivo correcto
-2. Haz los cambios
-3. Verifica que los comandos funcionan
-4. Actualiza la fecha de "Última actualización"
-
----
-
-**Last Updated:** 24 February 2026
-**Version:** v2.0.12 (Sprint 4 — Live Scoring + Leaderboard)
+| Documento | Qué fue |
+|-----------|---------|
+| [AUDIT_BACKEND_2026-07.md](AUDIT_BACKEND_2026-07.md) | Auditoría de seguridad y arquitectura de julio de 2026 |
+| [RAG_IMPLEMENTATION.md](RAG_IMPLEMENTATION.md) | Plan de asistente de diciembre de 2025, sustituido y nunca implementado |

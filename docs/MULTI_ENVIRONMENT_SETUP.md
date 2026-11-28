@@ -1,238 +1,139 @@
 # 🌍 Multi-Environment Setup - ComebackGolfApi
 
-## 📋 Environment Overview
+The same code runs in three places. What changes is configuration, read from
+environment variables (`src/config/settings.py` and the modules next to it). The
+complete list, commented, is in [`.env.example`](../.env.example).
 
-| Environment | Description | Frontend URL | Usage |
-|-------------|-------------|--------------|-------|
-| **Local (Docker)** | Local development with Docker Compose | `http://localhost:5173` | Daily development |
-| **Local (Kubernetes)** | Local Kind cluster | `http://localhost:8080` | K8s testing before deploy |
-| **Production** | Production deployment | `https://www.comebackgolf.com` | Live application |
-
----
-
-## 🐳 Environment 1: Local (Docker)
-
-### Setup
-
-**.env file:**
-```bash
-FRONTEND_URL=http://localhost:5173
-MAILGUN_API_KEY=your-api-key
-MAILGUN_DOMAIN=comebackgolf.com
-MAILGUN_FROM_EMAIL="Comeback Golf <noreply@comebackgolf.com>"
-MAILGUN_API_URL=https://api.eu.mailgun.net/v3
-# Correos (BE #563): local y Kind → EMAIL_TRANSPORT=mailpit (no se entregan, se ven en
-# http://localhost:8025); producción → mailgun, con RESEND_API_KEY y BREVO_API_KEY de respaldo
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/comebackgolf
-SECRET_KEY=your-local-secret-key
-```
-
-> **Note:** `DATABASE_URL` supports multiple formats: `postgres://`, `postgresql://`, and `postgresql+asyncpg://` (validated by `entrypoint.sh`).
-
-### Commands
-
-```bash
-# Start services
-docker-compose up -d
-
-# Apply migrations
-docker-compose exec app alembic upgrade head
-
-# View logs
-docker-compose logs -f app
-
-# Stop services
-docker-compose down
-```
-
-### Verification
-- Backend: http://localhost:8000/docs
-- Frontend: http://localhost:5173
-- Email links: `http://localhost:5173/verify-email?token=xxx`
+| Environment | API | Frontend | Email |
+|-------------|-----|----------|-------|
+| **Local (Docker Compose)** | `http://localhost:8000` (8001 if `DOCKER_APP_PORT` is unset) | `http://localhost:5173` (Vite, run from the frontend repo) | Mailpit, `http://127.0.0.1:8025` |
+| **Local (Kind)** | `http://localhost:8000` | `http://localhost:8080` | Mailpit inside the cluster |
+| **Production (Render)** | `https://api.comebackgolf.com` | `https://www.comebackgolf.com` | Mailgun (EU), with Resend and Brevo as backups |
 
 ---
 
-## ☸️ Environment 2: Local (Kubernetes)
+## Key variables
 
-### Requirements
-- Docker Desktop
-- kubectl
-- Kind
+| Variable | What it does |
+|----------|--------------|
+| `ENVIRONMENT` | `development` or `production`. Without it, CORS and the startup guard treat the app as production (and demand `FRONTEND_ORIGINS`), but `/health` and Sentry report `development`: set `ENVIRONMENT=production` explicitly on Render |
+| `DATABASE_URL` | PostgreSQL URL: use `postgresql://` (rewritten to `postgresql+asyncpg://` by `src/config/database.py`) or `postgresql+asyncpg://`. `postgres://` does not work for the app, even though Alembic and the startup guard accept it |
+| `MIGRATIONS_DATABASE_URL` | Optional: owner credential used only by `alembic upgrade` at startup; the API process never keeps it |
+| `SECRET_KEY` | JWT and CSRF signing key. Outside development the app refuses to start without one of 32 bytes or more (ADR-047). The algorithm is fixed to HS256 |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` / `REFRESH_TOKEN_EXPIRE_DAYS` | Session lifetimes (defaults 15 minutes and 7 days) |
+| `FRONTEND_URL` | Frontend address used in email links. A comma-separated list, the main site first: account emails use the site the request came from (ADR-055) |
+| `FRONTEND_ORIGINS` | CORS allow-list, comma-separated. `*` is rejected in production |
+| `COOKIE_DOMAIN` | Cookie domain(s), comma-separated; each request gets the one matching its `Host` (ADR-054) |
+| `DOCS_USERNAME` / `DOCS_PASSWORD` | HTTP Basic for `/docs`, `/redoc` and `/openapi.json`. Empty means the docs answer 401 |
+| `EMAIL_TRANSPORT` | `mailgun` (default, the only one allowed in production) or `mailpit` (local) |
+| `MAILGUN_API_KEY`, `MAILGUN_DOMAIN`, `MAILGUN_FROM_EMAIL`, `MAILGUN_API_URL` | Mailgun. In production the app does not start without the key |
+| `RESEND_API_KEY`, `BREVO_API_KEY` | Optional backups for Mailgun (see below) |
+| `CONTACT_EMAIL` | Mailbox that receives the contact form |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Sign in with Google |
+| `TRUST_CLOUDFLARE_HEADERS`, `CLOUDFLARE_ORIGIN_SECRET`, `TRUSTED_PROXIES` | How the real client IP is taken behind the proxy (ADR-038, ADR-041) |
+| `SENTRY_DSN`, `SENTRY_TRACES_SAMPLE_RATE`, `SENTRY_PROFILES_SAMPLE_RATE` | Error tracking and performance |
+| `HANDICAP_REFRESH_ENABLED` | Turns on the scheduled RFEG handicap refresh (set only in production) |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_STATEMENT_TIMEOUT_MS`, `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` | Connection pool and database timeouts |
 
-### Configuration
+### Email: who sends what
 
-**k8s/api-configmap.yaml:**
-```yaml
-FRONTEND_URL: "http://localhost:8080"
+```mermaid
+flowchart LR
+    A[Email ready to send] --> M{Mailgun EU}
+    M -- sent --> OK([Delivered])
+    M -- "429 · 500/503 · 401/403 · 404 · no key" --> R{Resend}
+    M -- "other 4xx · 502/504 · timeout · network error" --> X([Not retried elsewhere])
+    R -- sent --> OK
+    R -- "other 4xx · 502/504 · timeout · network error" --> X
+    R -- "429 · 500/503 · 401/403 · 404" --> T{Token or security notice?}
+    T -- yes --> Y([Not sent: never through a provider that rewrites links])
+    T -- no --> B{Brevo}
+    B --> OK
 ```
 
-**k8s/api-secret.yaml:**
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: api-secret
-  namespace: comebackgolf
-type: Opaque
-data:
-  MAILGUN_API_KEY: <base64-encoded>
-  SECRET_KEY: <base64-encoded>
-  POSTGRES_PASSWORD: <base64-encoded>
-```
+The next provider is tried only after a 429, a 500/503 (any 5xx except 502/504), a
+rejected key (401/403) or a 404 (misconfigured account). After any other 4xx, a 502/504,
+a timeout or a network error it is not, because the email may already have gone out or
+would be refused anyway. Brevo only sends emails without a token (and never security
+notices). Locally, `EMAIL_TRANSPORT=mailpit`
+keeps every email in a local inbox that delivers to nobody.
 
-### Deployment
+---
+
+## 🐳 Local (Docker Compose)
 
 ```bash
-# Deploy complete cluster
-./k8s/scripts/deploy-cluster.sh
+cp docker/.env.example docker/.env      # fill in the values
+docker compose -f docker/docker-compose.yml --env-file docker/.env up -d --build
+```
 
-# Check status
+The app container runs `entrypoint.sh`: it validates the variables, waits for
+PostgreSQL, checks the security configuration, runs `alembic upgrade head` and starts
+uvicorn with hot reload. Details in [docker/README.md](../docker/README.md).
+
+- API: `http://localhost:8000` (`DOCKER_APP_PORT`; 8001 if unset)
+- PostgreSQL: `localhost:5433` (`DOCKER_DATABASE_PORT`)
+- Emails: `http://127.0.0.1:8025`
+
+---
+
+## ☸️ Local (Kind)
+
+Requires Docker, `kubectl` and `kind`, and the frontend repository cloned next to this
+one. Configuration lives in `k8s/api-configmap.yaml` (`comebackgolf-api-config`) and
+the secret `comebackgolf-api-secret`.
+
+```bash
+./k8s/scripts/deploy-cluster.sh     # create the cluster and deploy everything
 ./k8s/scripts/cluster-status.sh
-
-# Port forward (in separate terminals)
-kubectl port-forward -n comebackgolf svc/frontend-service 8080:80
-kubectl port-forward -n comebackgolf svc/api-service 8000:8000
-
-# Update only backend
-./k8s/scripts/deploy-api.sh
-
-# Update only frontend
-./k8s/scripts/deploy-front.sh
+./k8s/scripts/deploy-api.sh         # rebuild and redeploy only the backend
+./k8s/scripts/deploy-front.sh       # only the frontend
 ```
 
-### Verification
-- Frontend: http://localhost:8080
-- Backend: http://localhost:8000/docs
-- Email links: `http://localhost:8080/verify-email?token=xxx`
-
-### Troubleshooting
+The cluster publishes its ports straight to `localhost` (`k8s/kind-config.yaml`): API
+8000, web 8080, PostgreSQL 5434. No port-forward needed. Full guide in
+[k8s/README.md](../k8s/README.md).
 
 ```bash
-# Check ConfigMap
-kubectl get configmap api-configmap -n comebackgolf -o yaml | grep FRONTEND_URL
-
-# Edit ConfigMap
-kubectl edit configmap api-configmap -n comebackgolf
-
-# Restart deployment
-kubectl rollout restart deployment/api-deployment -n comebackgolf
-
-# View logs
-kubectl logs -f -n comebackgolf deployment/api-deployment
+kubectl get configmap comebackgolf-api-config -n comebackgolf -o yaml | grep FRONTEND_URL
+kubectl rollout restart deployment/comebackgolf-api -n comebackgolf
+kubectl logs -f -n comebackgolf deployment/comebackgolf-api
 ```
 
 ---
 
-## 🚀 Environment 3: Production
+## 🚀 Production (Render)
 
-### Render.com Configuration
+The backend is a Docker web service on Render, deployed automatically when `main`
+moves. Variables are set in the Render dashboard; at minimum `ENVIRONMENT=production`
+(always explicit: without it `/health` and Sentry would say `development`),
+`DATABASE_URL`, `SECRET_KEY`, `FRONTEND_URL`, `FRONTEND_ORIGINS`, `COOKIE_DOMAIN`,
+`DOCS_USERNAME`/`DOCS_PASSWORD` and the Mailgun variables. Before migrating or
+starting, `entrypoint.sh` runs `python -m src.config.arranque_seguro`, which stops the
+deploy if the security configuration is unsafe.
 
-**Backend (Web Service) - Environment Variables:**
+The frontend points at the API with `VITE_API_BASE_URL`.
+
+Which release is live:
+
 ```bash
-FRONTEND_URL=https://www.comebackgolf.com,<old domain>
-DATABASE_URL=<provided-by-render>
-MAILGUN_API_KEY=<production-key>
-MAILGUN_DOMAIN=comebackgolf.com
-MAILGUN_FROM_EMAIL="Comeback Golf <noreply@comebackgolf.com>"
-MAILGUN_API_URL=https://api.eu.mailgun.net/v3
-# Correos (BE #563): local y Kind → EMAIL_TRANSPORT=mailpit (no se entregan, se ven en
-# http://localhost:8025); producción → mailgun, con RESEND_API_KEY y BREVO_API_KEY de respaldo
-SECRET_KEY=<production-secret>  # 32 bytes o más; HS256 fijo, sin ALGORITHM (ADR-047)
-ACCESS_TOKEN_EXPIRE_MINUTES=60
-ENVIRONMENT=production
-PORT=8000
-DOCS_USERNAME=admin
-DOCS_PASSWORD=<secure-password>
+curl -s https://api.comebackgolf.com/health
 ```
-
-**Frontend (Static Site):**
-```bash
-VITE_API_BASE_URL=https://api.comebackgolf.com
-```
-
-### Deployment
-
-Automatic on push to `main`:
-```bash
-git push origin main
-# Monitor at: https://dashboard.render.com
-```
-
-### Verification
-- Frontend: https://www.comebackgolf.com
-- Backend: https://api.comebackgolf.com/docs
-- Qué release está desplegada: `curl -s https://api.comebackgolf.com/health`
-- Email links: `https://www.comebackgolf.com/verify-email?token=xxx`
 
 ---
 
-## 🔍 Configuration Verification
+## 🔍 Checking the configuration
 
 ```bash
-# Check config script
 python k8s/scripts/check_config.py
-
-# Manual check
-python -c "from src.config.settings import settings; print(f'FRONTEND_URL: {settings.FRONTEND_URL}')"
+python -c "from src.config.settings import settings; print(settings.FRONTEND_URL)"
 ```
 
----
+## 🐛 Common issues
 
-## 🐛 Common Issues
-
-### Issue 1: Wrong Email Links
-
-**Symptoms**: Email links point to wrong URL
-
-**Solution**:
-1. Check `FRONTEND_URL` in your environment
-2. Restart application
-3. For K8s: `kubectl rollout restart deployment/api-deployment -n comebackgolf`
-
-### Issue 2: Emails Not Sending
-
-**Solution**:
-```bash
-# Verify Mailgun config
-python -c "from src.config.settings import settings; print('Mailgun:', bool(settings.MAILGUN_API_KEY))"
-
-# Check logs
-docker-compose logs app | grep -i mailgun
-kubectl logs -n comebackgolf deployment/api-deployment | grep -i mailgun
-```
-
-### Issue 3: Port Already in Use
-
-```bash
-# Find process
-lsof -i :8000
-
-# Kill process
-kill -9 <PID>
-
-# Or use different port
-uvicorn main:app --reload --port 8001
-```
-
----
-
-## 📊 Port Summary
-
-| Service | Docker | K8s (localhost) | Production |
-|---------|--------|-----------------|------------|
-| Backend | 8000 | 8000 | 443 (HTTPS) |
-| Frontend | 5173 | 8080 | 443 (HTTPS) |
-| PostgreSQL | 5432 | 5434 | 5432 (Render) |
-
----
-
-## 🔗 References
-
-- **Render Dashboard**: https://dashboard.render.com
-- **Mailgun Dashboard**: https://app.mailgun.com
-- **K8s Scripts**: `k8s/scripts/`
-- **Full Docs**: See `docs/` directory
-
----
-
-**Last Updated**: 28 January 2026
+| Symptom | Check |
+|---------|-------|
+| Email links point to the wrong site | `FRONTEND_URL` (list order and domains) and `COOKIE_DOMAIN`; restart the app |
+| No emails locally | Open Mailpit; `EMAIL_TRANSPORT` must be `mailpit` |
+| CORS errors | `FRONTEND_ORIGINS` must contain the exact origin, scheme included |
+| The app refuses to start | Read the `arranque_seguro` message in the logs: it names the unsafe setting |

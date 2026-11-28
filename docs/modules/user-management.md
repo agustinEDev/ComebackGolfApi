@@ -1,457 +1,154 @@
 # Module: User Management
 
+> **Version:** 2.82.0 · **Last updated:** 28 November 2026
+> **Code:** `src/modules/user/`
+
 ## 📋 Description
 
-Module responsible for user management, including registration, JWT authentication, profile management, handicaps, and email verification. Implements Clean Architecture with DDD.
+The user module owns accounts and access: sign-up with email verification, login with email and password or with Google, sessions per device, password reset and change, email change, handicaps (RFEG lookup or manual), avatars, terms acceptance and the admin back office. It follows Clean Architecture + DDD: the domain does not import infrastructure, and `import-linter` enforces it in CI (`.importlinter`, ADR-046).
 
-**📋 See complete API:** `docs/API.md`
+Friends, public profiles, profile photos and the activity feed live in the **social** module (`src/modules/social/`), not here.
+
+**Full endpoint list:** [`docs/API.md`](../API.md) and the OpenAPI schema served at `/docs` (protected with HTTP Basic).
 
 ---
 
-## 🎯 Implemented Use Cases
+## 🗂️ Layout
 
-### Authentication
-1. **RegisterUserUseCase** - New user registration
-2. **LoginUserUseCase** - Authentication with JWT
-3. **LogoutUserUseCase** - Session logout with refresh token revocation
-4. **RefreshAccessTokenUseCase** - Access token renewal
-5. **VerifyEmailUseCase** - Email verification with unique token
-6. **ResendVerificationEmailUseCase** - Resend verification email
-
-### Profile Management
-7. **GetCurrentUserUseCase** - Get authenticated user data
-8. **UpdateProfileUseCase** - Update personal information (name, surname, country_code)
-9. **UpdateSecurityUseCase** - Change email or password
-
-### Handicap Management
-10. **UpdateUserHandicapManuallyUseCase** - Update handicap manually
-11. **UpdateUserHandicapUseCase** - Get handicap from RFEG API
-12. **BatchUpdateHandicapsUseCase** - Batch handicap update (cron job)
-
-### Google OAuth ⭐ Sprint 3
-13. **GoogleLoginUseCase** - Login/register with Google (3 flows: existing OAuth, auto-link, auto-register)
-14. **LinkGoogleAccountUseCase** - Link Google account to existing user
-15. **UnlinkGoogleAccountUseCase** - Unlink Google account (guard: must have password)
+```
+src/modules/user/
+├── domain/
+│   ├── entities/        # User, UserDevice, RefreshToken, PasswordHistory,
+│   │                    # UserOAuthAccount, TermsAcceptance, UserAvatarUpload
+│   ├── value_objects/   # UserId, Email, Password, Handicap, DeviceFingerprint, TokenHash…
+│   ├── services/        # Login brake, refresh-token rotation, device cookie, handicap service…
+│   ├── ports/           # PasswordHasher
+│   ├── repositories/    # Repository interfaces + UserUnitOfWork interface
+│   ├── errors/  exceptions/
+├── application/
+│   ├── use_cases/       # One class per operation
+│   ├── services/        # Shared steps: save the session, revoke sessions, security notices…
+│   ├── ports/           # Email, Google OAuth, RFEG handicap, token service, image processor,
+│   │                    # security audit, login brake, notice quotas…
+│   └── dto/
+└── infrastructure/
+    ├── api/v1/          # auth_routes, google_auth_routes, user_routes, device_routes,
+    │                    # handicap_routes, avatar_routes, admin_routes
+    ├── persistence/     # sqlalchemy/ and in_memory/ (test doubles)
+    ├── security/        # BcryptPasswordHasher, re-authentication, SecurityAuditLogger
+    ├── external/        # RFEG handicap service, Google OAuth service, Pillow image processor,
+    │                    # avatar preset provider
+    └── static/avatar_presets/
+```
 
 ---
 
 ## 🗃️ Domain Model
 
-### Entity: User (Aggregate Root)
+| Entity | Role |
+|--------|------|
+| `User` | Aggregate root: name, alias, email (verified or not, pending email change), password hash, handicap, country, gender, admin and active flags, failed-login counters, avatar choice, terms version accepted |
+| `UserDevice` | A device that signed in: name, user agent, IP, fingerprint hash, last use, installed app; the session belongs to it (ADR-039, ADR-042) |
+| `RefreshToken` | A hashed refresh token tied to a device, rotated on every refresh |
+| `PasswordHistory` | Previous password hashes, to prevent reuse (ADR-029) |
+| `UserOAuthAccount` | A linked Google account (`OAuthProvider.GOOGLE`) |
+| `TermsAcceptance` | When a user accepted which version of the terms |
+| `UserAvatarUpload` | An uploaded avatar image, stored in the database |
 
-**Identification:**
-- `id`: UserId (Value Object - UUID)
+Main value objects: `UserId`, `Email`, `Password` (policy below), `Handicap`, `DeviceFingerprint`, `TokenHash`, `AvatarSource`, `OAuthProvider`, `TermsOfService`.
 
-**Personal Data:**
-- `email`: Email (Value Object with RFC 5322 validation)
-- `password`: Password (Value Object - bcrypt hashed, OWASP ASVS V2.1)
-- `first_name`: str (100 chars max)
-- `last_name`: str (100 chars max)
-- `country_code`: CountryCode (Value Object - ISO 3166-1 alpha-2, optional)
-
-**Handicap:**
-- `handicap`: Handicap (Value Object - float, range -10.0 to 54.0, optional)
-- `handicap_updated_at`: datetime
-
-**Email Verification:**
-- `email_verified`: bool (default False)
-- `verification_token`: str (unique UUID, optional)
-
-**Timestamps:**
-- `created_at`: datetime
-- `updated_at`: datetime
-
-### Entity: UserOAuthAccount ⭐ Sprint 3
-
-**Fields:**
-- `id`: OAuthAccountId (Value Object - UUID)
-- `user_id`: UserId (FK to User)
-- `provider`: OAuthProvider (Value Object - "google", extensible)
-- `provider_user_id`: str (Google sub ID)
-- `provider_email`: str
-- `created_at`: datetime
-
-**Factory method:** `create(user_id, provider, provider_user_id, provider_email)` → emits `GoogleAccountLinkedEvent`
-
-**📋 See implementation:** `src/modules/user/domain/entities/user_oauth_account.py`
-
-### Value Objects
-
-**Implemented:**
-- `UserId` - Unique user UUID
-- `Email` - RFC 5322 validation, lowercase normalization
-- `Password` - OWASP ASVS V2.1 validation (12 chars min, complexity, blacklist)
-- `Handicap` - Range validation [-10.0, 54.0]
-- `CountryCode` - ISO 3166-1 alpha-2 validation
-- `OAuthAccountId` - Unique OAuth account UUID ⭐ Sprint 3
-- `OAuthProvider` - StrEnum: GOOGLE (extensible) ⭐ Sprint 3
-
-**📋 See implementation:** `src/modules/user/domain/value_objects/`
-
-### Security audit events
-
-The domain events of the entities were removed as unused (ADR-050). What remains are the
-security audit events that the security logger writes: login attempts, logout, refresh
-token use, revocation and reuse, password and email changes, account lock, deactivation,
-reactivation and deletion, Google link and unlink, password reset, access denied and rate
-limit.
-
-**📋 See security events:** `src/shared/domain/events/security_events.py`
+Security audit events (`src/shared/domain/events/security_events.py`) are written to the security log by `SecurityAuditLogger` through the `security_audit_interface` port (ADR-050, ADR-051): login attempts, logout, refresh used/revoked/reused/rejected, password and email changes, password reset requested/completed, account unlocked/deactivated/reactivated/deleted by an admin, admin role changes, Google account linked/unlinked, access denied, rate limit exceeded, terms accepted, among others.
 
 ---
 
-## 🏗️ Architecture
+## 🎯 Use cases
 
-### Repository Pattern
+There are 48 use-case files in `application/use_cases/`. By area:
 
-**Interfaces (Domain Layer):**
-- `UserRepositoryInterface` - User CRUD
-  - find_by_id, find_by_email, add, update, delete, exists_by_email
-- `RefreshTokenRepositoryInterface` - Refresh token management
-  - save, find_by_token_hash, revoke_all_for_user, delete_expired_before
-- `UserOAuthAccountRepositoryInterface` - OAuth account management ⭐ Sprint 3
-  - save, find_by_provider_and_provider_user_id, find_by_user_id, find_by_user_id_and_provider, delete
-
-**Implementations (Infrastructure Layer):**
-- `SQLAlchemyUserRepository` - Async persistence with PostgreSQL
-- `SQLAlchemyRefreshTokenRepository` - Refresh token persistence
-- `SQLAlchemyUserOAuthAccountRepository` - OAuth account persistence ⭐ Sprint 3
-
-**📋 See implementation:** `src/modules/user/infrastructure/persistence/sqlalchemy/`
-
-### Unit of Work Pattern
-
-**Interface (Domain Layer):**
-```python
-UserUnitOfWorkInterface
-├── users: UserRepositoryInterface
-├── refresh_tokens: RefreshTokenRepositoryInterface
-├── oauth_accounts: UserOAuthAccountRepositoryInterface  # Sprint 3
-├── async commit()
-├── async rollback()
-└── async __aenter__() / __aexit__()
-```
-
-**Implementation (Infrastructure Layer):**
-- `SQLAlchemyUserUnitOfWork` - Atomic transaction management
-
-**Benefits:**
-- Atomic transactions (commit/rollback)
-- Multiple repositories in single transaction
-- Business logic isolation from persistence
-
-### Domain Services
-
-**Implemented:**
-- `UserFinder` - User search with business validations
-
-### Domain Ports
-
-- `PasswordHasher` (Protocol, `domain/ports/password_hasher.py`) → `BcryptPasswordHasher` (Infrastructure)
-  - `hash()`, `matches()`; installed once per process by `src/config/contrasenas.py`
-  - bcrypt: 12 rounds (prod), 4 rounds (tests)
-
-### Application Services (Ports)
-
-**Interfaces (Application Layer):**
-- `IEmailService` - Email sending (Port)
-- `ITokenService` - JWT token generation (Port)
-- `IGoogleOAuthService` - Google OAuth token exchange (Port) ⭐ Sprint 3
-
-**Implementations (Infrastructure Layer):**
-- `EmailService` - Mailgun API (EU region)
-- `JWTTokenService` - python-jose, HS256 algorithm
-- `GoogleOAuthService` - Google OAuth via httpx (token exchange + userinfo) ⭐ Sprint 3
-
-**Dependency Injection:**
-- Configured in `src/config/dependencies/` (`comun.py` and `usuarios.py`)
-- Complete Inversion of Control (IoC)
-
-**📋 See pattern:** ADR-012 Composition Root
+| Area | Use cases |
+|------|-----------|
+| Sign-up and verification | register, verify email, resend verification, accept terms |
+| Login and sessions | login, logout, refresh access token, re-authenticate, get current user, register device, list devices, revoke device, purge stale sessions |
+| Google | Google login, link Google account, unlink Google account |
+| Password and account | request password reset, validate reset token, reset password, update security (password/email), confirm or cancel email change, unlock account |
+| Profile and search | update profile, find user, search users, player stats, recent matches |
+| Handicap | update from RFEG, update several, update manually, refresh my own |
+| Avatar | list presets, preset image, set preset, upload, list my uploads, activate an upload, get images, remove |
+| Admin | stats, list users, update user, activate/deactivate, delete user |
+| Maintenance | ensure the system user, purge old terms acceptances |
 
 ---
 
-## 🔐 Security Implemented
+## 🔐 Security
 
-### JWT Authentication
-- **Access Token:** 15 minutes (httpOnly cookie)
-- **Refresh Token:** 7 days (httpOnly cookie, SHA256 hash in DB)
-- **Algorithm:** HS256
-- **Revocation:** Logout invalidates refresh tokens in DB
+Values checked in code on 28 Nov 2026:
 
-### Password Security (OWASP ASVS V2.1)
-- Minimum length: 12 characters
-- Complexity: Uppercase + Lowercase + Digits + Symbols
-- Common password blacklist
-- Hashing: bcrypt 12 rounds
+| Topic | What the code does | Where |
+|-------|--------------------|-------|
+| Tokens | JWT access token in the `access_token` httpOnly cookie, **15 min** by default (`ACCESS_TOKEN_EXPIRE_MINUTES`); refresh token in the `refresh_token` cookie, **7 days** by default (`REFRESH_TOKEN_EXPIRE_DAYS`) | `src/config/settings.py`, `src/shared/infrastructure/security/cookie_handler.py` |
+| Refresh rotation | Each refresh replaces the token with a successor; reuse of a replaced token is detected and handled (lost response, two tabs or theft) | `domain/services/rotacion_del_refresco.py` |
+| CSRF | Signed token bound to the user, in the `csrf_token` cookie plus a header | `src/config/csrf_config.py`, ADR-028, ADR-040, ADR-047 |
+| Password policy | 12 to 64 characters and at most 72 bytes, checked against blocklists | `domain/value_objects/password.py` |
+| Hashing | bcrypt, **12 rounds** by default (`BCRYPT_ROUNDS`; fewer only in development) | `src/config/contrasenas.py`, `infrastructure/security/bcrypt_password_hasher.py` |
+| Password history | The last 5 passwords cannot be reused | `domain/entities/password_history.py`, ADR-029 |
+| Login brake | Per email and origin (the network, or a trusted device): 10 failures in 30 min lock that origin for 30 min; the account-wide backstop never locks out a trusted device | `domain/services/freno_del_login.py`, ADR-043 |
+| Sign-up and reset | Sign-up does not reveal existing accounts; email links are hashed and expire | ADR-048 |
+| New device | A sign-in from a new device sends a notice by email | ADR-042 |
+| Google | Login with PKCE (`tests/integration/api/v1/test_google_pkce.py`) | `infrastructure/external/google_oauth_service.py` |
 
-### httpOnly Cookies
-- XSS protection (JavaScript cannot access)
-- Flags: httponly=True, secure=production, samesite="lax"
-- Dual support: cookies (priority 1) + headers (legacy)
-
-### Rate Limiting
-- Routes with a session count per user (verified access token); anonymous routes count per network (#273, ADR-038)
-- Login: 5 attempts/minute per email, 30 failed logins/minute per network, 60/minute ceiling
-- Register: 30/hour per network
-- RFEG API: 5 calls/hour per user
-- Full table: [API.md, Rate Limits per Endpoint](../API.md#rate-limits-per-endpoint)
-
-### Security Logging (Audit Trail)
-- Logs in `logs/security_audit.log` (structured JSON)
-- 9 audited security events
-- HTTP Context: IP, User-Agent
-- Severity levels: CRITICAL, HIGH, MEDIUM, LOW
-
-**📋 See complete implementation:** `docs/SECURITY_IMPLEMENTATION.md`
+Rate limiting is shared by the whole API (slowapi, default limit plus per-route limits, ADR-041).
 
 ---
 
-## 📊 Database Schema
+## 📡 API
 
-### Table: users
-```sql
-CREATE TABLE users (
-    id UUID PRIMARY KEY,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255),  -- nullable: OAuth-only users have no password
-    first_name VARCHAR(100) NOT NULL,
-    last_name VARCHAR(100) NOT NULL,
-    handicap DECIMAL(4,1),
-    handicap_updated_at TIMESTAMP,
-    email_verified BOOLEAN DEFAULT FALSE,
-    verification_token VARCHAR(255),
-    country_code VARCHAR(2) REFERENCES countries(code),
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-```
+Operations per OpenAPI tag (counted from `app.openapi()`):
 
-### Table: refresh_tokens
-```sql
-CREATE TABLE refresh_tokens (
-    id VARCHAR(36) PRIMARY KEY,
-    user_id VARCHAR(36) REFERENCES users(id) ON DELETE CASCADE,
-    token_hash VARCHAR(64) UNIQUE NOT NULL,
-    expires_at DATETIME NOT NULL,
-    created_at DATETIME DEFAULT NOW(),
-    revoked BOOLEAN DEFAULT FALSE,
-    revoked_at DATETIME
-);
-CREATE INDEX idx_refresh_tokens_user_id ON refresh_tokens(user_id);
-CREATE INDEX idx_refresh_tokens_token_hash ON refresh_tokens(token_hash);
-CREATE INDEX idx_refresh_tokens_expires_at ON refresh_tokens(expires_at);
-```
-
-**SQLAlchemy Mappers:**
-- Imperative Mapping (no declarative base)
-- TypeDecorators for single-column Value Objects
-- Composites for multi-column Value Objects
-
-**📋 See mappers:** `src/modules/user/infrastructure/persistence/sqlalchemy/mappers.py`
+| Tag | Prefix | Operations |
+|-----|--------|-----------:|
+| Authentication (incl. Google) | `/api/v1/auth` | 16 |
+| Users | `/api/v1/users` | 12 |
+| Devices | `/api/v1/users/me/devices` | 2 |
+| Handicaps | `/api/v1/handicaps` | 4 |
+| Avatars | `/api/v1/avatar-presets`, `/api/v1/users/me/avatar…`, `/api/v1/users/{user_id}/avatar` | 9 |
+| Admin | `/api/v1/admin` | 5 |
 
 ---
 
-## 📡 API Endpoints
+## 📊 Database
 
-### Authentication
-- `POST /api/v1/auth/register` - User registration
-- `POST /api/v1/auth/login` - Login with JWT
-- `POST /api/v1/auth/logout` - Logout with revocation
-- `POST /api/v1/auth/refresh-token` - Renew access token
-- `POST /api/v1/auth/verify-email` - Verify email with token
-- `POST /api/v1/auth/resend-verification` - Resend verification email
-- `GET /api/v1/auth/current-user` - Get authenticated user
+Tables of this module: `users`, `user_devices`, `refresh_tokens`, `password_history`, `user_oauth_accounts`, `terms_acceptances`, `user_avatar_uploads`. Columns and relations: [`docs/DATABASE_ERD.md`](../DATABASE_ERD.md).
 
-### Profile Management
-- `GET /api/v1/users/profile` - Get profile
-- `PUT /api/v1/users/profile` - Update profile (name, surname, country_code)
-- `PUT /api/v1/users/security` - Update email or password
-
-### Handicap Management
-- `PUT /api/v1/users/handicaps/manual` - Update handicap manually
-- `POST /api/v1/users/handicaps/update` - Get from RFEG API
-- `POST /api/v1/users/handicaps/batch-update` - Batch update (admin)
-
-### Google OAuth ⭐ Sprint 3
-- `POST /api/v1/auth/google` - Login/register with Google (public, 5/min rate limit)
-- `POST /api/v1/auth/google/link` - Link Google to existing account (auth + CSRF)
-- `DELETE /api/v1/auth/google/unlink` - Unlink Google account (auth + CSRF)
-
-**📋 See complete documentation:** `docs/API.md`
-
-**📋 See Postman Collection:** `docs/postman_collection.json`
+The first admin is set by the migration that adds `users.is_admin` (`alembic/versions/7522c9fc51ef_…`): it promotes the existing user whose email is `ADMIN_EMAIL`, and does nothing if the variable is empty (see `.env.example`).
 
 ---
 
 ## 🧪 Testing
 
-### Testing Stack
-- **pytest** - Testing framework
-- **pytest-asyncio** - Async tests
-- **pytest-xdist** - Parallelization
-- **httpx** - HTTP client for integration tests
-
-### Statistics
-- **Total User Module:** 608+ tests (100% passing) ⭐ Sprint 3
-- **Unit Tests:** 409+ tests
-  - Domain: 76+ tests (entities, VOs, events) — includes 27 OAuth domain tests
-  - Value Objects: Complete validation tests
-  - Use Cases: 106+ tests — includes 23 OAuth use case tests
-  - Infrastructure: 18+ tests — includes OAuth repo + service tests
-- **Integration Tests:** 72 tests (API endpoints)
-
-### Structure
-```
-tests/
-├── unit/
-│   └── modules/user/
-│       ├── domain/entities/test_user.py
-│       ├── domain/value_objects/test_*.py
-│       ├── application/use_cases/test_*.py
-│       └── infrastructure/test_*.py
-└── integration/
-    └── api/v1/
-        ├── test_user_routes.py
-        └── test_auth_routes.py
-```
-
-### Execution
 ```bash
-# All tests for User module
-pytest tests/unit/modules/user/ tests/integration/api/v1/test_user_routes.py -v
-
-# Only unit tests (fast, no DB required)
-pytest tests/unit/modules/user/ -v
-
-# With parallelization
-pytest tests/unit/modules/user/ -n auto
+pytest tests/unit/modules/user/    # unit tests, no database
+pytest tests/integration/          # endpoint tests (need PostgreSQL)
+pytest tests/security/             # CSRF, injection, auth bypass, rate limiting…
 ```
 
-### Test Doubles (In-Memory)
-- `InMemoryUserRepository` - Tests without PostgreSQL
-- `InMemoryRefreshTokenRepository` - Refresh token tests
-- `InMemoryUserOAuthAccountRepository` - OAuth account tests ⭐ Sprint 3
-- `InMemoryUnitOfWork` - Transaction tests
-
-**📋 See test doubles:** `src/modules/user/infrastructure/persistence/in_memory/`
+- Unit tests: `tests/unit/modules/user/` (1,904 collected with `pytest --collect-only` on 28 Nov 2026).
+- Endpoint tests: `tests/integration/api/v1/` (for example `test_auth_routes.py`, `test_account_lockout.py`, `test_device_routes.py`, `test_handicap_routes.py`, `test_avatar_routes.py`, `test_admin_endpoints.py`).
+- In-memory repositories for unit tests: `src/modules/user/infrastructure/persistence/in_memory/`.
 
 ---
 
-## 🔄 Key Architecture Decisions
+## 🔗 ADRs
 
-### 1. Handicap Value Object Mapping
-**Decision:** TypeDecorator (not composite())
-
-**Reason:**
-- Handicap is a single-column optional Value Object (NULL)
-- composite() does not handle NULL correctly
-- TypeDecorator transparently converts Handicap ↔ float
-
-**📋 See:** SQLAlchemy Mappers section above and `src/modules/user/infrastructure/persistence/sqlalchemy/mappers.py`
-
-### 2. Dependency Injection Refactoring
-**Decision:** Ports & Adapters (Hexagonal Architecture)
-
-**Before (❌):**
-- Use cases directly imported EmailService, JWTTokenService
-- Violation of Dependency Inversion Principle
-
-**After (✅):**
-- Application Layer: IEmailService, ITokenService (Ports)
-- Infrastructure Layer: EmailService, JWTTokenService (Adapters)
-- Use cases depend on abstractions
-
-**Result:** 440/440 tests passing - Clean Architecture 100%
-
-### 3. Session Timeout with Refresh Tokens
-**Decision:** Short access token + long refresh token pattern
-
-**Before (❌):**
-- Access token: 60 minutes
-- No revocation possible
-- Logout only deleted browser cookie
-
-**After (✅):**
-- Access token: 15 minutes (-75% hijacking window)
-- Refresh token: 7 days (SHA256 hash in DB)
-- DB revocation on logout
-- 722/722 tests passing (+35 new)
-
-**📋 See ADR:** ADR-039 Session Lifetime per Device (refresh token lifetime and revocation on logout)
-
-### 4. Password Policy (OWASP ASVS V2.1)
-**Decision:** Update from 8 to 12 minimum characters
-
-**Before (❌):**
-- 8 minimum characters (obsolete according to OWASP 2024)
-
-**After (✅):**
-- 12 minimum characters
-- Full complexity required
-- Common password blacklist
-- 681 tests updated (100%)
-
-**📋 See migration:** ADR-023 Security Strategy (OWASP Compliance)
-
----
-
-## 🔗 Related Links
-
-### Documentation
-- **API Endpoints:** `docs/API.md`
-- **Security Implementation:** `docs/SECURITY_IMPLEMENTATION.md`
-- **Postman Collection:** `docs/postman_collection.json`
-
-### Source Code
-- **Domain Layer:** `src/modules/user/domain/`
-- **Application Layer:** `src/modules/user/application/`
-- **Infrastructure Layer:** `src/modules/user/infrastructure/`
-
-### ADRs (Architecture Decision Records)
-- **ADR-002:** Value Objects
-- **ADR-005:** Repository Pattern
-- **ADR-006:** Unit of Work Pattern
-- **ADR-050:** Remove the Unused Domain Events
-- **ADR-013:** External Services Pattern
-- **ADR-039:** Session Lifetime per Device
-- **ADR-019:** Email Verification System
-
-### Testing
-- **Unit Tests:** `tests/unit/modules/user/`
-- **Integration Tests:** `tests/integration/api/v1/`
-- **Test Doubles:** `tests/in_memory/`
-
----
-
-## 💡 Development Tips
-
-### Create New Use Case
-1. Define Request and Response DTO in `application/dto/`
-2. Create Use Case in `application/use_cases/`
-3. Inject dependencies (UoW, services) in constructor
-4. Implement logic in `execute()` method
-5. Use `async with self._uow:` for transactions
-6. Create unit + integration tests
-
-### Add New Value Object
-1. Create class in `domain/value_objects/`
-2. Inherit from base class if applicable
-3. Implement validations in constructor
-4. Add `__eq__()` method for comparisons
-5. Create TypeDecorator in mapper (if 1 column)
-6. Create complete validation tests
-
-### Add New Endpoint
-1. Define route in `infrastructure/api/v1/`
-2. Inject Use Case with `Depends()`
-3. Inject `get_current_user` if auth required
-4. Handle domain exceptions → HTTP status codes
-5. Add rate limiting if applicable
-6. Document in `docs/API.md`
-7. Update Postman collection
-
----
-
-**Last Updated:** 16 February 2026
-**Version:** Sprint 3 Block 1 (Google OAuth)
+- [ADR-014: Handicap management system](../architecture/decisions/ADR-014-handicap-management-system.md)
+- [ADR-019: Email verification system](../architecture/decisions/ADR-019-email-verification-system.md)
+- [ADR-024: Password reset system](../architecture/decisions/ADR-024-password-reset-security.md)
+- [ADR-027: Account lockout](../architecture/decisions/ADR-027-account-lockout-brute-force-protection.md)
+- [ADR-029: Password history](../architecture/decisions/ADR-029-password-history.md)
+- [ADR-030: Device fingerprinting](../architecture/decisions/ADR-030-device-fingerprinting.md)
+- [ADR-039: Sessions belong to a device](../architecture/decisions/ADR-039-session-lifetime-per-device.md)
+- [ADR-040: Signed CSRF token bound to the user](../architecture/decisions/ADR-040-signed-csrf-token-bound-to-user.md)
+- [ADR-042: Devices checked by id, new sign-in notice](../architecture/decisions/ADR-042-devices-checked-by-id-and-new-sign-in-notice.md)
+- [ADR-043: Login brake per email and network](../architecture/decisions/ADR-043-login-brake-per-email-and-network.md)
+- [ADR-044: Deactivated accounts and refresh codes](../architecture/decisions/ADR-044-deactivated-accounts-and-public-refresh-codes.md)
+- [ADR-045: Unverified accounts, lock rule and pending email](../architecture/decisions/ADR-045-unverified-accounts-lock-rule-and-pending-email.md)
+- [ADR-048: Sign-up without enumeration, hashed links, reset brake](../architecture/decisions/ADR-048-sign-up-without-enumeration-hashed-links-and-reset-brake.md)

@@ -1,7 +1,12 @@
 # Backend Security & Architecture Audit — July 2026
 
+> **Historical document (frozen on 2026-07-26).** It describes the code as it was then
+> (v2.0.x) and is kept for the record; it is not updated. Issue numbers refer to the
+> archived repository. The current architecture rules are enforced by `.importlinter`
+> and `tests/unit/architecture/`.
+
 > Proactive full audit of the backend: dependency/security posture, Clean Architecture layering,
-> and DDD compliance. No known incident triggered this review (see GitHub issue #106).
+> and DDD compliance. No known incident triggered this review (issue #106, archived repository).
 
 **Date**: 2026-07-26
 **Scope**: the backend repository @ `develop` (commit `cce8074`)
@@ -174,11 +179,11 @@ as follow-up issues.
 
 ## Checked — Preexisting / Already-Known Items (no new action needed)
 
-- **5 accepted mypy errors in `golf_course_repository.py`** (tracked as issue #108, still open,
+- **5 accepted mypy errors in `golf_course_repository.py`** (tracked as issue #108 in the archived repository, open at the time,
   P2/backlog): re-verified with `mypy src/ --ignore-missing-imports` from the project root —
   **0 errors reported** today, because `mypy.ini:66`
   (`[mypy-src.modules.*.infrastructure.persistence.*]`) already relaxes strictness for that
-  glob. Consistent with the documented "accepted by config (exit 0)" state; issue #108 remains
+  glob. Consistent with the documented "accepted by config (exit 0)" state; issue #108 remained
   the correct tracking item for the underlying fix. No new issue opened.
 - **`.snyk` permanent ignores for `setuptools`/`nltk`** (no `expires` field): confirmed present
   and unchanged in `.snyk` (reasons referencing CVE-2024-6345, CVE-2022-40897, CVE-2025-47273,
@@ -228,7 +233,7 @@ as follow-up issues.
 
 ---
 
-## Follow-up Issues Opened
+## Follow-up Issues Opened (archived repository)
 
 | Issue | Severity | Priority | Title |
 |-------|----------|----------|-------|
