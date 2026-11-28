@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.82.2] - 2026-11-28
+
+Mantenimiento: dependencias al día y limpieza tras el renombrado. Sin migraciones ni cambio de
+contrato. Va con el frontend 2.96.2.
+
+### Changed
+
+- **Dependencias** (#87): FastAPI 0.165.0 (los límites nuevos de cuerpo, formularios y
+  concurrencia vienen apagados por defecto), email-validator 2.4.0 y secure 2.0.2; en
+  desarrollo, ruff, pip-tools y cyclonedx-bom. El `requirements.lock` se ha regenerado.
+- **Limpieza tras el renombrado** (#88, #89): el contacto de la licencia pasa a
+  hola@comebackgolf.com; el plan de pago sale del repositorio; se borran la auditoría de julio
+  de 2026, el plan RAG que no se hizo y un paquete vacío. El `.env.example` trae
+  `EMAIL_TRANSPORT=mailpit`, para que una copia en local no entregue correos de verdad (fuera de
+  desarrollo la app sigue exigiendo mailgun).
+
 ## [2.82.1] - 2026-11-28
 
 **Primera release desde el repositorio nuevo `agustinEDev/ComebackGolfApi`.** Sin cambios en el

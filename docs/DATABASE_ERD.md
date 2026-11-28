@@ -1,6 +1,6 @@
 # 🗄️ Database Entity Relationship Diagram (ERD)
 
-> **Version:** 2.82.1
+> **Version:** 2.82.2
 > **Last updated:** 28 November 2026
 > **Database:** PostgreSQL 15 (the image used by `docker/docker-compose.yml`, the Kind cluster and the CI integration job)
 

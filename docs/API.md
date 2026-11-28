@@ -4,7 +4,7 @@
 |---|---|
 | **Production base URL** | `https://api.comebackgolf.com` |
 | **Local base URL** | `http://localhost:8000` |
-| **Version** | 2.82.1 (`src/config/version.py`, also returned by `GET /health`) |
+| **Version** | 2.82.2 (`src/config/version.py`, also returned by `GET /health`) |
 | **Operations** | 213 in the OpenAPI schema (`app.openapi()`) |
 | **Prefix** | every business route lives under `/api/v1` |
 
