@@ -12,7 +12,7 @@
 
 Ryder-style team tournaments, quick rounds and hole-by-hole scoring for amateur golfers.
 
-[![Version](https://img.shields.io/badge/version-2.82.0-ddf478?style=flat-square&labelColor=222d24)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.82.1-ddf478?style=flat-square&labelColor=222d24)](CHANGELOG.md)
 [![CI](https://img.shields.io/github/actions/workflow/status/agustinEDev/ComebackGolfApi/ci_cd_pipeline.yml?branch=develop&style=flat-square&label=CI&labelColor=222d24&logo=githubactions&logoColor=ddf478)](https://github.com/agustinEDev/ComebackGolfApi/actions/workflows/ci_cd_pipeline.yml)
 [![Tests](https://img.shields.io/badge/tests-13k%2B-ddf478?style=flat-square&labelColor=222d24&logo=pytest&logoColor=ddf478)](tests/README.md)
 [![Coverage gate](https://img.shields.io/badge/coverage%20gate-%E2%89%A588%25-ddf478?style=flat-square&labelColor=222d24)](docs/ci-cd/PIPELINE_GUIDE.md)

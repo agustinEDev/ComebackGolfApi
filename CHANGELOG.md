@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.82.1] - 2026-11-28
+
+**Primera release desde el repositorio nuevo `agustinEDev/ComebackGolfApi`.** Sin cambios en el
+código ni migraciones: solo documentación. Va con el frontend 2.96.1.
+
+### Changed
+
+- **Documentación renovada** (#84): README rehecho; referencia de la API (213 operaciones),
+  diagrama de la base de datos (44 tablas), módulos, despliegue, entornos, runbook, guía de la
+  pipeline, modelo de amenazas, problemas de seguridad conocidos y los README de Kind, Docker y
+  tests, al día con el nombre y los repos nuevos.
+
 ## [2.82.0] - 2026-11-27
 
 **El código deja de nombrar la marca vieja** (#947, #948). Sin migraciones ni cambio de

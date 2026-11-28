@@ -17,7 +17,7 @@ cuando algo falla.
 
 ```bash
 curl -s https://api.comebackgolf.com/health
-# {"status":"ok","version":"2.82.0","commit":"<sha>","branch":"main","environment":"production"}
+# {"status":"ok","version":"2.82.1","commit":"<sha>","branch":"main","environment":"production"}
 ```
 
 `version` sale de `src/config/version.py` y `commit`/`branch` de las variables que
