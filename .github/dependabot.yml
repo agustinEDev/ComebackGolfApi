@@ -49,6 +49,9 @@ updates:
           - "zipp"
           - "pygments"
           - "coverage*"
+          # Solo el job semanal de mutación (requirements-mutacion.txt; su lock con hashes
+          # se regenera a mano con pip-compile)
+          - "cosmic-ray*"
         update-types:
           - "minor"
           - "patch"
