@@ -1,6 +1,6 @@
 # Roadmap - Comeback Golf Backend
 
-> **Versión en producción:** 2.82.1 (28 nov 2026) · fuente: `src/config/version.py`
+> **Versión en producción:** 2.82.2 (28 nov 2026) · fuente: `src/config/version.py`
 >
 > El detalle de cada versión está en el [CHANGELOG](CHANGELOG.md). Este documento resume
 > lo que ya existe y lo que queda por delante; no repite el historial.
