@@ -12,6 +12,7 @@ If this page and the workflow disagree, the workflow wins.
 | --- | --- |
 | **CI/CD Pipeline** | `push` to `main`, `develop`, `release/**`, `hotfix/**` (changes only to Markdown, `docs/**`, `CHANGELOG.md` or `LICENSE` are ignored); `pull_request` to `main` or `develop`; manual `workflow_dispatch` |
 | **Snyk (weekly and releases)** | Mondays 06:00 UTC, pull requests to `main`, manual |
+| **Mutation Score** ([`mutacion.yml`](../../.github/workflows/mutacion.yml)) | Mondays 02:00 UTC, manual. cosmic-ray over the scoring code ([`mutacion.toml`](../../mutacion.toml)); never blocks, the score goes to the job summary and the report is an artifact |
 
 Dependabot (`.github/dependabot.yml`) opens weekly dependency PRs against `develop`,
 with a cooldown for freshly published versions: 5 days for pip and GitHub Actions, 3 for

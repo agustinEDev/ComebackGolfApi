@@ -1,0 +1,25 @@
+# Puntuación de mutación con cosmic-ray (método de auditoría v2, testabilidad): mete
+# un error pequeño en el código (un > por >=, un + por -...) y mira si algún test lo
+# caza. Solo el cálculo de la anotación: el dominio entero no cabe en un job de GitHub.
+# mutmut no sirve aquí: no admite módulos que se importan como `src.modules...`.
+# La lanza .github/workflows/mutacion.yml una vez por semana; no bloquea nada.
+#
+# Ojo: cosmic-ray cambia los ficheros en su sitio mientras corre. En local, no tocar el
+# repo hasta que acabe. Y los tests de cada mutante son SIEMPRE este conjunto amplio:
+# con un fichero de tests que no existe, pytest no corre nada y el mutante cuenta como
+# eliminado (un 100 % falso). El job comprueba antes que se recogen tests.
+[cosmic-ray]
+module-path = [
+    "src/modules/competition/domain/services/scoring_service.py",
+    "src/modules/competition/domain/services/tarjeta_de_stroke_play.py",
+    "src/modules/competition/domain/services/clasificacion.py",
+    "src/modules/competition/domain/services/barra_del_jugador.py",
+    "src/modules/quick_match/domain/services/hole_completion_service.py",
+    "src/modules/quick_match/domain/entities/quick_match.py",
+]
+timeout = 120.0
+excluded-modules = []
+test-command = "python -m pytest -x -q -n 0 -p no:cacheprovider tests/unit/modules/competition/domain tests/unit/modules/quick_match/domain"
+
+[cosmic-ray.distributor]
+name = "local"

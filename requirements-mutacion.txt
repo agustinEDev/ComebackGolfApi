@@ -1,0 +1,5 @@
+# Puntuación de mutación (método de auditoría v2): solo la instala el job semanal
+# .github/workflows/mutacion.yml, encima de requirements-dev.txt. Va aparte para que
+# no la instale cada job del CI; Dependabot la sigue igual. No mueve ninguna versión de
+# requirements.lock (el job lo comprueba después de instalarla).
+cosmic-ray==8.9.0
