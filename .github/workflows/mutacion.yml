@@ -1,0 +1,102 @@
+name: Mutation Score
+
+# Puntuación de mutación (cosmic-ray) del cálculo de la anotación: mide si los tests
+# fallan cuando el código cambia, no solo si lo recorren. La usa la auditoría (método v2,
+# testabilidad), que lee la puntuación del último informe. No bloquea nada: corre una
+# vez por semana y a mano. Qué se muta y con qué tests: mutacion.toml.
+on:
+  schedule:
+    - cron: '0 2 * * 1' # lunes, 03:00 en Madrid en invierno, 04:00 en verano
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-score
+  # Una a mano no cancela la semanal que esté corriendo: espera
+  cancel-in-progress: false
+
+jobs:
+  mutation:
+    name: Mutation score (scoring)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Siempre develop, también al lanzarlo a mano desde otra rama: se mide lo
+          # que va a salir
+          ref: develop
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          bash .github/scripts/instalar_dependencias.sh --dev
+          # cosmic-ray y sus dependencias, fijadas y con hashes; --no-deps: solo lo del lock
+          python -m pip install --require-hashes --no-deps -r requirements-mutacion.lock
+          # cosmic-ray no puede mover ninguna versión de los locks
+          python .github/scripts/comprobar_lock_instalado.py requirements.lock requirements-bootstrap.lock
+
+      - name: Audit the installed packages
+        # pip-audit del CI no ve estas dependencias: solo las instala este job
+        run: |
+          pip-audit --format json --output "$RUNNER_TEMP/pip-audit.json" || true
+          python .github/scripts/pip_audit_gate.py "$RUNNER_TEMP/pip-audit.json"
+
+      - name: The test command really runs tests
+        # Con una ruta de tests que no exista, pytest no corre nada y cada mutante
+        # contaría como eliminado: un 100 % falso
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest --collect-only -q -n 0 -p no:cacheprovider \
+            tests/unit/modules/competition/domain tests/unit/modules/quick_match/domain \
+            | tail -1 | tee "$RUNNER_TEMP/recogidos.txt"
+          grep -Eq '^[0-9]{3,} tests? collected' "$RUNNER_TEMP/recogidos.txt"
+
+      - name: Run cosmic-ray
+        # Por debajo del tope del job: si se corta, el resumen y la subida tienen margen
+        timeout-minutes: 270
+        run: |
+          cosmic-ray init mutacion.toml "$RUNNER_TEMP/mutacion.sqlite"
+          cosmic-ray baseline mutacion.toml
+          cosmic-ray exec mutacion.toml "$RUNNER_TEMP/mutacion.sqlite"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ ! -f "$RUNNER_TEMP/mutacion.sqlite" ]; then echo "No report"; exit 0; fi
+          cr-report "$RUNNER_TEMP/mutacion.sqlite" --show-pending > "$RUNNER_TEMP/mutacion.txt" || true
+          tail -3 "$RUNNER_TEMP/mutacion.txt"
+          python - "$RUNNER_TEMP/mutacion.txt" <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import re, sys
+          texto = open(sys.argv[1], encoding="utf-8").read()
+          trabajos = re.search(r"total jobs: (\d+)", texto)
+          total = re.search(r"complete: (\d+)", texto)
+          vivos = re.search(r"surviving mutants: (\d+)", texto)
+          if not (trabajos and total and vivos) or int(total.group(1)) == 0:
+              print("### Mutation score: no result")
+          else:
+              n, t, v = int(trabajos.group(1)), int(total.group(1)), int(vivos.group(1))
+              parcial = "" if t == n else " PARTIAL: the run did not finish"
+              print(f"### Mutation score: {100 * (t - v) / t:.2f} % ({t - v} killed of {t} completed, {n} mutants){parcial}")
+          EOF
+          cr-html "$RUNNER_TEMP/mutacion.sqlite" > "$RUNNER_TEMP/mutacion.html" || true
+          mkdir -p reports/mutation
+          cp "$RUNNER_TEMP"/mutacion.* reports/mutation/
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mutation-report
+          path: reports/mutation/
+          retention-days: 90
+          if-no-files-found: ignore
