@@ -55,7 +55,6 @@
 |-----------|----------|
 | [ROADMAP.md](../ROADMAP.md) | Lo que hay y lo que queda |
 | [pendientes-de-release.md](pendientes-de-release.md) | Decisiones que una release deja para otra |
-| [plan-de-pago-e-ia.md](plan-de-pago-e-ia.md) | Plan de pago e IA (aparcado) |
 
 ## 🗄️ Histórico
 

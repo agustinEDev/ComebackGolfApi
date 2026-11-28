@@ -29,8 +29,8 @@ hándicaps con la RFEG y comprobación diaria de la clave de Brevo.
 - **Decisiones abiertas de la última release:** ver
   [docs/pendientes-de-release.md](docs/pendientes-de-release.md).
 - **Plan de pago e IA (aparcado):** asistente del reglamento, entrenador de swing y
-  caddie. Plan, costes y precio en [docs/plan-de-pago-e-ia.md](docs/plan-de-pago-e-ia.md)
-  y [ADR-052](docs/architecture/decisions/ADR-052-no-ai-rules-assistant-for-now.md).
+  caddie. El plan, con costes y precio, se guarda fuera del repositorio; la
+  decisión técnica está en [ADR-052](docs/architecture/decisions/ADR-052-no-ai-rules-assistant-for-now.md).
   Aparcado hasta poder facturar; necesita antes un sistema de pagos
   (Stripe), que hoy no existe. Sustituye al antiguo módulo «AI & RAG» (LangChain +
   Pinecone + OpenAI), que no se llegó a hacer: [docs/RAG_IMPLEMENTATION.md](docs/RAG_IMPLEMENTATION.md).

@@ -1,6 +1,6 @@
 # 🤖 Guía de Implementación RAG - Asistente de Reglamento de Golf
 
-> **⚠️ SUSTITUIDO (26 oct 2026):** este plan de diciembre de 2025 no se llegó a implementar y ha quedado desfasado (proveedores, corpus y licencia). Se conserva como histórico. El plan vigente está en [plan-de-pago-e-ia.md](plan-de-pago-e-ia.md) y en la épica BE #676 del repositorio archivado (archived repository; aparcada).
+> **⚠️ SUSTITUIDO (26 oct 2026):** este plan de diciembre de 2025 no se llegó a implementar y ha quedado desfasado (proveedores, corpus y licencia). Se conserva como histórico. El plan vigente se guarda fuera del repositorio; su decisión técnica está en [ADR-052](architecture/decisions/ADR-052-no-ai-rules-assistant-for-now.md) y en la épica BE #676 del repositorio archivado (archived repository; aparcada).
 
 ---
 
