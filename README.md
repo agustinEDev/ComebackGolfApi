@@ -1,726 +1,299 @@
-# 🏆 Comeback Golf - Backend API
-
-> Professional REST API for managing amateur Ryder Cup golf tournaments
-
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-2.0.18-blue?style=for-the-badge&logo=semver)](.)
-[![Python](https://img.shields.io/badge/python-3.12%20%7C%203.14-3776AB?style=for-the-badge&logo=python&logoColor=white)](.)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.125.0-009688?style=for-the-badge&logo=fastapi&logoColor=white)](.)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15+-336791?style=for-the-badge&logo=postgresql&logoColor=white)](.)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-0096C7?style=for-the-badge&logo=kubernetes&logoColor=white)](k8s/README.md)
+<a href="https://www.comebackgolf.com">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://www.comebackgolf.com/brand/wordmark-acid.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://www.comebackgolf.com/brand/wordmark-deep.svg">
+    <img alt="Comeback Golf" src="https://www.comebackgolf.com/brand/wordmark-deep.svg" width="360">
+  </picture>
+</a>
 
-[![Tests](https://img.shields.io/badge/tests-2158%20passing-00C853?style=for-the-badge&logo=pytest&logoColor=white)](.)
-[![Coverage](https://img.shields.io/badge/coverage-90%25-success?style=for-the-badge&logo=codecov)](.)
-[![OWASP](https://img.shields.io/badge/OWASP-9.4%2F10-4CAF50?style=for-the-badge&logo=owasp)](https://owasp.org/www-project-top-ten/)
-[![CI/CD](https://img.shields.io/badge/CI%2FCD-passing-2088FF?style=for-the-badge&logo=github-actions&logoColor=white)](.)
+### Golf among friends — the API behind it
 
-[![Clean Architecture](https://img.shields.io/badge/architecture-Clean%20Architecture-blueviolet?style=for-the-badge)](.)
-[![DDD](https://img.shields.io/badge/design-Domain%20Driven-orange?style=for-the-badge)](.)
-[![License](https://img.shields.io/badge/license-All%20rights%20reserved-lightgrey?style=for-the-badge)](LICENSE)
+Ryder-style team tournaments, quick rounds and hole-by-hole scoring for amateur golfers.
+
+[![Version](https://img.shields.io/badge/version-2.82.1-ddf478?style=flat-square&labelColor=222d24)](CHANGELOG.md)
+[![CI](https://img.shields.io/github/actions/workflow/status/agustinEDev/ComebackGolfApi/ci_cd_pipeline.yml?branch=develop&style=flat-square&label=CI&labelColor=222d24&logo=githubactions&logoColor=ddf478)](https://github.com/agustinEDev/ComebackGolfApi/actions/workflows/ci_cd_pipeline.yml)
+[![Tests](https://img.shields.io/badge/tests-13k%2B-ddf478?style=flat-square&labelColor=222d24&logo=pytest&logoColor=ddf478)](tests/README.md)
+[![Coverage gate](https://img.shields.io/badge/coverage%20gate-%E2%89%A588%25-ddf478?style=flat-square&labelColor=222d24)](docs/ci-cd/PIPELINE_GUIDE.md)
+
+[![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.14-e8ddce?style=flat-square&labelColor=222d24&logo=python&logoColor=e8ddce)](requirements.txt)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.162-e8ddce?style=flat-square&labelColor=222d24&logo=fastapi&logoColor=e8ddce)](requirements.txt)
+[![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.1-e8ddce?style=flat-square&labelColor=222d24&logo=sqlalchemy&logoColor=e8ddce)](requirements.txt)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-e8ddce?style=flat-square&labelColor=222d24&logo=postgresql&logoColor=e8ddce)](docker/docker-compose.yml)
+[![License](https://img.shields.io/badge/license-all%20rights%20reserved-e8ddce?style=flat-square&labelColor=222d24)](LICENSE)
+
+[**Web app**](https://www.comebackgolf.com) ·
+[**Frontend repo**](https://github.com/agustinEDev/ComebackGolfWeb) ·
+[**API reference**](docs/API.md) ·
+[**Docs**](docs/README.md) ·
+[**Changelog**](CHANGELOG.md)
 
 </div>
 
 ---
 
-## 🌟 Overview
+## ⛳ What it is
 
-**ComebackGolfApi** is a production-ready backend API designed for managing amateur Ryder Cup style golf tournaments. Built with Clean Architecture and Domain-Driven Design principles, it provides a robust foundation for tournament management, player enrollment, live scoring, and real-time leaderboards.
+**Comeback Golf** is an app for amateur golfers who play with their friends: organise a
+tournament in the Ryder-style team format (or Stableford and Medal), invite players,
+draft the teams, score every hole from the course and follow the standings live. Or
+skip the tournament and start a quick round in seconds.
 
-### 🎯 Key Highlights
+This repository is the **backend**: a FastAPI REST API, built with Clean Architecture and
+Domain-Driven Design, that serves the web app at
+[www.comebackgolf.com](https://www.comebackgolf.com) from `https://api.comebackgolf.com`.
 
-- ✅ **83 REST API endpoints** fully documented (Swagger UI)
-- ✅ **2,158 tests** passing (100% success rate, ~90s execution)
-- ✅ **OWASP Top 10 Score: 9.4/10** - Production-grade security
-- ✅ **Clean Architecture** - 3-layer separation with DDD patterns
-- ✅ **RBAC Foundation** - Simplified, three-tier role system (v2.0.0)
-- ✅ **Google OAuth** - Login, link and unlink Google accounts (Sprint 3)
-- ✅ **Invitations** - Email invitations with secure tokens and bilingual emails (Sprint 3)
-- ✅ **Live Scoring** - Hole-by-hole scoring with dual validation and leaderboard (Sprint 4)
-- ✅ **Rounds, Matches & Teams** - Full tournament scheduling with WHS handicap calculation (Sprint 2)
-- ✅ **Competition ↔ GolfCourse M2M** - Multi-course tournaments with ordering (v2.0.2)
-- ✅ **10 CI/CD jobs** - GitHub Actions pipeline (~3min)
-- ✅ **Device Fingerprinting** - Advanced session management with auto-registration
-- ✅ **166 Countries** - Full country database with 614 border relationships
+| | |
+|---|---|
+| 🔌 **213** operations in the OpenAPI schema | 🧪 **13,000+** tests (unit, integration, security) |
+| 🧱 **6** bounded contexts + a shared kernel | 📜 **50** Architecture Decision Records |
 
----
-
-> **History.** This project had another name until November 2026. Issue and PR
-> numbers written before the new repositories (`BE #N`, `FE #N`) refer to the archived
-> repositories, kept private and read-only.
-
-## 🌐 Frontend Application
-
-This is the **backend API**. For the web frontend application, visit:
-
-👉 **[ComebackGolfWeb Repository](https://github.com/agustinEDev/ComebackGolfWeb)**
+> **History.** This project had another name until November 2026. Issue and PR numbers
+> written before the new repositories (`BE #N`, `FE #N`) refer to the archived
+> repositories.
 
 ---
 
-## 🚀 Quick Start
+## 🧩 What's inside
 
-### Prerequisites
-- Docker & Docker Compose
-- Git
+| | Module | What it does |
+|---|---|---|
+| 👤 | **`user`** | Sign-up with email verification, sign-in with httpOnly cookies, Google sign-in, password reset, email change, devices, handicap (RFEG lookup or manual), avatars and photo uploads (HEIC included), player stats, terms acceptance, admin panel |
+| 🏆 | **`competition`** | Tournaments in Ryder-style team format (`RYDER_CUP`), Stableford and Medal · lifecycle `DRAFT → ACTIVE → CLOSED → IN_PROGRESS → COMPLETED` with backward steps · enrollments, invitations, waiting lists, automatic enrollment closing · teams, captains, draft and envelopes · rounds and matches (Singles, Fourball, Foursomes) · stroke-play tee groups · hole-by-hole scoring, standings and leaderboard |
+| ⛳ | **`golf_course`** | Courses with tees and holes, requests reviewed by an admin, import of the Spanish federation's courses, hole maps matched from OpenStreetMap |
+| ⚡ | **`quick_match`** | Rounds outside a tournament: friends and guests without an account, delegated scorers, auto-close of abandoned rounds, hide and delete, stats exclusion |
+| 🤝 | **`social`** | Friends and blocking, public profiles, photo gallery, friends' activity feed and achievements |
+| ✉️ | **`support`** | Contact form delivered to the app's mailbox |
+| 🧱 | **`shared`** | The kernel every module uses: playing-handicap and match-play rules, email delivery, HTTP middleware, security, persistence |
+| ⚙️ | **`config`** | Composition root: settings, dependency wiring, rate limits, CSRF, startup safety checks and background jobs |
 
-### Local Development (Docker Compose)
+---
+
+## 🏛️ Architecture
+
+Each module is split into three layers, and the dependency rule only points inwards:
+**infrastructure → application → domain**. The domain imports no framework. The rules
+are not a convention: 19 [`import-linter`](.importlinter) contracts and the tests in
+`tests/unit/architecture/` break the build if a layer or a module reaches where it
+should not.
+
+```mermaid
+flowchart TB
+    WEB["🌐 Web app<br/>ComebackGolfWeb"] -->|"HTTPS · cookies + CSRF"| MAIN
+
+    subgraph API["FastAPI · main.py"]
+        MAIN["Middleware<br/>CORS · CSRF · rate limit · security headers · correlation ID"]
+    end
+
+    MAIN --> INFRA
+
+    subgraph MOD["src/modules/ — user · competition · golf_course · quick_match · social · support"]
+        INFRA["infrastructure<br/>routers · SQLAlchemy repositories · external clients"]
+        APP["application<br/>use cases · DTOs · ports"]
+        DOM["domain<br/>entities · value objects · domain services"]
+        INFRA --> APP --> DOM
+    end
+
+    SHARED["src/shared/<br/>shared kernel · security audit events"]
+    CONFIG["src/config/<br/>composition root · settings · jobs"]
+
+    MOD --> SHARED
+    CONFIG -. wires .-> MOD
+    INFRA --> PG[("PostgreSQL 15")]
+    INFRA --> EXT["RFEG · Google · OpenStreetMap"]
+    SHARED --> MAIL["Mailgun · Resend · Brevo"]
+    API --> SENTRY["Sentry"]
+
+    classDef brand fill:#ddf478,stroke:#222d24,color:#222d24
+    classDef core fill:#222d24,stroke:#ddf478,color:#e8ddce
+    class DOM,APP,INFRA core
+    class MAIN,SHARED,CONFIG brand
+```
+
+Patterns in play: repositories and unit of work, value objects, ports and adapters,
+dependency injection through FastAPI `Depends`, and use cases that call
+the port responsible for each side effect explicitly (ADR-050). Persistence uses
+SQLAlchemy imperative mapping, so entities stay plain Python. More in
+[docs/design-document.md](docs/design-document.md) and
+[docs/project-structure.md](docs/project-structure.md).
+
+### ✉️ How an email leaves
+
+```mermaid
+flowchart LR
+    E["Email"] --> M{"Mailgun EU"}
+    M -->|sent| OK(["✅ Delivered"])
+    M -->|"429 · 500/503 · 401/403 · 404 · no key"| R{"Resend"}
+    M -->|"other 4xx · 502/504 · timeout · network error"| NO(["Not retried elsewhere"])
+    R -->|sent| OK
+    R -->|"other 4xx · 502/504 · timeout · network error"| NO
+    R -->|"429 · 500/503 · 401/403 · 404"| T{"Token or<br/>security notice?"}
+    T -->|yes| NO
+    T -->|no| B{"Brevo"}
+    B --> OK
+```
+
+The next provider is tried only after a 429, a 500/503 (any 5xx except 502/504), a
+rejected key (401/403) or a 404 (misconfigured account). After any other 4xx, a 502/504,
+a timeout or a network error it is not: the email may already be out, or would be
+refused anyway. Brevo only sends emails without a token: those that carry one
+(verification, password reset, email change) and security notices never go through it,
+because it rewrites links. Locally and in Kind, `EMAIL_TRANSPORT=mailpit` keeps everything in a local
+inbox.
+
+---
+
+## 🛠️ Stack
+
+| Area | Technology |
+|---|---|
+| Language | Python 3.12 · 3.14 (production image `python:3.14-slim`) |
+| Web | FastAPI 0.162 · Starlette 1.10 · Uvicorn 0.54 · Pydantic 2 |
+| Data | PostgreSQL 15 · SQLAlchemy 2.1 (async, imperative mapping) · asyncpg · Alembic |
+| Security | PyJWT (HS256) · bcrypt · slowapi · secure (security headers) |
+| Geo | Shapely · geojson-pydantic · tzfpy (course time zones) |
+| Images | Pillow · pillow-heif |
+| Observability | Sentry · structured security audit log · correlation IDs |
+| Quality | pytest · pytest-xdist · Ruff · mypy · import-linter |
+| Delivery | Docker · GitHub Actions · Render |
+
+Exact pins live in [`requirements.txt`](requirements.txt) and
+[`requirements-dev.txt`](requirements-dev.txt); the image installs the hashed
+[`requirements.lock`](requirements.lock).
+
+---
+
+## 🚀 Quick start
+
+**With Docker Compose** (PostgreSQL + API + Mailpit):
 
 ```bash
-# Clone repository
 git clone https://github.com/agustinEDev/ComebackGolfApi.git
 cd ComebackGolfApi
-
-# Start services (PostgreSQL + API)
-cd docker
-docker-compose up -d
-
-# View logs
-docker-compose logs -f app
-
-# Access API documentation
-open http://localhost:8000/docs
+cp docker/.env.example docker/.env          # fill in the values
+docker compose -f docker/docker-compose.yml --env-file docker/.env up -d --build
+curl -s http://localhost:8000/health
 ```
 
-**API will be available at:**
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
-- Health Check: http://localhost:8000/health
+| | |
+|---|---|
+| API | `http://localhost:8000` (`DOCKER_APP_PORT`; 8001 if unset) |
+| Interactive docs | `http://localhost:8000/docs` (HTTP Basic: `DOCS_USERNAME` / `DOCS_PASSWORD`) |
+| Test inbox | `http://127.0.0.1:8025` |
 
-### Local Development (Kubernetes)
+Migrations run on start-up (`entrypoint.sh`).
 
-For a more production-like environment, you can use Kubernetes (via Kind). This setup provides a full cluster with separate services for the API, frontend, and database.
+**Without Docker for the API:**
 
 ```bash
-# Navigate to the Kubernetes directory
-cd k8s
-
-# Run the deployment script
-# (Make sure scripts are executable: chmod +x scripts/*.sh)
-./scripts/deploy-cluster.sh
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt         # includes requirements.txt
+cp .env.example .env                        # point DATABASE_URL at a PostgreSQL (postgresql://)
+# In .env set EMAIL_TRANSPORT=mailpit (the example says mailgun: real emails)
+docker compose -f docker/docker-compose.yml --env-file docker/.env up -d mailpit   # inbox on http://127.0.0.1:8025
+alembic upgrade head
+uvicorn main:app --reload
 ```
 
-Once the script finishes, the application will be accessible at:
-- **Frontend:** `http://localhost:8080`
-- **Backend API:** `http://localhost:8000/docs`
+**Full stack on Kubernetes (Kind)**, with the frontend cloned next to this repo:
 
-For a complete guide on managing the Kubernetes environment, including troubleshooting and script details, see the **[Kubernetes README](k8s/README.md)**.
-
-### Production Deployment (Render.com)
-
-See detailed guide: [RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md)
-
-**Quick setup:**
-1. Create PostgreSQL Database on Render
-2. Create Web Service (Docker runtime)
-3. Configure environment variables (see below)
-4. Push to GitHub → Auto-deploy
-
-**Essential Environment Variables:**
 ```bash
-DATABASE_URL=<internal-database-url>
-SECRET_KEY=<random-32-chars>
-ENVIRONMENT=production
-FRONTEND_ORIGINS=https://www.comebackgolf.com
-MAILGUN_API_KEY=<your-api-key>
-MAILGUN_DOMAIN=<your-domain>
-SENTRY_DSN=<your-sentry-dsn>  # Optional but recommended
+./k8s/scripts/deploy-cluster.sh             # API on :8000, web on :8080
 ```
+
+See [k8s/README.md](k8s/README.md), [docker/README.md](docker/README.md) and
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
+---
+
+## 🧪 Tests
+
+```bash
+pytest tests/unit/                 # 11,258 tests, no database
+pytest tests/integration/          #  1,737 tests, needs PostgreSQL
+pytest tests/security -n 2         #     67 tests: CSRF, XSS, SQLi, auth bypass, rate limits
+```
+
+Counts from `pytest --collect-only` on v2.82.0. Tests run in parallel by default
+(`-n auto`), and every integration test gets its own throw-away database. Details in
+[tests/README.md](tests/README.md).
+
+---
+
+## 🔐 Security and quality
+
+**In the application**
+
+- 🍪 Sessions in **httpOnly cookies** (15-minute access token, 7-day refresh token); no
+  bearer tokens.
+- 🛡️ **CSRF**: signed token bound to the session, sent as `X-CSRF-Token` and checked
+  against its cookie.
+- 🚦 **Rate limiting**: stricter limits on sensitive routes and a default of 100/min per
+  user for every session route without its own (a few are explicitly exempt), keyed on
+  the verified user or the real client IP behind Cloudflare (ADR-038, ADR-041).
+- 🔑 **Login brake** per email and network, plus an account-wide backstop (ADR-043);
+  bcrypt with 12 rounds; the last 5 passwords cannot be reused.
+- 🔗 Email links are stored hashed and expire (verification 48 h, password reset 1 h).
+- 🧾 Security headers (HSTS, CSP, `X-Frame-Options`, `nosniff`, referrer policy,
+  `no-store`), upload size caps,
+  docs behind HTTP Basic, and a start-up check that refuses to run with an unsafe
+  configuration (weak `SECRET_KEY`, malformed cookie domain, missing CORS origins…).
+- 🔭 Security audit log, correlation IDs on every response and Sentry.
+
+**In the pipeline** ([guide](docs/ci-cd/PIPELINE_GUIDE.md))
+
+| Check | Tool |
+|---|---|
+| Lint, format, types | Ruff · mypy |
+| Architecture | import-linter (19 contracts) |
+| API contract | oasdiff against the base branch |
+| OWASP Top 10 | Semgrep (`p/owasp-top-ten`, `p/python`) |
+| Code and dependencies | Bandit · pip-audit · Dependency Review · weekly Snyk |
+| Secrets | Gitleaks over the whole history |
+| Image | Trivy · start-up exactly like Render |
+| Supply chain | Hash-pinned locks · CycloneDX SBOM · GPG-signed commits |
+| Tests | Unit, integration and security on Python 3.12 and 3.14; coverage floor 88 % |
+
+Threat model: [docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md) ·
+accepted risks: [docs/KNOWN_SECURITY_ISSUES.md](docs/KNOWN_SECURITY_ISSUES.md).
 
 ---
 
 ## 📚 Documentation
 
-| Document | Description |
-|----------|-------------|
-| [ROADMAP.md](ROADMAP.md) | Product roadmap and version planning |
-| [CHANGELOG.md](CHANGELOG.md) | Detailed version history |
-| [API.md](docs/API.md) | API endpoints reference |
-| [ADRs](docs/architecture/decisions/) | Architecture Decision Records (33 total) |
-| [SECURITY_IMPLEMENTATION.md](docs/SECURITY_IMPLEMENTATION.md) | Security features documentation |
-| [MULTI_ENVIRONMENT_SETUP.md](docs/MULTI_ENVIRONMENT_SETUP.md) | Environment configuration guide |
-
----
-
-## 🛠️ Tech Stack
-
-<div align="center">
-
-| Category | Technologies |
-|----------|-------------|
-| **Language** | Python 3.12+ |
-| **Framework** | FastAPI 0.125.0 |
-| **Database** | PostgreSQL 15+ |
-| **ORM** | SQLAlchemy 2.0 (Imperative Mapping) |
-| **Migrations** | Alembic |
-| **Authentication** | JWT (httpOnly cookies + headers) |
-| **Email** | Mailgun (EU region) |
-| **Monitoring** | Sentry (errors + APM + profiling) |
-| **Cache** | Redis (planned for leaderboards) |
-| **Security** | SlowAPI, secure, bcrypt |
-| **Testing** | pytest, pytest-xdist, pytest-asyncio |
-| **CI/CD** | GitHub Actions |
-| **Deployment** | Docker, Render.com |
-
-</div>
-
----
-
-## ✨ Features
-
-### User Management
-- ✅ **RBAC Foundation (v2.0.0)**: Simplified three-tier role system (ADMIN, CREATOR, PLAYER).
-- ✅ Registration with email verification (bilingual ES/EN)
-- ✅ JWT authentication (httpOnly cookies + dual support)
-- ✅ Profile management (personal info + security)
-- ✅ Handicap system (manual + RFEG integration)
-- ✅ Password reset with secure tokens (256-bit, 24h expiration)
-- ✅ Device fingerprinting with auto-registration
-
-> **Admin User Setup**: Set `ADMIN_EMAIL=admin@example.com` in `.env` before running migrations. The initial admin is auto-promoted during migration. For post-migration promotion: `UPDATE users SET is_admin = TRUE WHERE email = 'user@example.com';`
-
-### Competition Module
-- ✅ CRUD operations for tournaments
-- ✅ State machine (6 states): DRAFT → ACTIVE ↔ CLOSED ↔ IN_PROGRESS → COMPLETED
-- ✅ Enrollment system (invitations + approvals)
-- ✅ Custom handicap override per competition
-- ✅ 166 countries with multilanguage support
-- ✅ **Competition ↔ GolfCourse M2M** (v2.0.2) - Multi-course tournaments with ordering
-- ✅ **Rounds & Matches** (Sprint 2) - Session-based scheduling, match generation, WHS handicap calculation
-- ✅ **Invitations** (Sprint 3) - Email invitations with secure tokens, bilingual emails, auto-enrollment
-- ✅ **Live Scoring** (Sprint 4) - Hole-by-hole scoring, dual validation, leaderboard, match concession
-- ✅ **Backward transitions** (v2.0.14) - Revert IN_PROGRESS→CLOSED, reopen CLOSED→ACTIVE
-- ✅ 45 endpoints (12 competition + 8 enrollment + 4 golf courses + 11 rounds/matches + 5 invitations + 5 scoring)
-
-### Support Module (v2.0.8)
-- ✅ **Contact Form** - Public endpoint for support requests (no authentication required)
-- ✅ **Email Delivery** - Submissions are emailed as plain text to `CONTACT_EMAIL` through Mailgun (EU); before 2.52 they opened GitHub issues
-- ✅ **Input Sanitization** - Control and invisible characters removed from the subject and name, control characters from the message
-- ✅ **Rate Limiting** - 10 per day per network (a failed send counts too) and 20 per day app-wide
-- ✅ 1 endpoint: `POST /api/v1/support/contact`
-
-### Security Features (v1.13.1)
-- ✅ **httpOnly Cookies** - XSS prevention for tokens
-- ✅ **Session Timeout** - 15min access tokens, 7-day refresh tokens
-- ✅ **Login brake** - per email + network: 10 failures lock that network 30 min; the owner's trusted device is never locked out (ADR-043)
-- ✅ **CSRF Protection** - Triple-layer (header + cookie + SameSite)
-- ✅ **Password History** - Prevents reuse of last 5 passwords
-- ✅ **Device Fingerprinting** - SHA256 fingerprints, device management
-- ✅ **IP Spoofing Prevention** - Trusted proxy validation
-- ✅ **Rate Limiting** - Per-endpoint throttling (5-100 req/min)
-- ✅ **Security Headers** - HSTS, X-Frame-Options, CSP
-- ✅ **Audit Logging** - 8 security event types, JSON structured
-- ✅ **Correlation IDs** - Full request traceability
-- ✅ **Input Sanitization** - HTML sanitization, XSS prevention
-- ✅ **Sentry Integration** - Error tracking + APM + profiling
-
-### What's New
-
-**v2.0.18 (Jul 7, 2026) — Hotfix**
-- ✅ **Same-Day Competition Dates**: Single-day tournaments (`start_date == end_date`) are now accepted
-- ✅ **Live Match Result Visibility**: Scorecard summary now derives the result from validated holes instead of waiting for every player to submit
-
-**v2.0.17 (Jul 2026) — Scoring Improvements**
-- ✅ **Handicap Revert to RFEG**: New `DELETE /enrollments/{id}/handicap` lets creator/admin clear a custom handicap, reverting to the official RFEG value
-- ✅ **Handicap Edit Gating**: Setting/removing custom handicaps only allowed in DRAFT/ACTIVE/CLOSED (blocked once matches are generated)
-- ✅ **Auto Handicap Refresh on Login**: Daily silent RFEG lookup for Spanish players; `needs_handicap` flag for the rest
-- ✅ **Admin Full Access**: Admins bypass creator-only checks across scoring and match management use cases
-- ✅ **Playing Handicap Limit**: Optional `max_playing_handicap` cap (1–54) per competition
-- ✅ **Best Ball Determinism**: Deterministic tie-break + returns both tied player IDs in Fourball
-- ✅ **1 new endpoint**, 51 new tests (1,966 total unit)
-
-**v2.0.14 (Feb 24, 2026)**
-- ✅ **Backward State Transitions**: Revert IN_PROGRESS→CLOSED, reopen CLOSED→ACTIVE
-- ✅ **2 new endpoints**, 29 new tests (2,158 total)
-
-**v2.0.13 (Feb 24, 2026) — Sprint 4: Live Scoring**
-- ✅ **Live Scoring**: Hole-by-hole scoring with dual validation (own_score + marker_score)
-- ✅ **Leaderboard**: Team points, match standings, player names
-- ✅ **Scorecard submission**: Validates all holes MATCH, auto-completes match/round
-- ✅ **Match concession**: Players concede own team, creator any team
-- ✅ **User search autocomplete**: Partial name search (max 10 results)
-- ✅ **6 new endpoints**, 238 new tests
-
-**v2.0.12 (Feb 19, 2026) — Sprint 3: Invitations**
-- ✅ **Invitation System**: Invite by user ID or email, accept/decline, auto-enrollment
-- ✅ **Bilingual Emails**: ES/EN invitation emails via Mailgun
-- ✅ **5 new endpoints**, 194 new tests
-
-**v2.0.9 (Feb 16, 2026) — Sprint 3: Google OAuth**
-- ✅ **Google OAuth**: Login/register with Google, link/unlink accounts
-- ✅ **3 new endpoints**
-
-### Coming Soon
-- 🔄 **GDPR Compliance** - Data export, right to be forgotten (v2.1.0)
-- 🔄 **WebSocket Leaderboards** - Real-time updates (v2.1.1)
-- ⏸️ **Rules assistant & swing tutor** - Parked until the paid plan ([plan](docs/plan-de-pago-e-ia.md), #676)
-
----
-
-## 🏗️ Architecture
-
-### Clean Architecture + DDD
-
-```
-src/
-├── modules/
-│   ├── user/
-│   │   ├── domain/          # Entities, VOs, Events, Interfaces
-│   │   ├── application/     # Use Cases, DTOs
-│   │   └── infrastructure/  # API, DB, External Services
-│   ├── competition/
-│   ├── golf_course/
-│   └── support/
-├── shared/                  # Cross-cutting concerns
-└── config/                  # Settings, dependencies
-```
-
-### Design Patterns
-- **Repository + Unit of Work** - Data access abstraction
-- **Value Objects** - Encapsulated validation logic
-- **Port/Adapter (Hexagonal)** - External service interfaces
-- **Dependency Injection** - FastAPI Depends()
-- **Use Cases** - Single responsibility per operation
-
-### Key Principles
-- **SOLID** compliance
-- **Dependency Inversion** - Domain never imports Infrastructure
-- **Testability** - 90%+ coverage on business logic
-- **Immutability** - Value Objects are immutable
-- **Explicit side effects** - Use cases call the port that does it (ADR-050)
-
----
-
-## 🧪 Testing
-
-### Running Tests
-
-```bash
-# Full test suite (recommended - with parallelization)
-python dev_tests.py
-
-# Specific test categories
-pytest tests/unit/              # Unit tests only (~40s)
-pytest tests/integration/       # Integration tests (~20s)
-pytest tests/security/          # Security tests (~5s)
-
-# With coverage report
-pytest --cov=src --cov-report=html
-
-# Parallel execution (faster)
-pytest tests/ -n auto
-```
-
-### Test Statistics (v2.0.14)
-
-| Category | Tests | Status | Coverage |
-|----------|-------|--------|----------|
-| **Total** | **2,158** | ✅ 100% passing | 90%+ |
-| Unit tests | 1,902 | ✅ 100% | 90%+ |
-| Integration tests | 256 | ✅ 100% (1 skipped) | - |
-
-**Execution Time**: ~90 seconds (with pytest-xdist parallelization)
-
-**Test Types**:
-- Unit tests (domain + application logic)
-- Integration tests (database + API endpoints)
-- Security tests (OWASP Top 10 coverage)
-- E2E tests (full user flows)
-
----
-
-## 🔐 Security
-
-### OWASP Top 10 2021 Score: 9.4/10 ⭐
-
-<div align="center">
-
-| Category | Score | Mitigation |
-|----------|-------|------------|
-| **A01: Broken Access Control** | 10/10 | JWT, refresh tokens, CSRF, RBAC, device fingerprinting |
-| **A02: Cryptographic Failures** | 10/10 | bcrypt 12 rounds, httpOnly cookies, HSTS, SHA256 tokens |
-| **A03: Injection** | 10/10 | SQLAlchemy ORM, Pydantic validation, HTML sanitization |
-| **A04: Insecure Design** | 9/10 | Rate limiting, field limits, secure defaults |
-| **A05: Security Misconfiguration** | 9.5/10 | CORS whitelist, security headers, fail-fast validation |
-| **A06: Vulnerable Components** | 9/10 | Snyk scanning, dependency audit, CI/CD checks |
-| **A07: ID & Auth Failures** | 9.5/10 | Password policy, account lockout, password history, session timeout |
-| **A08: Software & Data Integrity** | 7/10 | GPG commit signing, code review (CI/CD SCA pending) |
-| **A09: Logging Failures** | 10/10 | Audit trail, correlation IDs, Sentry monitoring |
-| **A10: SSRF** | 8/10 | Input validation, URL whitelisting |
-
-</div>
-
-**Security Features Timeline**:
-- **v1.8.0**: httpOnly cookies, session timeout, rate limiting, CORS, security headers
-- **v1.11.0**: Password reset system with secure tokens
-- **v1.13.0**: Account lockout, CSRF protection, password history, device fingerprinting
-- **v1.13.1**: IP spoofing prevention, current device detection
-
-See [SECURITY_IMPLEMENTATION.md](docs/SECURITY_IMPLEMENTATION.md) for complete details.
-
----
-
-## 🔄 CI/CD Pipeline
-
-### GitHub Actions Workflow
-
-10 parallel jobs executed on every push:
-
-| Job | Description | Duration |
-|-----|-------------|----------|
-| **unit_tests** | Unit tests (matrix: Python 3.12, 3.14) | ~45s |
-| **integration_tests** | Integration tests with PostgreSQL service (Python 3.12, 3.14) | ~60s |
-| **security_tests** | CSRF, XSS, SQL injection, auth bypass and rate limiting tests (Python 3.12, 3.14) | ~60s |
-| **security_checks** | Bandit + pip-audit + Gitleaks (Python 3.14) | ~25s |
-| **linting** | Ruff linting (fast Rust-based linter) | ~20s |
-| **type_checking** | Mypy static type analysis | ~30s |
-| **build** | Docker build + Alembic validation | ~50s |
-| **snyk_scan** | Snyk Test (SCA) + Snyk Code (SAST) | ~40s |
-| **gitleaks** | Secret scanning in commits | ~15s |
-| **pipeline_summary** | Aggregate results and report | ~10s |
-
-**Total Pipeline Duration**: ~3 minutes
-
-**Branch Protection**:
-- All jobs must pass before merge
-- GPG-signed commits required on `main` and `develop`
-- Minimum 1 approving review for PRs
-
-See [ADR-021](docs/architecture/decisions/ADR-021-github-actions-ci-cd-pipeline.md) for technical decisions.
-
----
-
-## 📡 API Endpoints
-
-### Available Endpoints (83 total)
-
-<details>
-<summary><b>Authentication (11 endpoints)</b></summary>
-
-- `POST /api/v1/auth/register`
-- `POST /api/v1/auth/login`
-- `GET /api/v1/auth/current-user`
-- `POST /api/v1/auth/logout`
-- `POST /api/v1/auth/verify-email`
-- `POST /api/v1/auth/resend-verification`
-- `POST /api/v1/auth/refresh-token`
-- `POST /api/v1/auth/forgot-password`
-- `POST /api/v1/auth/reset-password`
-- `POST /api/v1/auth/validate-reset-token`
-- `POST /api/v1/auth/unlock-account`
-</details>
-
-<details>
-<summary><b>Google OAuth (3 endpoints)</b></summary>
-
-- `POST /api/v1/auth/google` - Login/register with Google
-- `POST /api/v1/auth/google/link` - Link Google account
-- `DELETE /api/v1/auth/google/unlink` - Unlink Google account
-</details>
-
-<details>
-<summary><b>User Management (5 endpoints)</b></summary>
-
-- `GET /api/v1/users/search-autocomplete` - Autocomplete by partial name
-- `GET /api/v1/users/search` - Search by email/name
-- `PATCH /api/v1/users/profile` - Update profile
-- `PATCH /api/v1/users/security` - Update security
-- `GET /api/v1/users/me/roles/{competition_id}` - Check roles
-</details>
-
-<details>
-<summary><b>Device Management (2 endpoints)</b></summary>
-
-- `GET /api/v1/users/me/devices`
-- `DELETE /api/v1/users/me/devices/{id}`
-</details>
-
-<details>
-<summary><b>Handicap Management (3 endpoints)</b></summary>
-
-- `POST /api/v1/handicaps/update`
-- `POST /api/v1/handicaps/update-multiple`
-- `POST /api/v1/handicaps/update-manual`
-</details>
-
-<details>
-<summary><b>Competition Management (12 endpoints)</b></summary>
-
-- `POST /api/v1/competitions` - Create competition
-- `GET /api/v1/competitions` - List competitions
-- `GET /api/v1/competitions/{id}` - Get details
-- `PUT /api/v1/competitions/{id}` - Update (DRAFT only)
-- `DELETE /api/v1/competitions/{id}` - Delete (DRAFT only)
-- `POST /api/v1/competitions/{id}/activate` - DRAFT → ACTIVE
-- `POST /api/v1/competitions/{id}/close-enrollments` - ACTIVE → CLOSED
-- `POST /api/v1/competitions/{id}/start` - CLOSED → IN_PROGRESS
-- `POST /api/v1/competitions/{id}/complete` - IN_PROGRESS → COMPLETED
-- `PUT /api/v1/competitions/{id}/revert-status` - IN_PROGRESS → CLOSED
-- `POST /api/v1/competitions/{id}/reopen-enrollments` - CLOSED → ACTIVE
-- `POST /api/v1/competitions/{id}/cancel` - Any → CANCELLED
-</details>
-
-<details>
-<summary><b>Competition-GolfCourse (4 endpoints)</b></summary>
-
-- `POST /api/v1/competitions/{id}/golf-courses` - Add golf course
-- `DELETE /api/v1/competitions/{id}/golf-courses/{gc_id}` - Remove golf course
-- `PUT /api/v1/competitions/{id}/golf-courses/reorder` - Reorder courses
-- `GET /api/v1/competitions/{id}/golf-courses` - List courses
-</details>
-
-<details>
-<summary><b>Enrollment Management (8 endpoints)</b></summary>
-
-- `POST /api/v1/competitions/{id}/enrollments`
-- `GET /api/v1/competitions/{id}/enrollments`
-- `POST /api/v1/enrollments/{id}/approve`
-- `POST /api/v1/enrollments/{id}/reject`
-- `POST /api/v1/enrollments/{id}/cancel`
-- `POST /api/v1/enrollments/{id}/withdraw`
-- `PUT /api/v1/enrollments/{id}/handicap`
-- `DELETE /api/v1/enrollments/{id}/handicap` - Revert to official RFEG handicap
-</details>
-
-<details>
-<summary><b>Rounds & Schedule (4 endpoints)</b></summary>
-
-- `POST /api/v1/competitions/{id}/rounds` - Create round
-- `PUT /api/v1/competitions/rounds/{id}` - Update round
-- `DELETE /api/v1/competitions/rounds/{id}` - Delete round
-- `GET /api/v1/competitions/{id}/schedule` - Get schedule
-</details>
-
-<details>
-<summary><b>Match Management (4 endpoints)</b></summary>
-
-- `GET /api/v1/competitions/matches/{id}` - Match detail
-- `PUT /api/v1/competitions/matches/{id}/status` - Update status
-- `POST /api/v1/competitions/matches/{id}/walkover` - Declare walkover
-- `PUT /api/v1/competitions/matches/{id}/players` - Reassign players
-</details>
-
-<details>
-<summary><b>Teams & Generation (3 endpoints)</b></summary>
-
-- `POST /api/v1/competitions/{id}/teams` - Assign teams
-- `POST /api/v1/competitions/rounds/{id}/matches/generate` - Generate matches
-- `POST /api/v1/competitions/{id}/schedule/configure` - Configure schedule
-</details>
-
-<details>
-<summary><b>Invitation Management (5 endpoints)</b></summary>
-
-- `POST /api/v1/competitions/{id}/invitations` - Invite by user ID
-- `POST /api/v1/competitions/{id}/invitations/by-email` - Invite by email
-- `GET /api/v1/invitations/me` - My pending invitations
-- `POST /api/v1/invitations/{id}/respond` - Accept/decline
-- `GET /api/v1/competitions/{id}/invitations` - Creator view
-</details>
-
-<details>
-<summary><b>Scoring & Leaderboard (5 endpoints)</b></summary>
-
-- `GET /api/v1/competitions/matches/{id}/scoring-view` - Scoring view
-- `POST /api/v1/competitions/matches/{id}/scores/holes/{n}` - Submit hole score
-- `POST /api/v1/competitions/matches/{id}/scorecard/submit` - Submit scorecard
-- `GET /api/v1/competitions/{id}/leaderboard` - Leaderboard
-- `PUT /api/v1/competitions/matches/{id}/concede` - Concede match
-</details>
-
-<details>
-<summary><b>Golf Course Management (10 endpoints)</b></summary>
-
-- `POST /api/v1/golf-courses/request` - Request new course
-- `POST /api/v1/golf-courses/admin` - Admin creates course
-- `GET /api/v1/golf-courses/{id}` - Get course details
-- `GET /api/v1/golf-courses` - List courses
-- `GET /api/v1/golf-courses/admin/pending` - Pending approvals
-- `PUT /api/v1/golf-courses/admin/{id}/approve` - Approve course
-- `PUT /api/v1/golf-courses/admin/{id}/reject` - Reject course
-- `PUT /api/v1/golf-courses/{id}` - Submit update
-- `PUT /api/v1/golf-courses/admin/updates/{id}/approve` - Approve update
-- `PUT /api/v1/golf-courses/admin/updates/{id}/reject` - Reject update
-</details>
-
-<details>
-<summary><b>Countries (2 endpoints)</b></summary>
-
-- `GET /api/v1/countries`
-- `GET /api/v1/countries/{code}/adjacent`
-</details>
-
-<details>
-<summary><b>Support (1 endpoint)</b></summary>
-
-- `POST /api/v1/support/contact` - Submit contact form (emails the app's mailbox)
-</details>
-
-**Interactive Documentation**: http://localhost:8000/docs
-
----
-
-## 💻 Development
-
-### Setup Development Environment
-
-```bash
-# Clone repository
-git clone https://github.com/agustinEDev/ComebackGolfApi.git
-cd ComebackGolfApi
-
-# Create virtual environment
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies (dev includes production: it starts with -r requirements.txt)
-pip install -r requirements-dev.txt
-
-# Copy environment template
-cp .env.example .env
-# Edit .env with your configuration
-
-# Start PostgreSQL (Docker)
-cd docker
-docker-compose up -d db
-
-# Run migrations
-alembic upgrade head
-
-# Start development server
-uvicorn main:app --reload --log-level info
-```
-
-### Common Commands
-
-```bash
-# Database migrations
-alembic revision --autogenerate -m "description"
-alembic upgrade head
-alembic downgrade -1
-
-# Code quality
-ruff check src/ tests/          # Linting
-ruff format src/ tests/         # Formatting
-mypy src/                       # Type checking
-
-# Security scanning
-gitleaks detect --verbose       # Secret detection
-bandit -r src/                  # Security linting
-safety check                    # Dependency vulnerabilities
-
-# Testing
-python dev_tests.py             # All tests with parallelization
-pytest tests/unit/ -v           # Unit tests verbose
-pytest tests/integration/ -v    # Integration tests verbose
-pytest --cov=src                # Coverage report
-```
-
-### Git Workflow
-
-**Important**: All commits must be GPG-signed on protected branches (`main`, `develop`).
-
-```bash
-# Enable GPG signing globally
-git config --global commit.gpgsign true
-
-# Create feature branch
-git checkout -b feature/amazing-feature
-
-# Make changes and commit (GPG-signed)
-git commit -S -m "feat: add amazing feature"
-
-# Push and create PR
-git push origin feature/amazing-feature
-```
-
-See [docs/](docs/) and the [ADRs](docs/architecture/decisions/) for complete development guidelines.
-
----
-
-## 📊 Project Roadmap
-
-### Current Version: v2.0.18 (Production)
-
-**Latest Features** (v2.0.18 - Jul 7, 2026):
-- **Same-Day Competition Dates**: Single-day tournaments are now accepted instead of rejected
-- **Live Match Result Visibility**: Match summary shows the result as soon as holes are validated, without waiting for every player's formal submission
-
-**Previous Features** (v2.0.17 - Jul 6, 2026):
-- **Handicap Revert to RFEG**: Creator/admin can clear a custom handicap, reverting to the official RFEG value
-- **Auto Handicap Refresh on Login**: Daily silent RFEG lookup for Spanish players
-- **Admin Full Access**: Admins bypass creator-only checks across scoring and match management
-- **Playing Handicap Limit**: Optional per-competition cap on calculated playing handicap
-- **Total: 82 endpoints, 2,158 tests passing**
-
-**Sprint Breakdown**:
-1. ✅ **Sprint 1** (Jan 27 - Jan 31): Golf Courses - 10 endpoints
-2. ✅ **Sprint 2** (Feb 3 - Feb 6): Rounds + Matches + Teams - 15 endpoints
-3. ✅ **Sprint 3** (Feb 16 - Feb 19): Google OAuth + Invitations - 8 endpoints
-4. ✅ **Sprint 4** (Feb 20 - Feb 24): Live Scoring + Leaderboard + Backward Transitions - 8 endpoints
-
-See [ROADMAP.md](ROADMAP.md) for complete version planning.
+| | |
+|---|---|
+| [docs/API.md](docs/API.md) | Endpoint reference, auth, CSRF, rate limits |
+| [docs/design-document.md](docs/design-document.md) | Design and architecture |
+| [docs/DATABASE_ERD.md](docs/DATABASE_ERD.md) | Data model |
+| [docs/architecture/decisions/](docs/architecture/decisions/) | Architecture Decision Records |
+| [docs/MULTI_ENVIRONMENT_SETUP.md](docs/MULTI_ENVIRONMENT_SETUP.md) | Environment variables per environment |
+| [DEPLOYMENT.md](DEPLOYMENT.md) · [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment and operations |
+| [ROADMAP.md](ROADMAP.md) · [CHANGELOG.md](CHANGELOG.md) | What exists, what's next, what changed |
+| [docs/plan-de-pago-e-ia.md](docs/plan-de-pago-e-ia.md) | Paid plan with a rules assistant, swing coach and caddie (parked) |
+| [docs/README.md](docs/README.md) | Full index |
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions! Please follow these guidelines:
-
-### Code Standards
-- Follow **Clean Architecture** and **DDD** principles
-- Write **tests** for all new features (>90% coverage)
-- Use **type hints** for all functions
-- Follow **PEP 8** style guide (enforced by Ruff)
-- Write **docstrings** for public APIs
-
-### Pull Request Process
-1. Fork the repository
-2. Create feature branch: `git checkout -b feature/amazing-feature`
-3. Commit changes with GPG signature: `git commit -S -m "feat: amazing feature"`
-4. Write/update tests: `python dev_tests.py`
-5. Push branch: `git push origin feature/amazing-feature`
-6. Open Pull Request with description
-
-### Commit Message Convention
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
-- `feat:` New feature
-- `fix:` Bug fix
-- `docs:` Documentation changes
-- `test:` Test additions/changes
-- `refactor:` Code refactoring
-- `perf:` Performance improvements
-- `chore:` Maintenance tasks
-
----
+Branches follow GitFlow (`feature/*` → `develop` → `release/*` → `main`), every commit
+must be GPG-signed, and a pull request needs the whole pipeline green. Production
+deploys automatically when `main` moves.
 
 ## 📄 License
 
-Copyright (c) 2025-2026 Agustín Estévez Domínguez. **All rights reserved.** The source code is published for viewing only; no licence is granted to use, copy, modify or distribute it without the author's written permission. See [LICENSE](LICENSE).
+Copyright © 2025-2026 Agustín Estévez Domínguez. **All rights reserved.** The source code
+is published for viewing only; no licence is granted to use, copy, modify or distribute it
+without the author's written permission. See [LICENSE](LICENSE).
 
----
+## 📬 Contact
 
-## 👨‍💻 Author & Contact
-
-**Agustín Estévez**
-- GitHub: [@agustinEDev](https://github.com/agustinEDev)
-- Repository: [ComebackGolfApi](https://github.com/agustinEDev/ComebackGolfApi)
-- Issues: [Report a bug](https://github.com/agustinEDev/ComebackGolfApi/issues)
-
----
-
-## 🙏 Acknowledgments
-
-- **FastAPI** - Modern, fast web framework for Python
-- **SQLAlchemy** - Powerful ORM for database operations
-- **Pydantic** - Data validation using Python type annotations
-- **R&A** - Official Rules of Golf
-- **USGA** - World Handicap System (WHS)
-
----
+[hola@comebackgolf.com](mailto:hola@comebackgolf.com) ·
+[Report an issue](https://github.com/agustinEDev/ComebackGolfApi/issues)
 
 <div align="center">
-
-### ⭐ Star this repository if you find it useful!
-
-
+<br>
+<sub>Built for the golfers who always ask for one more round.</sub>
 </div>

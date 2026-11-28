@@ -1,536 +1,170 @@
 # Design Document - Comeback Golf
 
-**Sprint 4** · 24 February 2026 · Live Scoring, Leaderboard, Backward State Transitions
+> **Version:** 2.82.1 · **Last updated:** 28 November 2026
 
 ---
 
 ## Summary
 
-Amateur golf tournament system in Ryder Cup format.
+Comeback Golf is a platform for amateur golf among friends: tournaments in the Ryder format (two teams, match play), Stableford and Medal tournaments (stroke play), quick matches between friends, hole-by-hole scoring that keeps working without coverage, and a social layer (friends, profiles, activity feed). This repository is the **backend API**; the web app lives in [ComebackGolfWeb](https://github.com/agustinEDev/ComebackGolfWeb).
 
-**Stack**: Python 3.12 and 3.14, FastAPI, PostgreSQL, Clean Architecture + DDD
-
-**Infrastructure**: Docker, Kubernetes (Kind), GitHub Actions
-
-**Security**: OWASP Top 10 compliant (9.7/10 score)
-
-**Features**:
-- ✅ User management + JWT auth + device tracking
-- ✅ Email verification (Mailgun, UUID tokens, bilingual)
-- ✅ Password security (12+ chars, history, reset flow)
-- ✅ Account lockout (brute-force protection)
-- ✅ CSRF protection + secure HTTP headers
-- ✅ Handicap system (RFEG integration)
-- ✅ Competition Module (Ryder Cup format tournaments)
-- ✅ Google OAuth (login/register, link/unlink) ⭐ Sprint 3
-- ✅ CI/CD Pipeline (GitHub Actions)
-- ✅ Kubernetes deployment (local & production-ready)
-- ⏳ Invitations (Sprint 3 Block 2)
-- ⏳ Real-time scoring (planned)
+- **Stack:** Python (CI runs 3.12 and 3.14; the production image uses 3.14), FastAPI, SQLAlchemy 2 with imperative mapping, Alembic, PostgreSQL 15.
+- **Architecture:** Clean Architecture + DDD, one bounded context per module, layer rules enforced by `import-linter` (`.importlinter`).
+- **Production:** Docker image deployed on Render; `GET /health` reports the version and the deployed commit.
 
 ---
 
 ## Architecture
 
-### Clean Architecture (3 Layers)
+### Layers
 
+```mermaid
+flowchart TB
+    subgraph Infrastructure
+        API["FastAPI routers (api/v1)"]
+        PERS["SQLAlchemy repositories + Unit of Work"]
+        EXT["External adapters: RFEG, Google, OSM, email, Pillow"]
+    end
+    subgraph Application
+        UC["Use cases"]
+        PORTS["Ports (interfaces)"]
+    end
+    subgraph Domain
+        ENT["Entities and value objects"]
+        DS["Domain services and policies"]
+        REPO["Repository interfaces"]
+    end
+    API --> UC
+    UC --> ENT
+    UC --> DS
+    UC --> PORTS
+    UC --> REPO
+    PERS -. implements .-> REPO
+    EXT -. implements .-> PORTS
 ```
-Infrastructure (FastAPI, SQLAlchemy, RFEG)
-    ↓
-Application (Use Cases, DTOs, Handlers)
-    ↓
-Domain (Entities, VOs, Repos)
-```
 
-**Rule**: Dependencies point inward.
+**Rule:** dependencies point inward. The domain imports no framework or infrastructure code. Use cases call the port that performs a side effect explicitly; the unused domain events were removed (ADR-050). Dependency injection is wired in one place, `src/config/dependencies/` (composition root, ADR-012). Domain errors are translated to HTTP in one place (ADR-049).
 
-**Patterns**: Repository, UoW, Value Objects, External Services (domain events removed, ADR-050).
+### Modules
 
-> ADRs: [001](architecture/decisions/ADR-001-clean-architecture.md), [002](architecture/decisions/ADR-002-value-objects.md), [005](architecture/decisions/ADR-005-repository-pattern.md), [006](architecture/decisions/ADR-006-unit-of-work-pattern.md), [050](architecture/decisions/ADR-050-remove-unused-domain-events.md)
+| Module | Responsibility | Doc |
+|--------|----------------|-----|
+| `user` | Accounts, authentication (password and Google), sessions per device, handicaps, avatars, admin | [user-management.md](modules/user-management.md) |
+| `competition` | Tournaments (Ryder format, Stableford, Medal): enrollment, teams, draft, envelopes, schedule, scoring, standings | [competition-management.md](modules/competition-management.md) |
+| `golf_course` | Course catalogue with approval workflow, tees and holes, hole maps from OpenStreetMap, RFEG course import | [RFEG_COURSE_IMPORT.md](RFEG_COURSE_IMPORT.md) |
+| `quick_match` | Quick matches between friends (match play or stroke play, Medal or Stableford), with guests | — |
+| `social` | Friendships and blocking, public profiles, profile photos, activity feed and achievements | — |
+| `support` | Contact form, delivered by email | — |
+| `shared` | Countries, shared value objects (match format, modality, play mode, scoring format), handicap and scoring calculators, HTTP middleware, email sending, logging | — |
+| `config` | Settings, startup guards, rate limiting, CORS, CSRF, Sentry, background jobs, version | — |
+
+Folder layout: [project-structure.md](project-structure.md). Database: [DATABASE_ERD.md](DATABASE_ERD.md).
+
+### Patterns
+
+- **Repository + Unit of Work** per module (ADR-005, ADR-006).
+- **Value objects** for validation (ADR-002).
+- **Ports and adapters** for external services (ADR-013).
+- **One use case per operation** (ADR-011).
+- **In-memory repositories** in `infrastructure/persistence/in_memory/` for fast unit tests.
 
 ---
 
-## Security (OWASP Top 10)
+## Key flows
 
-**Score**: 9.7/10 (v2.0.0, 29 Jan 2026)
+### Sign-up
 
-### Implemented Protections
+1. `RegisterUserUseCase` creates the user; the answer does not reveal whether the email already had an account (ADR-048).
+2. The use case sends the verification email through the email port. The link carries a token that is stored hashed and expires.
+3. `POST /api/v1/auth/verify-email` marks the email as verified (ADR-019, ADR-045).
 
-#### A01: Broken Access Control (10/10)
+### Login and session
 
-- JWT authentication with HS256 (SECRET_KEY from environment)
-- Device fingerprinting (User-Agent + IP)
-- Refresh token rotation (7d lifetime, SHA256 hashed in DB)
-- IP spoofing prevention (trusted proxy validation)
-- httpOnly cookies (primary) + Authorization header (legacy support)
+1. `POST /api/v1/auth/login` checks the password (bcrypt) and the login brake per email and network (ADR-043).
+2. The session belongs to a device (ADR-039, ADR-042): the access token goes in the `access_token` httpOnly cookie (15 min by default) and the refresh token in `refresh_token` (7 days by default), plus a signed CSRF token (ADR-040).
+3. `POST /api/v1/auth/refresh-token` rotates the refresh token on every use and detects reuse.
 
-#### A02: Cryptographic Failures (9.9/10)
+### Handicap from the RFEG
 
-- HTTPS enforced (HSTS headers)
-- Bcrypt password hashing (12 rounds, ~200ms)
-- Secure session management
+`RFEGHandicapService` queries the public handicap search of the Spanish federation (`rfegolf.es`, 10 s timeout). If it cannot find the player, the handicap can be set by hand (`POST /api/v1/handicaps/update-manual`). Competitions can refresh all their players' handicaps, by hand or scheduled (ADR-014).
 
-#### A03: Injection (10/10)
+### Scoring without coverage
 
-- SQLAlchemy ORM (parameterized queries)
-- Input validation (Pydantic)
-- HTTP context validation (sentinel rejection)
-
-#### A04: Insecure Design (9.5/10)
-
-- Clean Architecture (layered security)
-- Domain validation (Value Objects)
-- Business logic guards (CompetitionPolicy)
-- Threat modeling (STRIDE analysis for 5 flows)
-
-#### A05: Security Misconfiguration (9.5/10)
-
-- Secure HTTP headers (CSP, X-Frame-Options, etc.)
-- CORS configuration (whitelist origins)
-- Environment-based settings
-
-#### A06: Vulnerable Components (9.8/10)
-
-- Dependency scanning (pip-audit)
-- Regular updates (requirements.txt)
-
-#### A07: Identification Failures (9.9/10)
-
-- Password policy (12+ chars, complexity, history)
-- Account lockout (10 failed attempts, 30min)
-- Password reset flow (secure tokens)
-- Device tracking
-
-#### A08: Software Integrity Failures (9.5/10)
-
-- SBOM generation (CycloneDX format, 160 components tracked)
-- Dependency lock with SHA256 hashes (prevents substitution attacks)
-- CI/CD supply chain validation (automated SBOM + integrity checks)
-- Git-based deployment + Docker image verification (Trivy)
-
-#### A09: Security Logging Failures (9.0/10)
-
-- Audit logging (login, logout, security events)
-- Sentry integration (error tracking)
-- Correlation IDs
-
-#### A10: SSRF (9.5/10)
-
-- URL validation
-- External service whitelisting
-
-### Recent Security Improvements
-
-**v2.0.0 (29 Jan 2026)**:
-- ✅ A08: Software Integrity Failures (8.0 → 9.5)
-  - SBOM generation (CycloneDX, 160 components)
-  - Dependency lock with SHA256 hashes
-  - CI/CD supply chain validation
-- ✅ A04: Insecure Design (8.5 → 9.5)
-  - Business logic guards (CompetitionPolicy)
-  - STRIDE threat modeling (5 critical flows)
-
-**v1.13.1 (18 Jan 2026)**:
-- ✅ IP spoofing prevention (trusted proxy whitelist)
-- ✅ HTTP context validation (sentinel rejection)
-- ✅ Current device detection (UX improvement)
-
-**v1.13.0 (9 Jan 2026)**:
-- ✅ Account lockout (brute-force protection)
-- ✅ CSRF protection middleware
-- ✅ Password history (prevent reuse of last 5)
-- ✅ Password reset flow (secure tokens)
-- ✅ Device tracking (multi-device sessions)
+Scoring opens by itself at the hour of the session (06:00, 12:00 or 18:00 local time of the course) and the server decides with its own clock when each stroke arrives, so a stroke recorded offline is accepted when it reaches the server. Each hole carries the player's own score and the marker's; the hole is validated when both agree.
 
 ---
 
-## Modules
+## External integrations
 
-### User Management
-
-**Domain**:
-- Entities: `User`, `UserOAuthAccount` ⭐ Sprint 3
-- VOs: `UserId`, `Email`, `Password`, `Handicap`, `OAuthAccountId`, `OAuthProvider` ⭐ Sprint 3
-- Repos: `UserRepositoryInterface`, `UserOAuthAccountRepositoryInterface` ⭐ Sprint 3
-- Services: `HandicapService` (interface)
-- Email Verification: Fields `email_verified`, `verification_token`
-
-**Application**:
-- Use Cases: `RegisterUser`, `LoginUser`, `LogoutUser`, `UpdateProfile`, `UpdateSecurity`, `UpdateHandicap`, `UpdateHandicapManually`, `UpdateMultipleHandicaps`, `FindUser`, `GoogleLogin`, `LinkGoogleAccount`, `UnlinkGoogleAccount` ⭐ Sprint 3
-- DTOs: Request/Response (including OAuth DTOs) ⭐ Sprint 3
-- Ports: `IGoogleOAuthService` ⭐ Sprint 3
-- Email Verification: `VerifyEmailUseCase`, integrated in registration
-
-**Infrastructure**:
-- Routes: `/auth/*`, `/auth/google/*` ⭐ Sprint 3, `/handicaps/*`, `/users/*`
-- Repos: `SQLAlchemyUserRepository`, `SQLAlchemyUserOAuthAccountRepository` ⭐ Sprint 3
-- External: `RFEGHandicapService`, `GoogleOAuthService` ⭐ Sprint 3 (the `MockHandicapService` test double lives in `tests/fakes/`)
-- Email Verification: Service `EmailService` (Mailgun), endpoint `/api/v1/auth/verify-email`
-
-**Email Verification**:
-- Domain: Fields `email_verified`, `verification_token`
-- Application: Use case `VerifyEmailUseCase`, integrated in registration
-- Infrastructure: Service `EmailService` (Mailgun), endpoint `/api/v1/auth/verify-email`
-
-> ADRs: [011](architecture/decisions/ADR-011-application-layer-use-cases.md), [013](architecture/decisions/ADR-013-external-services-pattern.md), [014](architecture/decisions/ADR-014-handicap-management-system.md)
-
-### Competition Management ✅
-
-**Domain**:
-- Entities: `Competition`, `Enrollment`, `Country`
-- VOs: `CompetitionId`, `CompetitionName`, `DateRange`, `Location`, `PlayMode`, `EnrollmentId`, `EnrollmentStatus`, `CountryCode`
-- Repos: `CompetitionRepositoryInterface`, `EnrollmentRepositoryInterface`, `CountryRepositoryInterface`
-
-**Application**:
-- Use Cases: 17 use cases (CreateCompetition, RequestEnrollment, HandleEnrollment, etc.)
-- DTOs: 19 DTOs (Request/Response pairs)
-
-**Infrastructure**:
-- Routes: `/competitions/*`, `/enrollments/*`, `/countries/*`
-- Repos: `SQLAlchemyCompetitionRepository`, `SQLAlchemyEnrollmentRepository`, `SQLAlchemyCountryRepository`
-- Database: Alembic migrations (competitions, enrollments, countries, country_adjacencies)
-- Seed Data: 166 countries + 614 border relations
-
-**Features**:
-- Complete tournament management (CRUD + state machine with backward transitions)
-- Enrollment system (requests, invitations, approvals)
-- Multi-country support (up to 3 adjacent countries)
-- Custom handicaps per enrollment
-- 20 REST API endpoints
-
-> ADR: [020](architecture/decisions/ADR-020-competition-module-domain-design.md)
+| Service | Used for | Code |
+|---------|----------|------|
+| RFEG | Player handicaps; course dataset import | `user/infrastructure/external/rfeg_handicap_service.py`, `golf_course/infrastructure/importers/` |
+| Google OAuth | Sign in with Google, link and unlink | `user/infrastructure/external/google_oauth_service.py` |
+| OpenStreetMap (Overpass, or a local extract) | Hole maps of golf courses (ODbL data) | `golf_course/infrastructure/osm/` |
+| Mailgun → Resend → Brevo | Transactional email: Mailgun (EU) first; Resend as backup; Brevo only for emails without tokens or security notices, when the other two fail. Mailpit locally | `shared/infrastructure/email/envio_de_correo.py` |
+| Sentry | Errors and performance | `src/config/sentry_config.py` |
 
 ---
 
-## Data Models
+## Background jobs
 
-### User Entity
+Tasks of the API process itself, started in the application lifespan (`main.py`). They do not run in the tests; each one says below where it runs.
 
-```python
-User:
-    id: UserId (UUID)
-    email: Email (validated, normalized)
-    password: Password? (bcrypt, rounds=12, nullable for OAuth-only users)
-    first_name: str
-    last_name: str
-    handicap: float? (-10.0 to 54.0)
-    handicap_updated_at: datetime?
-    created_at: datetime
-    updated_at: datetime
-    email_verified: bool
-    verification_token: str?
-```
-
-**Schema**:
-```sql
-CREATE TABLE users (
-    id UUID PRIMARY KEY,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password VARCHAR(255),  -- nullable: OAuth-only users have no password
-    first_name VARCHAR(50) NOT NULL,
-    last_name VARCHAR(50) NOT NULL,
-    handicap FLOAT,
-    handicap_updated_at TIMESTAMP,
-    created_at TIMESTAMP NOT NULL,
-    updated_at TIMESTAMP NOT NULL,
-    email_verified BOOLEAN DEFAULT FALSE,
-    verification_token VARCHAR(255)
-);
-CREATE INDEX idx_users_email ON users(email);
-```
-
-> ADR: [002](architecture/decisions/ADR-002-value-objects.md), [010](architecture/decisions/ADR-010-alembic-for-database-migrations.md)
-
----
-
-## Business Flows
-
-### 1. User Registration
-
-```
-Client → API → UseCase → User.create() → UoW.save() → commit()
-```
-
-1. Validate email does not exist
-2. `User.create()` builds the user
-3. UoW saves + commits
-4. The use case sends the verification email itself (no domain events, ADR-050)
-
-> ADR: [006](architecture/decisions/ADR-006-unit-of-work-pattern.md), [050](architecture/decisions/ADR-050-remove-unused-domain-events.md)
-
-### 2. Update Handicap (RFEG)
-
-```
-API → UseCase → HandicapService.search(name) → RFEG
-                      ↓
-                user.update_handicap()
-                      ↓
-                  UoW.commit()
-```
-
-1. Find user
-2. Query RFEG with full name
-3. Update the user
-4. Commit (no domain events, ADR-050)
-
-**Fallback**: If RFEG fails, use `manual_handicap` (optional)
-
-**Error Handling**: If player not found in RFEG and no `manual_handicap`, throw `HandicapNotFoundError` (404)
-
-> ADR: [013](architecture/decisions/ADR-013-external-services-pattern.md), [014](architecture/decisions/ADR-014-handicap-management-system.md)
-
----
-
-## External Integrations
-
-### RFEG (Royal Spanish Golf Federation)
-
-**Type**: Web scraping (no public API)
-**Flow**: Extract token → Search by name → Parse JSON
-**Timeout**: 10s
-**Errors**: Log + return None
-
-**Implementation**:
-- Interface: `HandicapService` (domain)
-- Impl: `RFEGHandicapService` (infra)
-- Mock: `MockHandicapService` (tests)
-
-> ADR: [013](architecture/decisions/ADR-013-external-services-pattern.md)
+| Job | What it does |
+|-----|--------------|
+| `CierreDeInscripciones` | Every hour, closes enrollments past the deadline (12:00 local time the day before). Production and Kind |
+| `CierreDePartidasRapidas` | Every hour, closes quick matches nobody finished. Production and Kind |
+| `LimpiezaDeSesiones` | Every hour, deletes old devices and refresh tokens. Production and Kind |
+| `VigilanteDeActualizaciones` | Every minute, launches scheduled RFEG handicap refreshes and resumes interrupted ones. Production |
+| `VigiaDeLaClaveDeBrevo` | Once a day, a small call that keeps the Brevo backup key alive (Brevo expires unused keys) and reports to a Sentry cron monitor. Production |
 
 ---
 
 ## Security
 
-### Authentication
+Summary of what exists in code; the detail is in [security/THREAT_MODEL.md](security/THREAT_MODEL.md), [KNOWN_SECURITY_ISSUES.md](KNOWN_SECURITY_ISSUES.md) and the ADRs.
 
-**JWT**: HS256, access 15min, refresh 7d, SECRET_KEY in env
-**Password**: bcrypt, rounds=12 (prod), rounds=4 (test)
-
-### Validation
-
-1. Pydantic (API): types and formats
-2. Value Objects (Domain): business rules
-3. Database: constraints (UNIQUE, NOT NULL)
-
-> ADR: [004](architecture/decisions/ADR-004-tech-stack.md)
-
----
-
-## API Endpoints
-
-### Auth
-- `POST /api/v1/auth/register` - User registration
-- `POST /api/v1/auth/login` - JWT authentication + UserLoggedInEvent
-- `POST /api/v1/auth/logout` - Logout with audit + UserLoggedOutEvent
-- `POST /api/v1/auth/verify-email` - Email verification (token via email)
-- `POST /api/v1/auth/google` - Login/register with Google OAuth ⭐ Sprint 3
-- `POST /api/v1/auth/google/link` - Link Google to existing account ⭐ Sprint 3
-- `DELETE /api/v1/auth/google/unlink` - Unlink Google account ⭐ Sprint 3
-
-### Handicaps
-- `POST /api/v1/handicaps/update` - RFEG lookup + fallback
-- `POST /api/v1/handicaps/update-manual` - Direct manual update
-- `POST /api/v1/handicaps/update-multiple` - Batch update
-
-### Users
-- `GET /api/v1/users/search` - Search by email or name
-- `PATCH /api/v1/users/profile` - Update name/surname (no password)
-- `PATCH /api/v1/users/security` - Update email/password (with password verification)
-
-> Details: [API.md](API.md)
+- **Access control:** JWT in httpOnly cookies, sessions per device, refresh-token rotation, admin role (`users.is_admin`), organiser checks per competition.
+- **CSRF:** signed token bound to the user, cookie + header (ADR-028, ADR-040, ADR-047).
+- **Passwords:** 12 to 64 characters, blocklists, bcrypt with 12 rounds by default, last 5 not reusable.
+- **Brute force:** login brake per email and network (ADR-043); rate limiting with slowapi, a default limit plus per-route limits, keyed by the real client IP behind the proxy (ADR-038, ADR-041).
+- **Headers:** HSTS (2 years, subdomains), and the rest of the security headers set with the `secure` library (`src/shared/infrastructure/http/security_headers.py`).
+- **Startup guards:** outside a declared development environment the app refuses to start with an empty, example or short `SECRET_KEY`, or with `TESTING=true` (`src/config/arranque_seguro.py`).
+- **Logging:** security audit events in a durable security log, correlation IDs on every request, Sentry (ADR-051).
+- **API docs:** `/docs`, `/redoc` and `/openapi.json` require HTTP Basic credentials (`DOCS_USERNAME`, `DOCS_PASSWORD`).
 
 ---
 
 ## Testing
 
-**Strategy**: Test Pyramid (89% unit, 11% integration)
+| Suite | Folder | Collected (28 Nov 2026) |
+|-------|--------|------------------------:|
+| Unit | `tests/unit/` | 11,258 |
+| Integration (PostgreSQL) | `tests/integration/` | 1,737 |
+| Security | `tests/security/` | 67 |
 
-```
-1,282 tests (100% passing, 16 skipped)
-├── Unit: 1,200+ tests
-│   ├── User Module: 308 tests
-│   ├── Competition Module: 554 tests (296 domain + 130 application + 52 infra + 76 DTO)
-│   ├── Shared: 138 tests
-│   └── Other: 200+ tests
-└── Integration: 80+ tests
-    ├── API: ~70 tests
-    └── Security: 34 tests
-```
-
-**Coverage**: >90% in business logic
-**Email Verification**: 100% (24 tests across 3 layers)
-**Competition Module**: 554 tests (domain + application + infrastructure + API)
-**Performance**: ~30s (parallelized with pytest-xdist)
-
-**CI/CD**: Tests run automatically on GitHub Actions (Python 3.12, 3.14)
-
-> ADR: [003](architecture/decisions/ADR-003-testing-strategy.md)
+Counted with `pytest --collect-only -q` per folder. CI runs each suite on Python 3.12 and 3.14; the unit job enforces a minimum coverage of 88 % on 3.12. See [tests/README.md](../tests/README.md) and ADR-003.
 
 ---
 
-## Deployment & Infrastructure
+## Deployment and environments
 
-### Docker (Development)
-
-**docker-compose.yml**:
-- PostgreSQL 15 (port 5432)
-- FastAPI app (port 8000)
-- Hot reload enabled
-- Environment validation scripts
-
-### Kubernetes (Production-ready)
-
-**Platform**: Kind (local), ready for cloud deployment
-
-**Components**:
-- API deployment (FastAPI + Gunicorn)
-- PostgreSQL StatefulSet with PVC
-- Frontend deployment (React + nginx)
-- ConfigMaps & Secrets management
-- NodePort services with port mapping
-
-**Scripts** (`k8s/scripts/`):
-- `deploy-cluster.sh` - Full cluster deployment (~3-5 min)
-- `deploy-api.sh` - Backend rolling update (zero downtime)
-- `deploy-front.sh` - Frontend update
-- `deploy-db.sh` - Database + migrations
-- `cluster-status.sh` - Health check
-- `restore-db.sh` - Backup restoration
-- `destroy-cluster.sh` - Cluster teardown
-
-**Access**:
-- Backend: <http://localhost:8000> (API docs)
-- Frontend: <http://localhost:8080>
-- PostgreSQL: `localhost:5434` (external tools)
-
-**Features**:
-- Automatic port mapping (no manual port-forward needed)
-- Rolling updates with zero downtime
-- Database backups to `k8s/backups/`
-- Health checks and liveness probes
-
-> See: [RUNBOOK.md](RUNBOOK.md), [MULTI_ENVIRONMENT_SETUP.md](MULTI_ENVIRONMENT_SETUP.md)
+- **Local, Docker Compose:** `docker/docker-compose.yml` (PostgreSQL 15 + API + Mailpit). See [docker/README.md](../docker/README.md).
+- **Local, Kubernetes (Kind):** manifests and scripts in `k8s/`. See [k8s/README.md](../k8s/README.md).
+- **Production:** Render, Docker runtime. See [DEPLOYMENT.md](../DEPLOYMENT.md), [RUNBOOK.md](RUNBOOK.md) and [MULTI_ENVIRONMENT_SETUP.md](MULTI_ENVIRONMENT_SETUP.md).
 
 ---
 
-## CI/CD Pipeline
+## CI/CD
 
-**Platform**: GitHub Actions
-
-**Main job categories** (the workflow defines more jobs, and the test suites expand into one job per Python version):
-1. Unit Tests (matrix Python 3.12, 3.14)
-2. Integration and Security Tests (PostgreSQL service container, Python 3.12 and 3.14)
-3. Security Checks (Bandit, pip-audit, Gitleaks; Python 3.14)
-4. Code Quality (Ruff)
-5. Type Checking (Mypy)
-6. Database Migrations (Alembic validation)
-
-**Execution Time**: ~3 minutes
-**Trigger**: Push, Pull Request
-**Matrix**: Python 3.12, 3.14
-
-**Configurations**:
-- Mypy: Pragmatic configuration for SQLAlchemy imperative mapping
-- Gitleaks: Whitelist for false positives in docs
-- PostgreSQL: Service container for integration tests
-- Cache: pip dependencies
-
-> ADR: [021](architecture/decisions/ADR-021-github-actions-ci-cd-pipeline.md)
+GitHub Actions, workflow `.github/workflows/ci_cd_pipeline.yml`: unit, integration and security tests (Python 3.12 and 3.14), Bandit + pip-audit + Gitleaks, Ruff (lint and format), mypy, Docker build with a Render-like start and Trivy, dependency review, CycloneDX SBOM, signed-commit check, architecture contracts (import-linter), API contract check (oasdiff against the base branch) and OWASP Semgrep rules. A second workflow, `snyk_review.yml`, runs Snyk weekly and on releases. See [ci-cd/PIPELINE_GUIDE.md](ci-cd/PIPELINE_GUIDE.md) and ADR-021.
 
 ---
 
-## ADR References
+## ADR references
 
-**Foundation**: [001](architecture/decisions/ADR-001-clean-architecture.md), [004](architecture/decisions/ADR-004-tech-stack.md)
-
-**Patterns**: [002](architecture/decisions/ADR-002-value-objects.md), [005](architecture/decisions/ADR-005-repository-pattern.md), [006](architecture/decisions/ADR-006-unit-of-work-pattern.md), [050](architecture/decisions/ADR-050-remove-unused-domain-events.md)
-
-**Infrastructure**: [009](architecture/decisions/ADR-009-docker-for-development-environment.md), [010](architecture/decisions/ADR-010-alembic-for-database-migrations.md), [021](architecture/decisions/ADR-021-github-actions-ci-cd-pipeline.md)
-
-**Features**: [011](architecture/decisions/ADR-011-application-layer-use-cases.md), [012](architecture/decisions/ADR-012-composition-root.md), [013](architecture/decisions/ADR-013-external-services-pattern.md), [014](architecture/decisions/ADR-014-handicap-management-system.md), [039](architecture/decisions/ADR-039-session-lifetime-per-device.md), [020](architecture/decisions/ADR-020-competition-module-domain-design.md)
-
----
-
-## 📊 Project Metrics
-
-**Last Updated**: 16 February 2026
-
-### Infrastructure
-
-| Component | Technology | Status |
-|-----------|-----------|--------|
-| Containerization | Docker Compose | ✅ Active |
-| Orchestration | Kubernetes (Kind) | ✅ Active |
-| Deployment Scripts | Bash automation | ✅ 7 scripts |
-| CI/CD | GitHub Actions | ✅ 7 parallel jobs |
-| Database Backups | Automated | ✅ k8s/backups/ |
-
-### Testing
-
-| Metric | Value |
-|--------|-------|
-| Total tests | 2,204 (100% passing, 1 skipped) |
-| Unit tests | 1,903 tests |
-| Integration tests | 301 tests |
-| Coverage | >90% |
-| Email Verification | 100% (24 tests) |
-| Competition Module | 97.6% (174 tests) |
-| Execution time | ~30s (parallel) |
-| CI/CD Pipeline | ~3 min (7 jobs) |
-
-### Module Progress
-
-| Module | Status | Tests | Endpoints |
-|--------|--------|-------|-----------|
-| User | ✅ Complete + Auth + Email + Google OAuth | 608+ | 20 |
-| Competition | ✅ Complete + Enrollments + Rounds/Matches/Teams | 554 | 35 |
-| Golf Course | ✅ Complete + Approval Workflow | 38+ | 10 |
-| Shared | ✅ Countries + Security | 208 | 2 |
-| CI/CD | ✅ GitHub Actions | - | - |
-| Kubernetes | ✅ Complete deployment | - | - |
-| Invitations | ✅ Complete (Sprint 3 Block 2) | 70+ | 5 |
-| Scoring | ✅ Complete (Sprint 4) | 224+ | 6 |
-
-### Implemented Value Objects (69 tests)
-
-- **UserId** (12 tests) - Unique UUID identifier
-- **Email** (14 tests) - Validated and normalized email
-- **Password** (23 tests) - Bcrypt hashed password
-- **Handicap** (20 tests) - Range -10.0 to 54.0 (RFEG/EGA)
-
-### Implemented Use Cases (68 tests)
-
-**User Module (9 use cases)**:
-- `RegisterUserUseCase` (5 tests) - User registration
-- `LoginUserUseCase` (5 tests) - JWT authentication
-- `LogoutUserUseCase` (5 tests) - Logout with complete audit
-- `UpdateProfileUseCase` (7 tests) - Update name/surname without password
-- `UpdateSecurityUseCase` (9 tests) - Update email/password with verification
-- `UpdateUserHandicapUseCase` (10 tests) - Update from RFEG with fallback
-- `UpdateUserHandicapManuallyUseCase` (6 tests) - Direct manual update
-- `UpdateMultipleHandicapsUseCase` - Batch update with statistics
-- `FindUserUseCase` (10 tests) - Search by email or name
-
-### API Endpoints Active (82)
-- `/api/v1/auth/register`, `/login`, `/logout`, `/verify-email`
-- `/api/v1/users/profile`, `/security`, `/search`
-- `/api/v1/handicaps/update`, `/update-manual`, `/update-multiple`
-
-**Competitions (12)**:
-- `/api/v1/competitions` (GET, POST)
-- `/api/v1/competitions/{id}` (GET, PUT, DELETE)
-- `/api/v1/competitions/{id}/activate`, `/close-enrollments`, `/start`, `/complete`, `/cancel`
-- `/api/v1/competitions/{id}/revert-status`, `/reopen-enrollments`
-
-**Enrollments (7)**:
-- `/api/v1/competitions/{id}/enrollments` (GET, POST)
-- `/api/v1/enrollments/{id}/approve`, `/reject`, `/cancel`, `/withdraw`, `/handicap`
-
-**Countries (2)**:
-- `/api/v1/countries` (GET)
-- `/api/v1/countries/{code}/adjacent` (GET)
-
-### Implemented External Services (18 tests)
-
-- **RFEGHandicapService** (5 integration tests) - Real RFEG web scraping
-- **MockHandicapService** (13 tests) - Deterministic mock for testing
+- **Foundation:** [001](architecture/decisions/ADR-001-clean-architecture.md), [004](architecture/decisions/ADR-004-tech-stack.md)
+- **Patterns:** [002](architecture/decisions/ADR-002-value-objects.md), [005](architecture/decisions/ADR-005-repository-pattern.md), [006](architecture/decisions/ADR-006-unit-of-work-pattern.md), [011](architecture/decisions/ADR-011-application-layer-use-cases.md), [012](architecture/decisions/ADR-012-composition-root.md), [013](architecture/decisions/ADR-013-external-services-pattern.md), [046](architecture/decisions/ADR-046-allow-listed-imports-per-layer-and-password-hasher-port.md), [049](architecture/decisions/ADR-049-domain-errors-translated-to-http-in-one-place.md), [050](architecture/decisions/ADR-050-remove-unused-domain-events.md)
+- **Infrastructure:** [009](architecture/decisions/ADR-009-docker-for-development-environment.md), [010](architecture/decisions/ADR-010-alembic-for-database-migrations.md), [016](architecture/decisions/ADR-016-render-deployment-strategy.md), [018](architecture/decisions/ADR-018-automated-database-migrations.md), [021](architecture/decisions/ADR-021-github-actions-ci-cd-pipeline.md)
+- **Domain:** [014](architecture/decisions/ADR-014-handicap-management-system.md), [020](architecture/decisions/ADR-020-competition-module-domain-design.md), [026](architecture/decisions/ADR-026-playing-handicap-whs-calculation.md), [031](architecture/decisions/ADR-031-match-play-scoring-calculation.md), [032](architecture/decisions/ADR-032-golf-course-approval-workflow.md), [037](architecture/decisions/ADR-037-two-tier-handicap-session-round-model.md)
+- **Security:** [023](architecture/decisions/ADR-023-security-strategy-owasp-compliance.md), [028](architecture/decisions/ADR-028-csrf-protection.md), [038](architecture/decisions/ADR-038-client-network-identity.md), [039](architecture/decisions/ADR-039-session-lifetime-per-device.md), [040](architecture/decisions/ADR-040-signed-csrf-token-bound-to-user.md), [041](architecture/decisions/ADR-041-real-client-ip-behind-cloudflare-and-default-rate-limit.md), [043](architecture/decisions/ADR-043-login-brake-per-email-and-network.md), [048](architecture/decisions/ADR-048-sign-up-without-enumeration-hashed-links-and-reset-brake.md), [051](architecture/decisions/ADR-051-standard-logging-and-durable-security-log.md)

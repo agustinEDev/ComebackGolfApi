@@ -2,7 +2,7 @@
 
 > **Estado: aparcado** (26 oct 2026). No es para ahora: para cobrar hay que darse de alta como autónomo y queda mucho trabajo por delante. Este documento recoge lo decidido y lo estimado para retomarlo sin rehacer nada.
 >
-> Issues: épica BE #676 (asistente, con el modelo de rentabilidad en un comentario) y sus hijas #677–#680 y FE #977; entrenador de swing en FE #937.
+> Issues (archived repository, los números son del repositorio archivado): épica BE #676 (asistente, con el modelo de rentabilidad en un comentario) y sus hijas #677–#680 y FE #977; entrenador de swing en FE #937.
 >
 > Sustituye al plan de diciembre de 2025: [RAG_IMPLEMENTATION.md](RAG_IMPLEMENTATION.md), [ADR-052](architecture/decisions/ADR-052-no-ai-rules-assistant-for-now.md) (sustituye al ADR-022, borrado; al empezar la fase 1 hará falta otro) y la v2.2.0 del [ROADMAP](../ROADMAP.md).
 

@@ -1,136 +1,131 @@
-# 🧪 Estrategia de Testing del Comeback Golf
+# 🧪 Tests de Comeback Golf API
 
-Este documento describe la filosofía, estructura y herramientas utilizadas para el testing automatizado en el proyecto, asegurando la calidad y fiabilidad de la API.
+Cómo están organizados los tests, cómo se ejecutan y qué piezas de `conftest.py`
+conviene conocer. La configuración vive en [`pytest.ini`](../pytest.ini) y
+[`tests/conftest.py`](conftest.py); el CI que los ejecuta, en
+[`docs/ci-cd/PIPELINE_GUIDE.md`](../docs/ci-cd/PIPELINE_GUIDE.md).
 
 ## 🎯 Filosofía
 
-Nos adherimos a una estricta política de **Test-Driven Development (TDD)**. Un conjunto de tests robusto es fundamental para:
+- **TDD**: primero la tabla de casos y el test que falla, luego el código.
+- **Los tests son documentación viva**: muchos llevan en el docstring el caso en
+  formato *Given / When / Then*.
+- **Sin efectos fuera**: `conftest.py` sustituye el servicio de correo por un doble y
+  vacía `SENTRY_DSN`, así que los tests no mandan correos ni eventos a Sentry. La RFEG de
+  la app de prueba es un mock salvo que el test ponga el suyo.
 
--   **Garantizar la Calidad**: Asegurar que la lógica de negocio funciona como se espera.
--   **Prevenir Regresiones**: Detectar errores introducidos por nuevos cambios.
--   **Facilitar el Refactoring**: Permitir la mejora del código con la confianza de que no se ha roto nada.
--   **Servir como Documentación Viva**: Los tests son el mejor ejemplo de cómo debe usarse el código.
+## 🏗️ Estructura
 
-## 🏗️ Estructura de Directorios
-
-La carpeta `tests/` refleja la estructura de `src/` y los principios de la Clean Architecture, separando los tests por su alcance y propósito.
-
-```
+```text
 tests/
-├── reports/          # 📊 Reportes generados por el script de tests
-│   ├── test_report.json
-│   ├── test_summary.md
-│   └── warnings.txt
-│
-├── unit/             # 🔬 Tests Unitarios (553 tests - rápidos y aislados)
-│   ├── modules/
-│   │   └── user/
-│   │       └── domain/
-│   │           ├── entities/
-│   │           ├── errors/
-│   │           ├── repositories/ (interfaces)
-│   │           └── value_objects/
-│   └── shared/
-│       └── domain/
-│           ├── events/
-│           └── repositories/ (interfaces)
-│
-└── integration/      # 🔗 Tests de Integración (119 tests - requieren entorno Docker)
-    ├── api/          # -> Prueban los endpoints de FastAPI
-    └── modules/
-        └── user/
-            └── infrastructure/
-                └── persistence/
-                    └── sqlalchemy/ # -> Prueban la capa de persistencia
+├── unit/            # Rápidos y sin base de datos
+│   ├── architecture/   # Reglas de arquitectura como tests (imports por capa, logs, reloj…)
+│   ├── config/         # Arranque, configuración, dependencias con hash
+│   ├── fakes/          # Tests de los dobles de tests/fakes
+│   ├── modules/        # competition · golf_course · quick_match · social · support · user
+│   ├── scripts/        # Scripts del CI y de mantenimiento
+│   └── shared/         # Dominio, aplicación e infraestructura compartidos
+├── integration/     # Contra PostgreSQL de verdad (API, repositorios, migraciones)
+│   ├── api/            # Endpoints de FastAPI de punta a punta
+│   ├── config/         # Tareas de fondo y tiempos límite contra la base
+│   ├── logging/        # Rastro de auditoría de seguridad
+│   ├── modules/        # Persistencia por módulo
+│   └── test_*_migration.py  # Migraciones de Alembic (y paridad del esquema, rol de la API…)
+├── security/        # CSRF, XSS, inyección SQL, auth bypass, rate limiting
+├── fakes/           # Dobles reutilizables (p. ej. el servicio de hándicap)
+└── fixtures/        # Datos de prueba (extracto de OpenStreetMap)
 ```
 
--   **`tests/unit/`**: Contiene tests que verifican pequeños componentes de forma **aislada**. Se centran en la **Capa de Dominio** (entidades, `ValueObjects`, interfaces de repositorios) y no tienen dependencias externas como bases de datos o APIs. Son extremadamente rápidos.
+Recuento con `pytest --collect-only -q` (28 nov 2026, v2.82.0): **11.258** unitarios,
+**1.737** de integración y **67** de seguridad.
 
--   **`tests/integration/`**: Verifica que varios componentes colaboran correctamente. Por ejemplo, que el `SQLAlchemyUserRepository` puede guardar y recuperar un `User` de la base de datos. Estos tests son más lentos y **requieren que el entorno Docker esté funcionando**.
+## 🚀 Cómo ejecutarlos
 
-## 🚀 Cómo Ejecutar los Tests
-
-La forma principal y recomendada de ejecutar la suite de tests es a través de nuestro script personalizado `dev_tests.py`.
-
-### Uso Principal: `dev_tests.py`
-
-Este script orquesta `pytest` para proporcionar una experiencia de testing mejorada.
-
-1.  **Asegúrate de que tu entorno virtual está activado**:
-    ```bash
-    source .venv/bin/activate
-    ```
-
-2.  **Ejecuta el script desde la raíz del proyecto**:
-    ```bash
-    python dev_tests.py
-    ```
-
-**Ventajas de usar `dev_tests.py`:**
--   **Paralelización Automática**: Usa `pytest-xdist` para ejecutar tests en paralelo, reduciendo drásticamente el tiempo de ejecución.
--   **Salida Organizada**: Presenta los resultados agrupados por capa y módulo, facilitando la identificación de problemas.
--   **Generación de Reportes**: Crea automáticamente los reportes en el directorio `tests/reports/`.
-
-### Ejecución Directa con `pytest`
-
-Para depurar un fichero o un test específico, puedes usar `pytest` directamente:
 ```bash
-# Ejecutar todos los tests en un fichero
-pytest tests/unit/modules/user/domain/value_objects/test_user_id.py
+source .venv/bin/activate
 
-# Ejecutar un test específico por su nombre
-pytest tests/unit/modules/user/domain/entities/test_user.py::TestUserCreation::test_create_user_with_valid_data
+pytest tests/unit/                 # Unitarios (sin base de datos)
+pytest tests/security -n 2         # Seguridad
+pytest tests/integration/          # Integración: necesita PostgreSQL (ver abajo)
+
+# Un fichero o un test concreto
+pytest tests/unit/modules/user/domain/value_objects/test_user_id.py
+pytest "tests/unit/test_sin_la_marca_vieja.py::test_m1_the_repo_does_not_name_the_old_brand"
 ```
 
-## �️ Configuración Clave
+`pytest.ini` añade `-n auto` (pytest-xdist): todo corre en paralelo con un proceso por
+núcleo. Para depurar en un solo proceso, `-n0`.
 
-La configuración de nuestro entorno de pruebas se basa en varios ficheros y convenciones importantes.
+Ejecuta cada carpeta por separado, como el CI: hay varios módulos de test con el
+mismo nombre en carpetas distintas (p. ej. `test_rotacion_del_refresco.py`) y una
+colección conjunta (`pytest tests/`) falla al importar.
 
-### 1. `pytest.ini`
+### `dev_tests.py`
 
-Este fichero es **esencial** y no debe ser eliminado. Contiene dos configuraciones críticas:
+Lanza la suite con pytest-xdist y `pytest-json-report` y deja los informes en
+`tests/reports/`:
 
--   `asyncio_mode = auto`: Le indica a `pytest-asyncio` que ejecute automáticamente todas las funciones de prueba marcadas como `async def`. Esto nos ahorra tener que añadir el decorador `@pytest.mark.asyncio` a cada test asíncrono.
--   `markers`: Registra marcadores personalizados como `integration` para que podamos categorizar y filtrar pruebas sin generar advertencias.
+- `test_report.json`: los resultados en crudo.
+- `test_summary.md`: resumen legible (totales, avisos, los tests más lentos y el
+  detalle de los fallos).
+- `warnings.txt`: todos los avisos de la ejecución.
 
-### 2. `tests/conftest.py`
+```bash
+python dev_tests.py
+```
 
-Este es el corazón de nuestra configuración de `pytest`. Define fixtures y hooks globales que son cruciales para el funcionamiento de las pruebas.
+### PostgreSQL para integración
 
-#### Hooks Globales
+Los tests de integración usan la misma URL que la app: `tests/conftest.py` la importa
+de `src/config/database.py` (como `APP_DATABASE_URL`, un alias interno, no una variable
+de entorno) y crea en ese servidor una base efímera por test. Esa URL sale de:
 
--   `pytest_configure(config)`: Se asegura de que los **mappers de SQLAlchemy** se inicialicen una sola vez por sesión de prueba, incluso cuando se ejecutan en paralelo con `pytest-xdist`. Esto previene condiciones de carrera y errores de inicialización.
+1. `DATABASE_URL`, del entorno o del `.env` de la raíz (`load_dotenv()` no pisa lo ya
+   exportado). Ojo: el `.env` copiado de `.env.example` trae una con el puerto 5432.
+2. Si no hay `DATABASE_URL`: `postgresql://POSTGRES_USER:POSTGRES_PASSWORD@localhost:DATABASE_PORT/POSTGRES_DB`,
+   con `user`, `pass`, `5434` (la base del Kind) y `comebackgolf_db` por defecto. El host
+   es siempre `localhost`: `DATABASE_HOST` se ignora.
 
-#### Fixtures Principales
+`postgres://` no vale: solo se reescribe `postgresql://` a `postgresql+asyncpg://`. El
+usuario necesita permiso para crear bases (`CREATE DATABASE`).
 
--   `client()`: Es la fixture principal para los **tests de integración de la API**. Proporciona un `AsyncClient` de `httpx` para realizar peticiones a la aplicación FastAPI. Su característica más importante es el **aislamiento total de la base de datos**:
-    -   Crea una **base de datos de prueba única para cada proceso trabajador** de `pytest-xdist` (ej. `test_db_gw0`, `test_db_gw1`).
-    -   Crea todo el esquema de tablas antes de cada test.
-    -   Destruye la base de datos de prueba completa después de cada test.
-    -   Esto garantiza que las pruebas paralelas no interfieran entre sí y que cada test se ejecute en un entorno limpio.
+Para usar la base del docker-compose (puerto 5433 en el ordenador), exporta la URL con
+las credenciales de `docker/.env`:
 
--   `db_session()`: Proporciona una **sesión de base de datos (`AsyncSession`) aislada** para tests que interactúan directamente con la capa de persistencia (por ejemplo, para probar un repositorio). Al igual que la fixture `client`, crea y destruye el esquema de la base de datos para cada test.
+```bash
+cd docker && docker compose up -d db && cd ..
+export DATABASE_URL="postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@localhost:5433/<POSTGRES_DB>"
+pytest tests/integration/
+```
 
--   **Fixtures de Datos** (`sample_user_data`, `multiple_users_data`, etc.): Proveen datos consistentes y reutilizables para las pruebas unitarias y de integración, facilitando la escritura y lectura de los tests.
+## 🛠️ Configuración clave
 
-## �📊 Interpretación de los Reportes
+### `pytest.ini`
 
-Después de cada ejecución de `dev_tests.py`, encontrarás tres reportes en la carpeta `tests/reports/`:
+- `asyncio_mode = auto`: las funciones `async def` se ejecutan sin decorador.
+- `addopts = -n auto`: paralelo por defecto.
+- `markers`: registra `integration`.
 
-1.  **`test_report.json`**:
-    -   **Propósito**: Fichero de datos crudos generado por `pytest-json-report`.
-    -   **Uso**: Ideal para integraciones con sistemas de CI/CD, dashboards o cualquier análisis programático de los resultados de los tests.
+### `tests/conftest.py`
 
-2.  **`test_summary.md`**:
-    -   **Propósito**: Un reporte en formato Markdown, legible para humanos, generado por nuestro script.
-    -   **Contenido**:
-        -   Resumen global con estadísticas (tests pasados, fallados, tasa de éxito, **warnings**).
-        -   Sección dedicada de warnings con detalles completos.
-        -   Lista de los 3 tests más lentos para identificar cuellos de botella.
-        -   Detalle de cada test fallado, incluyendo el `traceback` completo del error.
-    -   **Uso**: Es la forma más rápida de analizar los resultados de una ejecución y entender por qué ha fallado un test.
+- **`pytest_configure`**: arranca los mappers de SQLAlchemy (los mismos que la app y
+  Alembic) una sola vez, también con xdist.
+- **`client`**: el `AsyncClient` de httpx para los tests de API. Cada test tiene **su
+  propia base de datos** (`test_db_<worker>_<id>`), con el esquema creado al empezar y
+  borrada al terminar, así que los tests en paralelo no se pisan.
+- **`db_session`**: una `AsyncSession` aislada, con la misma estrategia, para probar
+  repositorios.
+- **`unit_client`**: cliente de la app sin base de datos para tests unitarios de rutas.
+- **Dobles automáticos**: `mock_external_services` (el servicio de correo) y
+  `reset_rate_limits` (limpia el rate limiting entre tests).
+- **Ayudas**: `authenticated_client`, `create_authenticated_user`,
+  `create_competition`, `sample_user_data`, `sample_competition_data`…
 
-3.  **`warnings.txt`**:
-    -   **Propósito**: Captura todos los warnings emitidos por pytest durante la ejecución.
-    -   **Contenido**: Lista completa de warnings con ubicación del archivo y línea.
-    -   **Uso**: Identificar deprecaciones, configuraciones faltantes o problemas potenciales en el código o dependencias.
+## 🔒 Tests que vigilan el repo
+
+- `tests/unit/architecture/`: reglas de Clean Architecture comprobadas como tests,
+  además de los contratos de `lint-imports`.
+- `tests/unit/test_sin_la_marca_vieja.py`: ningún fichero del repo (salvo el
+  CHANGELOG) nombra la marca anterior.
+- `tests/unit/config/test_dependencias_con_hash.py`: el lock con hashes fija las mismas
+  versiones que `requirements.txt`.
