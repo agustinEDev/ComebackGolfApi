@@ -33,7 +33,7 @@ hándicaps con la RFEG y comprobación diaria de la clave de Brevo.
   decisión técnica está en [ADR-052](docs/architecture/decisions/ADR-052-no-ai-rules-assistant-for-now.md).
   Aparcado hasta poder facturar; necesita antes un sistema de pagos
   (Stripe), que hoy no existe. Sustituye al antiguo módulo «AI & RAG» (LangChain +
-  Pinecone + OpenAI), que no se llegó a hacer: [docs/RAG_IMPLEMENTATION.md](docs/RAG_IMPLEMENTATION.md).
+  Pinecone + OpenAI), que no se llegó a hacer.
 - **Iniciar sesión con Apple:** no existe todavía (solo Google). Requiere una cuenta de
   Apple Developer.
 
