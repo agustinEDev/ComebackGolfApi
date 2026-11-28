@@ -1,6 +1,6 @@
 # Design Document - Comeback Golf
 
-> **Version:** 2.82.0 · **Last updated:** 28 November 2026
+> **Version:** 2.82.1 · **Last updated:** 28 November 2026
 
 ---
 
