@@ -5,9 +5,9 @@
 # Ejecuta tests, security checks, linting y type checking en paralelo
 #
 # Jobs (todos en paralelo; el resumen espera al resto):
-# 1. Unit Tests - 662 tests (Python 3.12 + 3.14)
-# 2. Integration Tests - 72 tests (con PostgreSQL)
-# 3. Security Tests - 45+ tests (CSRF, XSS, SQLi, Auth Bypass)
+# 1. Unit Tests - Python 3.12 + 3.14
+# 2. Integration Tests - con PostgreSQL
+# 3. Security Tests - CSRF, XSS, SQLi, Auth Bypass
 # 4. Security Checks - Bandit, pip-audit, Gitleaks
 # 5. Linting - Ruff (linter + formatter, los dos bloquean)
 # 6. Type Checking - Mypy

@@ -271,7 +271,6 @@ accepted risks: [docs/KNOWN_SECURITY_ISSUES.md](docs/KNOWN_SECURITY_ISSUES.md).
 | [docs/MULTI_ENVIRONMENT_SETUP.md](docs/MULTI_ENVIRONMENT_SETUP.md) | Environment variables per environment |
 | [DEPLOYMENT.md](DEPLOYMENT.md) · [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment and operations |
 | [ROADMAP.md](ROADMAP.md) · [CHANGELOG.md](CHANGELOG.md) | What exists, what's next, what changed |
-| [docs/plan-de-pago-e-ia.md](docs/plan-de-pago-e-ia.md) | Paid plan with a rules assistant, swing coach and caddie (parked) |
 | [docs/README.md](docs/README.md) | Full index |
 
 ---
