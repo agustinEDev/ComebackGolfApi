@@ -18,7 +18,7 @@
 # Versión EXACTA: el CI la usa como check bloqueante, y con un rango cada release
 # nueva de ruff puede traer reglas y poner el CI en rojo sin tocar código (la 0.16
 # añadió PLR0917: 143 avisos). Subirla es una PR propia, que Dependabot propondrá.
-ruff==0.17.5
+ruff==0.17.6
 
 # import-linter - Contratos de arquitectura (capas, dominio puro, módulos), ver .importlinter
 # Versión exacta: el workflow "Architecture & API Contract" instala la que diga esta línea
@@ -134,10 +134,10 @@ radon>=6.0.1
 # cyclonedx-bom - Genera Software Bill of Materials (SBOM) en formato CycloneDX
 # Cumple con OWASP A08:2021 Software and Data Integrity Failures
 # Permite auditoría completa de la cadena de suministro de software
-cyclonedx-bom>=8.0.1
+cyclonedx-bom>=9.0.0
 
 # pip-tools - Herramientas para gestión de dependencias con pip
 # pip-compile: Genera requirements.lock con hashes SHA256 para verificación de integridad
 # pip-sync: Sincroniza el entorno con el lock file
 # Previene ataques de dependency substitution
-pip-tools>=7.6.2
+pip-tools>=7.7.0
