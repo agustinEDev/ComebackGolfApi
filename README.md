@@ -190,7 +190,6 @@ Migrations run on start-up (`entrypoint.sh`).
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt         # includes requirements.txt
 cp .env.example .env                        # point DATABASE_URL at a PostgreSQL (postgresql://)
-# In .env set EMAIL_TRANSPORT=mailpit (the example says mailgun: real emails)
 docker compose -f docker/docker-compose.yml --env-file docker/.env up -d mailpit   # inbox on http://127.0.0.1:8025
 alembic upgrade head
 uvicorn main:app --reload

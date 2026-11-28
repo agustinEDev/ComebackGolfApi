@@ -29,4 +29,5 @@ longer described any decision in force, so it was deleted.
 ## Consequences
 
 - No external AI cost, data processing agreement or prompt-injection surface today.
-- `docs/RAG_IMPLEMENTATION.md` is kept only as history of the discarded plan.
+- The old plan (`docs/RAG_IMPLEMENTATION.md`) was removed on 28 November 2026; it remains
+  in the git history.
