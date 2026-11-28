@@ -55,13 +55,3 @@
 |-----------|----------|
 | [ROADMAP.md](../ROADMAP.md) | Lo que hay y lo que queda |
 | [pendientes-de-release.md](pendientes-de-release.md) | Decisiones que una release deja para otra |
-| [plan-de-pago-e-ia.md](plan-de-pago-e-ia.md) | Plan de pago e IA (aparcado) |
-
-## 🗄️ Histórico
-
-Se conservan como registro; no describen el código de hoy.
-
-| Documento | Qué fue |
-|-----------|---------|
-| [AUDIT_BACKEND_2026-07.md](AUDIT_BACKEND_2026-07.md) | Auditoría de seguridad y arquitectura de julio de 2026 |
-| [RAG_IMPLEMENTATION.md](RAG_IMPLEMENTATION.md) | Plan de asistente de diciembre de 2025, sustituido y nunca implementado |

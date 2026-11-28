@@ -1,6 +1,6 @@
 # Module: Competition Management
 
-> **Version:** 2.82.1 · **Last updated:** 28 November 2026
+> **Version:** 2.82.2 · **Last updated:** 28 November 2026
 > **Code:** `src/modules/competition/`
 
 ## 📋 Description

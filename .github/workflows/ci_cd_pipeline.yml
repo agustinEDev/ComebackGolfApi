@@ -5,9 +5,9 @@
 # Ejecuta tests, security checks, linting y type checking en paralelo
 #
 # Jobs (todos en paralelo; el resumen espera al resto):
-# 1. Unit Tests - 662 tests (Python 3.12 + 3.14)
-# 2. Integration Tests - 72 tests (con PostgreSQL)
-# 3. Security Tests - 45+ tests (CSRF, XSS, SQLi, Auth Bypass)
+# 1. Unit Tests - Python 3.12 + 3.14
+# 2. Integration Tests - con PostgreSQL
+# 3. Security Tests - CSRF, XSS, SQLi, Auth Bypass
 # 4. Security Checks - Bandit, pip-audit, Gitleaks
 # 5. Linting - Ruff (linter + formatter, los dos bloquean)
 # 6. Type Checking - Mypy
@@ -771,7 +771,7 @@ jobs:
           trivyignores: '.trivyignore.yaml'  # las aceptadas, acotadas por purl (INF-02)
 
       - name: Upload Trivy Results to GitHub Security
-        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea  # v4.39.4
         if: matrix.comprobacion == 'trivy' && steps.trivy_scan.outcome == 'success' && hashFiles('trivy-results.sarif') != ''
         with:
           sarif_file: 'trivy-results.sarif'
@@ -1513,7 +1513,7 @@ jobs:
 
       - name: Upload results to the Security tab
         if: always() && hashFiles('semgrep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea  # v4.39.4
         with:
           sarif_file: semgrep.sarif
           category: semgrep

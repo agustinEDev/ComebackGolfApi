@@ -12,7 +12,7 @@
 
 Ryder-style team tournaments, quick rounds and hole-by-hole scoring for amateur golfers.
 
-[![Version](https://img.shields.io/badge/version-2.82.1-ddf478?style=flat-square&labelColor=222d24)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.82.2-ddf478?style=flat-square&labelColor=222d24)](CHANGELOG.md)
 [![CI](https://img.shields.io/github/actions/workflow/status/agustinEDev/ComebackGolfApi/ci_cd_pipeline.yml?branch=develop&style=flat-square&label=CI&labelColor=222d24&logo=githubactions&logoColor=ddf478)](https://github.com/agustinEDev/ComebackGolfApi/actions/workflows/ci_cd_pipeline.yml)
 [![Tests](https://img.shields.io/badge/tests-13k%2B-ddf478?style=flat-square&labelColor=222d24&logo=pytest&logoColor=ddf478)](tests/README.md)
 [![Coverage gate](https://img.shields.io/badge/coverage%20gate-%E2%89%A588%25-ddf478?style=flat-square&labelColor=222d24)](docs/ci-cd/PIPELINE_GUIDE.md)
@@ -190,7 +190,6 @@ Migrations run on start-up (`entrypoint.sh`).
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt         # includes requirements.txt
 cp .env.example .env                        # point DATABASE_URL at a PostgreSQL (postgresql://)
-# In .env set EMAIL_TRANSPORT=mailpit (the example says mailgun: real emails)
 docker compose -f docker/docker-compose.yml --env-file docker/.env up -d mailpit   # inbox on http://127.0.0.1:8025
 alembic upgrade head
 uvicorn main:app --reload
@@ -271,7 +270,6 @@ accepted risks: [docs/KNOWN_SECURITY_ISSUES.md](docs/KNOWN_SECURITY_ISSUES.md).
 | [docs/MULTI_ENVIRONMENT_SETUP.md](docs/MULTI_ENVIRONMENT_SETUP.md) | Environment variables per environment |
 | [DEPLOYMENT.md](DEPLOYMENT.md) · [docs/RUNBOOK.md](docs/RUNBOOK.md) | Deployment and operations |
 | [ROADMAP.md](ROADMAP.md) · [CHANGELOG.md](CHANGELOG.md) | What exists, what's next, what changed |
-| [docs/plan-de-pago-e-ia.md](docs/plan-de-pago-e-ia.md) | Paid plan with a rules assistant, swing coach and caddie (parked) |
 | [docs/README.md](docs/README.md) | Full index |
 
 ---
