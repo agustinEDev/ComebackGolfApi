@@ -1,8 +1,8 @@
 # Threat Models - Comeback Golf API
 
-**Version:** 1.1
+**Version:** 1.2
 **Created On:** January 29, 2026
-**Last Review:** February 4, 2026
+**Last Review:** November 28, 2026 (figures checked against the code of v2.82.0)
 **OWASP Coverage:** A04: Insecure Design (Threat Modeling)
 
 ---
@@ -41,11 +41,11 @@ User → API (email + password) → Verify credentials → Generate JWT → Set 
 | **Tampering**: Attacker modifies JWT token | ⚠️ MEDIUM | JWT signature verification (HS256), token validation on every request | ✅ Mitigated |
 | **Repudiation**: User denies login action | 🟢 LOW | Security audit logs (`UserLoggedInEvent`), correlation IDs | ✅ Mitigated |
 | **Information Disclosure**: JWT stolen from client | ⚠️ MEDIUM | httpOnly cookies (no JS access), HTTPS only, SameSite=lax | ✅ Mitigated |
-| **Denial of Service**: Brute force login attempts | ⚠️ MEDIUM | Rate limiting (5/min), account lockout (10 attempts, 30 min) | ✅ Mitigated |
+| **Denial of Service**: Brute force login attempts | ⚠️ MEDIUM | Login brake per email + network (5/min; 10 failures in 30 min lock that network for 30 min, ADR-043), account backstop across all networks (50 failures/hour → 30 min; 150/24 h → 24 h for unknown devices) | ✅ Mitigated |
 | **Elevation of Privilege**: Normal user becomes admin | 🔴 HIGH | RBAC checks, `is_admin` field in DB, no public admin creation endpoint | ✅ Mitigated |
 
 ### Residual Risks
-- 🟡 **Session Hijacking**: If attacker gains physical access to device with active session → **Mitigation**: Session timeout (15 min), cookie-based device identification (v2.0.4), manual device revocation, `is_current_device` for user awareness
+- 🟡 **Session Hijacking**: If attacker gains physical access to device with active session → **Mitigation**: Short-lived access token (15 min by default), cookie-based device identification, manual device revocation, `is_current_device` for user awareness
 
 ---
 
@@ -80,7 +80,7 @@ Creator → API (competition data) → Validate limits → Validate dates → Cr
 ## 3. Enrollment Flow
 
 ### Assets
-- Enrollment status (REQUESTED, APPROVED, REJECTED)
+- Enrollment status (REQUESTED, INVITED, APPROVED, REJECTED, CANCELLED, WITHDRAWN)
 - Competition capacity (max_players limit)
 - User enrollment history
 - Team assignments
@@ -97,7 +97,7 @@ Player → API (enrollment request) → Validate competition status → Check du
 | **Spoofing**: Bot enrollments (fake users) | 🔴 HIGH | **RISK**: No CAPTCHA or bot prevention implemented ⚠️ | ❌ Open Risk |
 | **Tampering**: Modify enrollment status without approval | ⚠️ MEDIUM | State machine validation, RBAC checks, only creator/admin can approve | ✅ Mitigated |
 | **Repudiation**: User denies enrollment action | 🟢 LOW | `EnrollmentRequestedEvent`, audit logs, timestamps | ✅ Mitigated |
-| **Information Disclosure**: Leak of enrollment lists | 🟢 LOW | Only creator/admin/players can view enrollments | ✅ Mitigated |
+| **Information Disclosure**: Leak of enrollment lists | 🟢 LOW | `quien_ve_los_inscritos.py`: the organizer and admins see every enrollment and request; enrolled captains and vice-captains see all approved players; everyone else, in a public competition, all approved players once it is published and only their friends before; in a private one, all if they accepted, their friends if invited, nobody otherwise | ✅ Mitigated |
 | **Denial of Service**: Duplicate enrollments | ⚠️ MEDIUM | **NEW:** `CompetitionPolicy.can_enroll` (duplicate prevention) ⭐ | ✅ Mitigated |
 | **Denial of Service**: Enrollment spam (enroll in 1000 competitions) | 🔴 HIGH | **NEW:** `CompetitionPolicy.can_enroll` (limit: 20 active enrollments) ⭐ | ✅ Mitigated |
 | **Denial of Service**: Capacity bypass (enroll when full) | ⚠️ MEDIUM | **NEW:** `CompetitionPolicy.validate_capacity` (checks before approval) ⭐ | ✅ Mitigated |
@@ -112,7 +112,7 @@ Player → API (enrollment request) → Validate competition status → Check du
 ## 4. Password Reset Flow
 
 ### Assets
-- Password reset tokens (256-bit, 24h expiration)
+- Password reset tokens (stored as SHA-256, valid for 1 hour)
 - User email addresses
 - New password (plaintext temporarily in memory)
 
@@ -128,8 +128,8 @@ User → API (reset request) → Generate token → Send email → User clicks l
 | **Spoofing**: Attacker requests reset for victim's email | ⚠️ MEDIUM | Token sent only to registered email, timing attack prevention | ✅ Mitigated |
 | **Tampering**: Token manipulation | ⚠️ MEDIUM | 256-bit secure random token, stored hashed (SHA256), single-use | ✅ Mitigated |
 | **Repudiation**: User denies requesting reset | 🟢 LOW | `PasswordResetRequestedEvent`, audit logs | ✅ Mitigated |
-| **Information Disclosure**: Token leaked in email | ⚠️ MEDIUM | HTTPS links only, token expires in 24h, single-use | ✅ Mitigated |
-| **Denial of Service**: Reset spam | ⚠️ MEDIUM | Rate limiting (3/hour per email) | ✅ Mitigated |
+| **Information Disclosure**: Token leaked in email | ⚠️ MEDIUM | HTTPS links only, token expires in 1 hour, single-use; reset and security emails never go through a provider that rewrites links | ✅ Mitigated |
+| **Denial of Service**: Reset spam | ⚠️ MEDIUM | Rate limiting (3/hour per email, 30/hour per network) | ✅ Mitigated |
 | **Elevation of Privilege**: Reset admin password | 🟢 LOW | No special treatment, same flow for all users | ✅ Mitigated |
 
 ### Residual Risks
@@ -148,19 +148,19 @@ User → API (reset request) → Generate token → Send email → User clicks l
 
 | Threat | Risk | Mitigation | Status |
 |--------|------|------------|--------|
-| **Denial of Service**: API flooding (10000 requests/sec) | 🔴 HIGH | SlowAPI rate limiting (global 100/min, endpoint-specific limits) | ✅ Mitigated |
-| **Denial of Service**: Slow loris attacks | ⚠️ MEDIUM | Uvicorn timeout configuration, reverse proxy (nginx) | ✅ Mitigated |
-| **Denial of Service**: Database connection exhaustion | ⚠️ MEDIUM | SQLAlchemy pool limits, async operations | ✅ Mitigated |
-| **Elevation of Privilege**: Bypass rate limits | 🟢 LOW | No client-written header chooses a bucket (ADR-038): session routes key on the verified user, anonymous routes on the network, login also on the email (#273) | ✅ Mitigated |
+| **Denial of Service**: API flooding (10000 requests/sec) | 🔴 HIGH | SlowAPI rate limiting: endpoint-specific limits plus a default of 100/min per user for every session route without its own | ✅ Mitigated |
+| **Denial of Service**: Slow loris attacks | ⚠️ MEDIUM | Uvicorn behind the hosting provider's proxy; request body size capped for uploads | ✅ Mitigated |
+| **Denial of Service**: Database connection exhaustion | ⚠️ MEDIUM | SQLAlchemy pool limits (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`), statement and idle-in-transaction timeouts, async operations | ✅ Mitigated |
+| **Elevation of Privilege**: Bypass rate limits | 🟢 LOW | No client-written header chooses a bucket (ADR-038): session routes key on the verified user, anonymous routes on the network, login also on the email | ✅ Mitigated |
 
 ### Rate Limits by Endpoint
 
-The full table, with who is counted for each limit, lives in [API.md, Rate Limits per Endpoint](../API.md#rate-limits-per-endpoint). In short (#273):
+The full table, with who is counted for each limit, lives in [API.md, Rate limiting](../API.md). In short:
 
 - Routes with a session count **per user**, taken from the verified access token.
-- Anonymous routes count **per network**, which in production is one bucket for the whole app until the real client IP arrives (#466).
-- Login: 5/min per email (before the lookup), 30 failed/min per network, 60/min ceiling. Forgot-password and resend-verification: 3/hour per email.
-- Routes without a decorator have **no** limit: the 100/min default is not applied (#467).
+- Anonymous routes count **per network**; behind Cloudflare the real client IP is trusted only on requests that prove they came through Cloudflare (ADR-041, amending ADR-038).
+- Login: 5/min per email and network (before the lookup), 30 failed/min per network, 120/min ceiling. Forgot-password and resend-verification: 3/hour per email and 30/hour per network.
+- Every session route without its own limit gets a default of 100/min per user, applied as a global dependency; a few routes are explicitly exempt, and anonymous routes always declare their own.
 
 ---
 

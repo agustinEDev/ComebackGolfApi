@@ -1,6 +1,6 @@
 # 🤖 Guía de Implementación RAG - Asistente de Reglamento de Golf
 
-> **⚠️ SUSTITUIDO (26 oct 2026):** este plan de diciembre de 2025 no se llegó a implementar y ha quedado desfasado (proveedores, corpus y licencia). Se conserva como histórico. El plan vigente está en [plan-de-pago-e-ia.md](plan-de-pago-e-ia.md) y en la épica BE #676 (aparcada).
+> **⚠️ SUSTITUIDO (26 oct 2026):** este plan de diciembre de 2025 no se llegó a implementar y ha quedado desfasado (proveedores, corpus y licencia). Se conserva como histórico. El plan vigente está en [plan-de-pago-e-ia.md](plan-de-pago-e-ia.md) y en la épica BE #676 del repositorio archivado (archived repository; aparcada).
 
 ---
 
@@ -256,7 +256,7 @@ COMMON_GOLF_FAQS = {
 **Documentos a ingerir (50 inicial):**
 - R&A Rules 2023 (ES/EN)
 - WHS Manual 2020 (ES)
-- Ryder Cup Format Guide
+- Ryder format guide
 - Local Rules Spain
 - ... (más PDFs y Markdown)
 

@@ -1,152 +1,66 @@
-# Docker Validation Scripts
+# 🔍 Docker Validation Scripts
 
-Este directorio contiene scripts de validación fail-fast para garantizar que las variables de entorno requeridas estén configuradas correctamente antes de que los servicios Docker inicien.
+Scripts de validación *fail-fast* para que un contenedor no arranque con variables de entorno que faltan, en lugar de fallar más tarde con errores confusos.
 
-## 📋 Scripts Disponibles
+## 📋 Scripts disponibles
 
 ### 1. `validate-postgres-env.sh`
 
-**Propósito:** Valida las variables de entorno requeridas para el servicio PostgreSQL antes de que la base de datos inicie.
+**Lo usa** el servicio `db` de `docker/docker-compose.yml` como `entrypoint`: valida las variables y, si están bien, cede el control al arranque normal de PostgreSQL.
 
-**Variables validadas:**
-- `POSTGRES_USER` - Usuario de PostgreSQL (requerido)
-- `POSTGRES_PASSWORD` - Contraseña del usuario (requerido)
-- `POSTGRES_DB` - Nombre de la base de datos (requerido)
+**Variables obligatorias:** `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`.
 
 **Comportamiento:**
-- ✅ **Éxito:** Si todas las variables están configuradas, el script permite que PostgreSQL inicie normalmente
-- ❌ **Fallo:** Si alguna variable falta, el script:
-  - Imprime un mensaje de error claro y detallado
-  - Proporciona ejemplos de configuración
-  - Sale con código de error 1 (el contenedor no inicia)
-
-**Ejemplo de salida en caso de error:**
-```
-🔍 Validating PostgreSQL environment variables...
-❌ ERROR: Required environment variable 'POSTGRES_USER' is not set or is empty
-✓ POSTGRES_PASSWORD is set
-✓ POSTGRES_DB is set
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FAIL-FAST VALIDATION FAILED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Please ensure your .env file exists and contains:
-  - POSTGRES_USER
-  - POSTGRES_PASSWORD
-  - POSTGRES_DB
-```
+- ✅ Todas presentes: PostgreSQL arranca normalmente.
+- ❌ Falta alguna (vacía o con el valor `MISSING_*` que pone Compose por defecto): imprime qué falta y cómo configurarlo, y sale con código 1 (el contenedor no arranca).
 
 ### 2. `validate-app-env.sh`
 
-**Propósito:** Valida las variables de entorno requeridas para la aplicación FastAPI antes de que inicie.
+Valida las variables de la API antes de arrancar FastAPI.
 
-**Variables requeridas (críticas):**
-- `POSTGRES_USER` - Usuario de PostgreSQL
-- `POSTGRES_PASSWORD` - Contraseña de PostgreSQL
-- `POSTGRES_DB` - Nombre de la base de datos
-- `SECRET_KEY` - Clave secreta para JWT
+**Obligatorias:** `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `SECRET_KEY`.
+**Recomendadas (solo avisa):** `MAILGUN_API_KEY`, `DOCS_USERNAME`, `DOCS_PASSWORD`.
 
-**Variables opcionales (advertencia):**
-- `MAILGUN_API_KEY` - API key de Mailgun
-- `DOCS_USERNAME` - Usuario para Swagger docs
-- `DOCS_PASSWORD` - Contraseña para Swagger docs
+Compose lo monta en el contenedor `app` (`/validate-app-env.sh`), pero **no es su entrypoint**: el servicio arranca con el `entrypoint.sh` de la imagen, que hace su propia validación (variables obligatorias y valores `MISSING_*`), espera a PostgreSQL, aplica las migraciones y lanza `uvicorn`. Se puede ejecutar a mano para comprobar un entorno:
 
-**Comportamiento:**
-- ✅ **Éxito:** Si todas las variables requeridas están configuradas, permite que la aplicación inicie
-- ⚠️  **Advertencia:** Si faltan variables opcionales, muestra advertencias pero continúa
-- ❌ **Fallo:** Si falta alguna variable requerida, el script:
-  - Imprime un mensaje de error detallado
-  - Proporciona ejemplos de configuración
-  - Sale con código de error 1 (el contenedor no inicia)
+```bash
+docker compose -f docker/docker-compose.yml --env-file docker/.env exec app sh /validate-app-env.sh
+```
 
 ### 3. `test-validation.sh`
 
-**Propósito:** Script de prueba automatizado para verificar que los scripts de validación funcionan correctamente.
+Prueba de humo de `validate-postgres-env.sh`: comprueba que falla sin `POSTGRES_USER` y que pasa con todas las variables definidas.
 
-**Tests incluidos:**
-- Test de variables faltantes (debe fallar)
-- Test de variables configuradas (debe pasar)
+## 🧪 Ejecutar las pruebas
 
-## 🚀 Uso
-
-Los scripts se ejecutan automáticamente mediante el `docker-compose.yml`:
-
-```yaml
-services:
-  db:
-    volumes:
-      - ./docker/scripts/validate-postgres-env.sh:/validate-postgres-env.sh:ro
-    entrypoint: ["/bin/sh", "/validate-postgres-env.sh"]
-
-  app:
-    volumes:
-      - ./docker/scripts/validate-app-env.sh:/validate-app-env.sh:ro
-    entrypoint: ["/bin/sh", "/validate-app-env.sh"]
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-```
-
-## 🧪 Ejecutar Tests
-
-Para probar manualmente los scripts de validación:
+Desde la raíz del repositorio:
 
 ```bash
-# Ejecutar suite completa de tests
 ./docker/scripts/test-validation.sh
-
-# Probar script de PostgreSQL manualmente
-export POSTGRES_USER="test"
-export POSTGRES_PASSWORD="test"
-export POSTGRES_DB="test"
-./docker/scripts/validate-postgres-env.sh
 ```
+
+`validate-postgres-env.sh` está pensado para ejecutarse **dentro del contenedor** `db`:
+si las variables están bien, termina con `exec docker-entrypoint.sh postgres`, que fuera
+de la imagen de PostgreSQL no existe. Para probarlo en tu máquina, usa
+`test-validation.sh`, que sustituye ese arranque por uno de mentira.
 
 ## 🔧 Configuración
 
-### Archivo `.env` Requerido
-
-Los scripts esperan que exista un archivo `.env` en la raíz del proyecto con las siguientes variables:
+Las variables salen de **`docker/.env`** (el `env_file` de Compose es relativo a `docker/docker-compose.yml`). Créalo desde la plantilla:
 
 ```bash
-# Database Configuration (REQUIRED)
-POSTGRES_USER=rydercupam_adminuser
-POSTGRES_PASSWORD=your_secure_password
-POSTGRES_DB=rydercupam_db
-
-# Security Configuration (REQUIRED)
-SECRET_KEY=your_secret_key_here
-
-# Optional Configuration
-MAILGUN_API_KEY=your_mailgun_key
-DOCS_USERNAME=admin
-DOCS_PASSWORD=secure_password
+cp docker/.env.example docker/.env
+# Edita docker/.env con tus valores
 ```
 
-### Crear desde Ejemplo
+## 📝 Notas técnicas
 
-Si no tienes un archivo `.env`, copia el ejemplo:
-
-```bash
-cp .env.example .env
-# Edita .env con tus valores
-```
-
-## 🎯 Beneficios
-
-1. **Fail-Fast:** Los errores de configuración se detectan inmediatamente, no después de minutos de espera
-2. **Mensajes Claros:** Errores descriptivos que indican exactamente qué falta y cómo solucionarlo
-3. **Prevención de Problemas:** Evita healthcheck failures y errores confusos de PostgreSQL
-4. **Mejora DX:** Desarrollo más rápido al detectar problemas de configuración de inmediato
-
-## 📝 Notas Técnicas
-
-- Los scripts usan **shell POSIX** (`/bin/sh`) para compatibilidad máxima con Alpine Linux
-- Los volúmenes están montados en modo **read-only** (`:ro`) por seguridad
-- El `docker-compose.yml` marca `env_file` como `required: false` para permitir que nuestros scripts manejen el error
-- Los scripts son compatibles con entrypoints estándar de Docker (`docker-entrypoint.sh`)
+- Los scripts usan **shell POSIX** (`/bin/sh`), compatible con la imagen Alpine de PostgreSQL.
+- Se montan en **solo lectura** (`:ro`).
+- Los valores por defecto `MISSING_*` de `docker-compose.yml` solo existen para que la interpolación sea válida; los validadores los tratan como ausentes.
 
 ## 🔗 Referencias
 
-- **docker-compose.yml:** Configuración de servicios
-- **.env.example:** Plantilla de variables de entorno
-- **docs/README.md:** Documentación completa del proyecto
+- [`../docker-compose.yml`](../docker-compose.yml): servicios
+- [`../.env.example`](../.env.example): plantilla de variables
+- [`../README.md`](../README.md): guía de Docker Compose

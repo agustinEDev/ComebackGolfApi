@@ -1,193 +1,152 @@
-# 🚀 Gestión del Entorno de Pruebas con Kubernetes
+# 🚀 Entorno local con Kubernetes (Kind)
 
-Este documento centraliza toda la información necesaria para desplegar, gestionar y mantener el entorno de pruebas de **ComebackGolfApi** utilizando Kubernetes.
+Este documento explica cómo levantar, gestionar y apagar el entorno local de **Comeback Golf** sobre Kubernetes. El detalle de cada script está en [`scripts/README.md`](scripts/README.md).
 
-## 🧐 ¿Qué es Kubernetes y por qué lo usamos?
+## 🧐 Qué es y para qué sirve
 
-**Kubernetes (K8s)** es un sistema de orquestación de contenedores que automatiza el despliegue, escalado y gestión de aplicaciones. Para este proyecto, utilizamos **Kind (Kubernetes in Docker)**, que permite ejecutar un clúster de Kubernetes localmente usando contenedores de Docker.
+Usamos **[Kind](https://kind.sigs.k8s.io/) (Kubernetes in Docker)**: un clúster de Kubernetes de un solo nodo que corre dentro de Docker. Levanta juntos la API, el frontend, PostgreSQL y un buzón de correo local (Mailpit), cada uno en su pod, para probar la aplicación completa en tu máquina.
 
-**Beneficios en nuestro entorno de pruebas:**
-- **Consistencia:** Asegura que todos los desarrolladores trabajen en un entorno idéntico al de producción.
-- **Aislamiento:** Todos los servicios (backend, frontend, base de datos) se ejecutan de forma aislada pero comunicada.
-- **Automatización:** Los scripts proporcionados simplifican tareas complejas como el despliegue o la restauración de la base de datos.
-- **Escalabilidad:** Permite simular un entorno con múltiples réplicas de los servicios.
+| Recurso | Valor |
+|---|---|
+| Clúster | `comebackgolf-cluster` (contexto `kind-comebackgolf-cluster`) |
+| Namespace | `comebackgolf` |
+| Deployments | `comebackgolf-api` (contenedor `fastapi`), `comebackgolf-web` (contenedor `nginx`), `postgres`, `mailpit` |
+| Imágenes | `agustinedev/comebackgolf-api:latest` y `agustinedev/comebackgolf-web:latest`, construidas en local y cargadas con `kind load` (no se suben a ningún registro); `postgres:15`; `axllent/mailpit` |
+| Base de datos | `comebackgolf_dev`, en el PVC `postgres-pvc` |
+
+Cada deployment tiene **una réplica**: es un entorno de pruebas local, no un clúster de producción.
 
 ---
 
 ## ✅ Prerrequisitos
 
-Antes de empezar, asegúrate de tener instalado el siguiente software:
+- **Docker Desktop** (o Docker Engine) arrancado: `docker info`
+- **kubectl**: `kubectl version --client`
+- **Kind**: `kind version`
+- El repositorio del frontend clonado **junto a este**, con el nombre `ComebackGolfWeb`:
 
-| Software       | Versión Mínima | Comando de Verificación      |
-|----------------|----------------|------------------------------|
-| Docker Desktop | 24.0+          | `docker --version`           |
-| kubectl        | 1.28+          | `kubectl version --client`   |
-| Kind           | 0.20+          | `kind version`               |
-
-Puedes verificar todas las versiones con un solo comando:
-```bash
-docker --version && kubectl version --client && kind version
+```text
+repos/
+├── ComebackGolfApi/   ← este repositorio
+└── ComebackGolfWeb/   ← el frontend (los scripts lo buscan en ../ComebackGolfWeb)
 ```
 
 ---
 
-## 🚀 Scripts de Gestión
+## 🚀 Flujo de trabajo
 
-Todos los scripts se encuentran en el directorio `k8s/scripts/` y deben ejecutarse desde el directorio `k8s`.
+Los scripts calculan sus rutas solos; lo habitual es lanzarlos desde `k8s/`.
 
-### Flujo de Trabajo Típico
+1. **Primer despliegue** (crea el clúster y despliega todo):
+   ```bash
+   cd k8s
+   ./scripts/deploy-cluster.sh
+   ```
+2. **Abrir la aplicación** (los puertos ya están mapeados a `localhost`):
+   - Frontend: http://localhost:8080
+   - API: http://localhost:8000 (`/health`, y `/docs` con las credenciales de `DOCS_USERNAME`/`DOCS_PASSWORD`)
+3. **Ver el estado**:
+   ```bash
+   ./scripts/cluster-status.sh
+   ```
+4. **Al terminar**, borra el clúster para liberar memoria:
+   ```bash
+   ./scripts/destroy-cluster.sh
+   ```
 
-1.  **Primer Despliegue:**
-    ```bash
-    cd k8s
-    ./scripts/deploy-cluster.sh
-    ```
-2.  **Acceder a la aplicación:**
-    Una vez desplegado el clúster, los servicios son accesibles directamente:
-    - Frontend: `http://localhost:8080`
-    - Backend API: `http://localhost:8000/docs`
+Las imágenes se construyen con la caché de Docker; `NO_CACHE=1 ./scripts/deploy-cluster.sh` (también en `deploy-api.sh`, `deploy-front.sh` y `deploy-db.sh`) construye desde cero. Antes de construir, `deploy-cluster.sh`, `deploy-api.sh` y `deploy-front.sh` muestran **de qué rama** sale cada imagen (`rama-de-la-imagen.sh`), porque construyen desde el árbol de trabajo tal y como esté.
 
-3.  **Verificar el estado:**
-    ```bash
-    ./scripts/cluster-status.sh
-    ```
-4.  **Al terminar de trabajar:**
-    ```bash
-    ./scripts/destroy-cluster.sh
-    ```
+### Resumen de scripts
 
-### Resumen de Scripts
-
-| Script                    | Descripción                                                                          |
-|---------------------------|--------------------------------------------------------------------------------------|
-| `deploy-cluster.sh`       | **(Principal)** Despliega el clúster completo desde cero (DB, API, Frontend).        |
-| `deploy-db.sh`            | Actualiza la base de datos y aplica migraciones de Alembic.                          |
-| `deploy-api.sh [tag]`     | Recompila y despliega una nueva versión del backend (API).                           |
-| `deploy-front.sh [tag]`   | Recompila y despliega una nueva versión del frontend.                                |
-| `destroy-cluster.sh`      | **(Peligroso)** Elimina completamente el clúster y todos sus datos.                  |
-| `cluster-status.sh`       | Muestra un informe detallado del estado de todos los componentes del clúster.        |
-| `restore-db.sh`           | Restaura la base de datos desde un archivo de backup ubicado en `k8s/backups/`.      |
-| `check_config.py`         | Script de Python para validar la configuración de los manifiestos.                   |
-
-### `deploy-cluster.sh`
-Despliega la aplicación completa. Es ideal para la configuración inicial.
-- **Qué hace:**
-    1. Verifica prerrequisitos.
-    2. Crea un clúster de Kind si no existe, aplicando el mapeo de puertos.
-    3. Aplica todos los manifiestos de Kubernetes (`.yaml`).
-    4. Despliega PostgreSQL, el backend y el frontend en orden.
-    5. Espera a que todos los servicios estén operativos.
-- **Uso:** `./scripts/deploy-cluster.sh`
-
-### `deploy-db.sh`
-Despliega o actualiza el esquema de la base de datos.
-- **Qué hace:**
-    1. Crea un backup automático de la base de datos en `k8s/backups/`.
-    2. Reinicia el pod de PostgreSQL.
-    3. Aplica las migraciones pendientes de Alembic.
-- **Uso:** `./scripts/deploy-db.sh`
-
-### `deploy-api.sh` & `deploy-front.sh`
-Actualizan el backend o el frontend con los últimos cambios del código.
-- **Qué hacen:**
-    1. Construyen una nueva imagen de Docker con la versión especificada (o `latest`).
-    2. Suben la imagen al registro (Docker Hub).
-    3. Realizan una actualización gradual (rolling update) en Kubernetes para no interrumpir el servicio.
-- **Uso:**
-    ```bash
-    ./scripts/deploy-api.sh v1.2.0
-    ./scripts/deploy-front.sh v1.5.1
-    ```
-
-### `destroy-cluster.sh`
-Elimina por completo el entorno de Kubernetes. **Esta acción es irreversible y borrará todos los datos de la base de datos.**
-- **Qué hace:**
-    1. Pide una confirmación explícita para evitar accidentes.
-    2. Elimina el clúster de Kind.
-- **Uso:** `./scripts/destroy-cluster.sh`
+| Script | Qué hace |
+|---|---|
+| `deploy-cluster.sh` | **(Principal)** Crea el clúster si no existe y despliega PostgreSQL, Mailpit, la API y el frontend. Si el clúster ya existe, solo lo borra si escribes su nombre. |
+| `deploy-api.sh [tag]` | Reconstruye la imagen de la API, la carga en Kind y reinicia el deployment. |
+| `deploy-front.sh [tag]` | Lo mismo para el frontend (desde `../ComebackGolfWeb`). |
+| `deploy-db.sh [--force]` | Reconstruye la imagen de la API, hace backup de la base, reinicia PostgreSQL y aplica las migraciones de Alembic. |
+| `restart-cluster.sh [--api\|--front\|--db\|--all]` | Reaplica ConfigMaps y Secrets y reinicia los deployments sin reconstruir imágenes (por defecto, API y frontend). |
+| `restore-db.sh` | Restaura la base desde un backup de `k8s/backups/` y aplica las migraciones. |
+| `cluster-status.sh` | Informe del clúster: nodos, pods, servicios, almacenamiento, eventos y health checks. |
+| `destroy-cluster.sh` | **(Irreversible)** Borra el clúster y todos sus datos; opcionalmente, las imágenes `kindest/node`. |
+| `check_config.py` | Comprueba la configuración que lee la app (`src/config/settings.py`) para el entorno detectado. |
+| `rama-de-la-imagen.sh` | Auxiliar: lo cargan los scripts de despliegue para avisar de la rama. |
 
 ---
 
 ## 🔐 Secrets
 
-`k8s/api-secret.yaml` está **versionado en git** y debe contener únicamente placeholders de ejemplo — nunca valores reales (el repo es público).
+`k8s/api-secret.yaml` está **versionado en git** y solo contiene valores de ejemplo, nunca reales (el repositorio es público).
 
-Para tener credenciales reales en local (p. ej. para mandar un correo de verdad, ver «Correos»):
+Para usar credenciales reales en local (por ejemplo, para mandar un correo de verdad):
 
-1. Crea `k8s/api-secret.local.yaml` (ya está en `.gitignore`, nunca se commitea) copiando la estructura de `api-secret.yaml`.
-2. Rellena ahí los valores reales (p. ej. `MAILGUN_API_KEY`, copiada directamente del dashboard de Render → Environment, sin pasar por ningún fichero versionado ni por el chat).
-3. `deploy-cluster.sh` y `restart-cluster.sh` aplican automáticamente `api-secret.local.yaml` si existe, en lugar de `api-secret.yaml`.
+1. Crea `k8s/api-secret.local.yaml` (está en `.gitignore`) con la misma estructura que `api-secret.yaml`.
+2. Rellena ahí los valores reales, copiándolos directamente del panel del proveedor, sin pasar por ningún fichero versionado.
+3. `deploy-cluster.sh` y `restart-cluster.sh` aplican `api-secret.local.yaml` si existe, en lugar de `api-secret.yaml`.
 
-⚠️ Si algún valor real llega a `api-secret.yaml` por error, rótalo de inmediato en el proveedor correspondiente (Mailgun, etc.) — el fichero es público en cuanto se commitea.
+⚠️ Si un valor real llega a `api-secret.yaml` por error, rótalo de inmediato en el proveedor: el fichero es público en cuanto se sube.
 
 ---
 
 ## 📬 Correos
 
-Desde el 7 nov 2026 (BE #563), **el Kind no entrega correos**: van a **Mailpit**
-(`k8s/mailpit.yaml`), un buzón local que los guarda sin mandarlos. Así las pruebas no
-gastan el cupo diario de Mailgun (100), que comparte producción.
+**El Kind no entrega correos**: la API los manda a **Mailpit** (`k8s/mailpit.yaml`, `EMAIL_TRANSPORT=mailpit` en `api-configmap.yaml`), un buzón local que los guarda sin enviarlos. Así las pruebas no gastan el cupo de Mailgun de producción.
 
 - **Verlos** (HTML, enlaces y tokens):
-  `kubectl port-forward -n comebackgolf svc/mailpit-service 8025:8025` y abrir
-  http://localhost:8025. Se guardan en memoria: un reinicio del pod los vacía.
-- **Mandar uno de verdad** (p. ej. para verlo en el iPhone), solo a propósito y solo a
-  tu propia dirección:
+  ```bash
+  kubectl port-forward -n comebackgolf svc/mailpit-service 8025:8025
+  ```
+  y abrir http://localhost:8025. Se guardan en memoria: un reinicio del pod los vacía.
+- **Mandar uno de verdad** (por ejemplo, para verlo en el móvil), solo a propósito y solo a tu propia dirección:
   ```bash
   kubectl set env deployment/comebackgolf-api -n comebackgolf EMAIL_TRANSPORT=mailgun
   # ... la prueba ...
   kubectl set env deployment/comebackgolf-api -n comebackgolf EMAIL_TRANSPORT-
   ```
-  Al quitarlo vuelve el valor del configmap (`mailpit`). Necesita la `MAILGUN_API_KEY`
-  real en `api-secret.local.yaml`.
+  Al quitarlo vuelve el valor del ConfigMap (`mailpit`). Necesita la `MAILGUN_API_KEY` real en `api-secret.local.yaml`.
 - En **producción** la app no arranca con otro valor que `mailgun`.
 
 ---
 
-## 🗃️ Gestión de la Base de Datos
+## 🗃️ Base de datos
 
 ### Backups
-- **Automáticos:** El script `deploy-db.sh` crea un backup en `k8s/backups/` antes de realizar cualquier cambio.
-- **Manuales:** Puedes crear un backup manual ejecutando el comando `pg_dump` directamente sobre el pod de PostgreSQL.
+- **Automáticos:** `deploy-db.sh` guarda un `pg_dump` en `k8s/backups/db_backup_AAAAMMDD_HHMMSS.sql` antes de tocar nada.
+- **Manuales:** ver «Manual Backup» en [`scripts/README.md`](scripts/README.md).
+- Los `.sql` de `k8s/backups/` están en `.gitignore`: nunca se suben.
 
 ### Restauración
-El script `restore-db.sh` facilita la restauración de la base de datos desde un backup.
-- **Qué hace:**
-    1. Muestra una lista de los backups disponibles en `k8s/backups/`.
-    2. Pide que selecciones el archivo a restaurar.
-    3. **Advertencia:** Confirma la operación, ya que **borrará todos los datos actuales**.
-    4. Restaura los datos y aplica las migraciones necesarias.
-- **Uso:** `./scripts/restore-db.sh`
+`restore-db.sh` lista los backups de `k8s/backups/`, pide el fichero, avisa de que **se borrarán todos los datos actuales**, recrea la base `comebackgolf_dev`, la restaura con `psql`, aplica las migraciones y reinicia la API.
+
+```bash
+./scripts/restore-db.sh
+```
 
 ---
 
-## 🌐 Acceso a los Servicios
+## 🌐 Acceso a los servicios
 
-El acceso a los servicios es **automático** gracias a la configuración del clúster de Kind (`kind-config.yaml`), que mapea los puertos del clúster a tu `localhost`.
+`kind-config.yaml` mapea los NodePorts del clúster a `localhost` (solo `127.0.0.1`, no a la red local). No hace falta `port-forward` salvo para Mailpit.
 
-**No necesitas ejecutar ningún script de `port-forward`.**
+| Servicio | En tu máquina | Service y NodePort |
+|---|---|---|
+| Frontend | http://localhost:8080 | `comebackgolf-web-service` → 32315 |
+| API | http://localhost:8000 | `comebackgolf-api-service` → 30321 |
+| PostgreSQL | `localhost:5434` | `postgres-service` → 30432 |
+| Mailpit | http://localhost:8025 (con `port-forward`) | `mailpit-service` (ClusterIP) |
 
-Una vez que el clúster esté desplegado con `deploy-cluster.sh`, puedes acceder directamente a:
-
-- **Frontend:** [http://localhost:8080](http://localhost:8080)
-- **Backend (Swagger UI):** [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Base de Datos (externa):** `localhost:5434`
-
-Este método es más estable y simula de forma más realista un entorno de producción.
+Los mapeos se aplican al **crear** el clúster: si cambias `kind-config.yaml`, hay que recrearlo.
 
 ---
 
-## 🛠️ Troubleshooting
+## 🛠️ Problemas habituales
 
-- **Permisos denegados en scripts:** Si recibes un error de `Permission denied`, asegúrate de que los scripts sean ejecutables:
+- **`Permission denied` al lanzar un script:**
   ```bash
   chmod +x k8s/scripts/*.sh
   ```
-- **Pods en estado `CrashLoopBackOff` o `Error`:**
-  Usa `cluster-status.sh` para obtener una visión general. Para más detalles, revisa los logs del pod con problemas:
+- **Pods en `CrashLoopBackOff` o `Error`:** `./scripts/cluster-status.sh` da la visión general; después, los logs:
   ```bash
-  # Reemplaza <nombre-del-pod> por el pod que falla
-  kubectl logs <nombre-del-pod>
+  kubectl logs -n comebackgolf deployment/comebackgolf-api --tail=50
   ```
-- **El puerto `8080` o `8000` ya está en uso:**
-  Asegúrate de no tener otro servicio (o un `port-forward` manual antiguo) ocupando esos puertos en tu máquina. Puedes usar `lsof -i :8080` para ver qué proceso lo está usando.
+- **El puerto `8080`, `8000` o `5434` ya está en uso:** otro servicio (o un `port-forward` antiguo) lo ocupa. `lsof -i :8080` dice cuál. El `docker-compose` de `docker/` puede usar también el `8000`: ver [`docker/README.md`](../docker/README.md).
+- **No encuentra el frontend:** `deploy-cluster.sh` y `deploy-front.sh` esperan el repositorio en `../ComebackGolfWeb` (ver «Prerrequisitos»).
